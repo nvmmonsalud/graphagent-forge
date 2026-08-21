@@ -1,9 +1,10 @@
 """Streamlit dashboard — GraphAgent Forge UI."""
+import os
 import streamlit as st
 import httpx
 import json
 
-API_BASE = "http://localhost:8000/api"
+API_BASE = os.getenv("GRAPHAGENT_API", "http://localhost:8000") + "/api"
 
 st.set_page_config(
     page_title="GraphAgent Forge",
@@ -19,6 +20,7 @@ with st.sidebar:
     st.image("https://img.icons8.com/color/96/brain.png", width=64)
     st.title("🧠 GraphAgent Forge")
     st.caption("Turn scattered information into connected intelligence")
+    st.caption("This is a secondary dashboard — the primary UI is served at the API root (GRAPHAGENT_API).")
 
     st.divider()
 

@@ -6,6 +6,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+PYTHON=${PYTHON:-python3}
+
 echo "🧠 GraphAgent Forge — Starting up..."
 echo ""
 
@@ -20,7 +22,7 @@ fi
 # Check venv
 if [ ! -d .venv ]; then
     echo "📦 Creating virtual environment..."
-    /opt/homebrew/bin/python3.13 -m venv .venv
+    "$PYTHON" -m venv .venv
 fi
 
 source .venv/bin/activate

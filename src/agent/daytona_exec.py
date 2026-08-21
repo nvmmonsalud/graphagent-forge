@@ -1,6 +1,8 @@
 """Daytona sandbox executor — run agent code in isolated VMs."""
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 from typing import Any, ClassVar
@@ -67,7 +69,9 @@ class DaytonaExecutor:
                 except Exception as e:
                     log.warning("Failed to delete sandbox %s: %s", sandbox.id, e)
 
-    async def run_in_sandbox(self, sandbox_id: str, code: str, delete: bool = True) -> dict[str, Any]:
+    async def run_in_sandbox(
+        self, sandbox_id: str, code: str, delete: bool = True
+    ) -> dict[str, Any]:
         """Run code in an existing sandbox (for multi-step workflows)."""
         if not self.client:
             return await self._local_fallback(code, "python")
@@ -93,19 +97,29 @@ class DaytonaExecutor:
                 except Exception as e:
                     log.warning("Failed to delete sandbox %s: %s", sandbox_id, e)
 
-    async def _local_fallback(self, code: str, language: str) -> dict[str, Any]:
-        """Local subprocess fallback when Daytona is unavailable."""
-        import asyncio
+    async def _local_fallback(
+        self,
+        code: str,
+        language: str,
+        stdin_data: bytes | None = None,
+    ) -> dict[str, Any]:
+        """Local subprocess fallback when Daytona is unavailable.
 
+        `stdin_data` is piped to the process instead of being embedded in the
+        command line — argv is capped at ARG_MAX, stdin is not.
+        """
         cmd = self._LANG_COMMANDS.get(language.lower(), "python3")
 
         try:
             proc = await asyncio.create_subprocess_exec(
                 cmd, "-c", code,
+                stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=stdin_data), timeout=30
+            )
 
             return {
                 "success": proc.returncode == 0,
@@ -113,7 +127,11 @@ class DaytonaExecutor:
                 "error": stderr.decode() if stderr else None,
                 "method": "local",
             }
-        except asyncio.TimeoutError:
+        except TimeoutError:
+            try:
+                proc.kill()
+            except Exception:
+                pass
             return {"success": False, "error": "Execution timed out (30s)", "method": "local"}
         except Exception as e:
             return {"success": False, "error": str(e), "method": "local"}
@@ -134,11 +152,15 @@ class DaytonaExecutor:
     # Graph verification in sandbox
     # ------------------------------------------------------------------
 
-    # Validation script template — runs inside the sandbox
+    # Validation script template — runs inside the sandbox.
+    # `__GRAPH_LOAD__` is replaced by an expression yielding the graph dict:
+    #   * Daytona path — the graph JSON embedded in the script (no argv limit).
+    #   * local path   — `json.load(sys.stdin)`, since the script is passed to
+    #                    `python3 -c` and argv is capped at ARG_MAX.
     _VERIFY_SCRIPT = r"""
 import json, sys
 
-graph_data = json.loads(__GRAPH_DATA__)
+graph_data = __GRAPH_LOAD__
 
 nodes = graph_data.get("nodes", [])
 edges = graph_data.get("edges", [])
@@ -194,16 +216,17 @@ print(json.dumps(result))
         then tears the sandbox down.  Returns a dict with validation results
         plus metadata about how the check was run.
         """
-        import json
-
         graph_json = json.dumps(graph_data)
-        script = self._VERIFY_SCRIPT.replace("__GRAPH_DATA__", json.dumps(graph_json))
 
         sandbox_id: str | None = None
         try:
             if not self.client:
-                # Local fallback — no sandbox, just run directly
-                result = await self._local_fallback(script, "python")
+                # Local fallback — no sandbox; stream the graph in over stdin so
+                # large graphs can't blow past ARG_MAX on `python3 -c`.
+                script = self._VERIFY_SCRIPT.replace("__GRAPH_LOAD__", "json.load(sys.stdin)")
+                result = await self._local_fallback(
+                    script, "python", stdin_data=graph_json.encode("utf-8")
+                )
                 if result["success"]:
                     parsed = json.loads(result["output"].strip().splitlines()[-1])
                     parsed["method"] = "local"
@@ -211,6 +234,10 @@ print(json.dumps(result))
                 return {"valid": False, "error": result.get("error", "unknown"), "method": "local"}
 
             # --- Daytona path ---
+            # The SDK ships the script as a file, so embedding the graph is safe.
+            script = self._VERIFY_SCRIPT.replace(
+                "__GRAPH_LOAD__", f"json.loads({json.dumps(graph_json)})"
+            )
             last_error = None
             for attempt in range(2):
                 try:
@@ -236,7 +263,11 @@ print(json.dumps(result))
 
         except Exception as e:
             log.error("Graph verification failed: %s", e)
-            return {"valid": False, "error": str(e), "method": "daytona"}
+            return {
+                "valid": False,
+                "error": str(e),
+                "method": "daytona" if self.client else "local",
+            }
 
         finally:
             # Always clean up the sandbox

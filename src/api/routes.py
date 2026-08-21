@@ -1,109 +1,225 @@
 """API routes — REST endpoints for the frontend."""
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
+import csv
+import io
+import logging
+import os
+import secrets
+import time
+from collections import deque
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, HttpUrl
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["graphagent"])
+
+#: Generic 500 detail. Exception text is logged, never returned — raw errors
+#: leak bolt URIs, credentials and upstream API metadata to the client.
+INTERNAL_ERROR = "internal error"
+
+
+# ------------------------------------------------------------------
+# Dependencies: availability guard, optional auth, rate limiting
+# ------------------------------------------------------------------
+async def require_graph(request: Request) -> None:
+    """Reject graph-touching requests while Neo4j is unreachable.
+
+    `neo4j_available` is set by the lifespan hook in `src.main`; the app boots
+    even when the database is down so /health and the frontend stay usable.
+    """
+    if not getattr(request.app.state, "neo4j_available", False):
+        raise HTTPException(status_code=503, detail="graph database unavailable")
+
+
+async def require_api_key(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> None:
+    """Optional shared-secret auth for mutating routes.
+
+    Zero-config by design: when the `API_KEY` env var is unset the check is
+    skipped entirely. Read at request time so the key can be rotated (or set in
+    tests) without re-importing the module.
+    """
+    expected = os.getenv("API_KEY")
+    if not expected:
+        return
+    if not x_api_key or not secrets.compare_digest(x_api_key, expected):
+        raise HTTPException(status_code=401, detail="invalid or missing API key")
+
+
+#: Per-IP sliding window. NOTE: in-memory and therefore PER-PROCESS — with
+#: multiple uvicorn workers each worker keeps its own counters, so the
+#: effective limit is (workers x RATE_LIMIT_MAX). It is a cheap abuse brake for
+#: the expensive LLM routes, not a security control; use a shared store
+#: (Redis) if this ever needs to be exact.
+RATE_LIMIT_MAX = 10
+RATE_LIMIT_WINDOW = 60.0
+_MAX_TRACKED_CLIENTS = 4096
+_rate_buckets: dict[str, deque] = {}
+
+
+def _rate_limit_allow(client_ip: str, now: float) -> bool:
+    """Record a hit for `client_ip`, returning False when over the limit.
+
+    Pure stdlib and side-effect-local so it can be exercised without FastAPI.
+    """
+    bucket = _rate_buckets.get(client_ip)
+    if bucket is None:
+        bucket = _rate_buckets.setdefault(client_ip, deque())
+    cutoff = now - RATE_LIMIT_WINDOW
+    while bucket and bucket[0] <= cutoff:
+        bucket.popleft()
+    if len(bucket) >= RATE_LIMIT_MAX:
+        return False
+    bucket.append(now)
+    # Bound memory: an idle client's timestamps are only popped when that same
+    # client calls again, so sweep by staleness (newest hit outside the window)
+    # rather than emptiness — otherwise abandoned buckets accumulate forever.
+    if len(_rate_buckets) > _MAX_TRACKED_CLIENTS:
+        stale = [ip for ip, b in _rate_buckets.items() if not b or b[-1] <= cutoff]
+        for ip in stale:
+            del _rate_buckets[ip]
+    return True
+
+
+async def rate_limit(request: Request) -> None:
+    """10 requests/minute per client IP on the expensive routes."""
+    client_ip = request.client.host if request.client else "unknown"
+    if not _rate_limit_allow(client_ip, time.monotonic()):
+        log.warning("Rate limit exceeded for %s on %s", client_ip, request.url.path)
+        raise HTTPException(status_code=429, detail="rate limit exceeded")
+
+
+GRAPH_DEP = [Depends(require_graph)]
+MUTATING_DEP = [Depends(require_api_key), Depends(require_graph)]
+INGEST_DEP = [Depends(require_api_key), Depends(rate_limit), Depends(require_graph)]
+ASK_DEP = [Depends(rate_limit), Depends(require_graph)]
 
 
 # ------------------------------------------------------------------
 # Request/Response models
 # ------------------------------------------------------------------
 class IngestURLRequest(BaseModel):
-    url: str = Field(..., description="URL to ingest")
+    url: HttpUrl = Field(..., description="URL to ingest")
 
 
 class IngestTextRequest(BaseModel):
-    text: str = Field(..., description="Text content to ingest")
-    source: str = Field(default="manual", description="Source label")
+    text: str = Field(
+        ..., min_length=1, max_length=200_000, description="Text content to ingest"
+    )
+    source: str = Field(default="manual", max_length=300, description="Source label")
 
 
 class AskRequest(BaseModel):
-    question: str = Field(..., description="Question to ask the knowledge graph")
+    question: str = Field(
+        ..., min_length=1, max_length=1000, description="Question to ask the knowledge graph"
+    )
 
 
 class SearchRequest(BaseModel):
-    query: str = Field(..., description="Search term")
+    query: str = Field(..., min_length=1, max_length=1000, description="Search term")
 
 
 class PathRequest(BaseModel):
-    from_label: str = Field(..., description="Source entity label")
-    to_label: str = Field(..., description="Target entity label")
+    from_label: str = Field(
+        ..., min_length=1, max_length=500, description="Source entity label"
+    )
+    to_label: str = Field(
+        ..., min_length=1, max_length=500, description="Target entity label"
+    )
 
 
 # ------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------
 @router.get("/health")
-async def health():
-    return {"status": "ok", "service": "graphagent-forge"}
+async def health(request: Request):
+    """Always 200 — the body reports whether the graph backend is usable."""
+    available = bool(getattr(request.app.state, "neo4j_available", False))
+    return {
+        "status": "ok" if available else "degraded",
+        "service": "graphagent-forge",
+        "neo4j": available,
+    }
 
 
-@router.post("/ingest/url")
+@router.post("/ingest/url", dependencies=INGEST_DEP)
 async def ingest_url(req: IngestURLRequest, request: Request):
     """Ingest a URL into the knowledge graph."""
     agent = request.app.state.agent
     try:
-        result = await agent.ingest_url(req.url)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # HttpUrl is a pydantic object — the agent expects a plain string.
+        return await agent.ingest_url(str(req.url))
+    except Exception:
+        log.exception("Failed to ingest URL")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 
-@router.post("/ingest/text")
+@router.post("/ingest/text", dependencies=INGEST_DEP)
 async def ingest_text(req: IngestTextRequest, request: Request):
     """Ingest raw text into the knowledge graph."""
     agent = request.app.state.agent
     try:
-        result = await agent.ingest_text(req.text, req.source)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return await agent.ingest_text(req.text, req.source)
+    except Exception:
+        log.exception("Failed to ingest text from source %r", req.source)
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 
-@router.post("/ask")
+@router.post("/ask", dependencies=ASK_DEP)
 async def ask(req: AskRequest, request: Request):
     """Ask a question — GraphRAG retrieves from graph + reasons with Kimi."""
     agent = request.app.state.agent
     try:
-        result = await agent.ask(req.question)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return await agent.ask(req.question)
+    except Exception:
+        log.exception("Failed to answer question")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 
-@router.get("/graph/stats")
+@router.get("/graph/stats", dependencies=GRAPH_DEP)
 async def graph_stats(request: Request):
     """Get knowledge graph statistics."""
     agent = request.app.state.agent
     try:
         return await agent.get_graph_stats()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        log.exception("Failed to read graph stats")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 
-@router.get("/graph/data")
-async def graph_data(request: Request):
-    """Get full graph data (nodes + edges) for visualization."""
+@router.get("/graph/data", dependencies=GRAPH_DEP)
+async def graph_data(
+    request: Request,
+    source_doc: str | None = Query(default=None, max_length=500),
+):
+    """Get graph data (nodes + edges) for visualization, optionally per source."""
     neo4j = request.app.state.neo4j
     try:
+        if source_doc:
+            return await neo4j.get_graph_data_by_source(source_doc)
         return await neo4j.get_all_graph_data()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        log.exception("Failed to read graph data (source_doc=%r)", source_doc)
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 
-@router.post("/graph/search")
+@router.post("/graph/search", dependencies=GRAPH_DEP)
 async def graph_search(req: SearchRequest, request: Request):
     """Search entities in the graph."""
     agent = request.app.state.agent
     try:
         return await agent.search_graph(req.query)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        log.exception("Failed to search graph")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 
-@router.get("/graph/verify")
+@router.get("/graph/verify", dependencies=GRAPH_DEP)
 async def graph_verify(request: Request):
     """Run graph-integrity verification inside a Daytona sandbox.
 
@@ -114,18 +230,122 @@ async def graph_verify(request: Request):
     agent = request.app.state.agent
     try:
         graph_data = await neo4j.get_all_graph_data(limit=None)
-        verification = await agent.daytona.verify_graph(graph_data)
-        return verification
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return await agent.daytona.verify_graph(graph_data)
+    except Exception:
+        log.exception("Graph verification failed")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 
-@router.post("/graph/path")
+@router.post("/graph/path", dependencies=GRAPH_DEP)
 async def graph_path(req: PathRequest, request: Request):
     """Find shortest path between two entities."""
     agent = request.app.state.agent
     try:
         path = await agent.find_path(req.from_label, req.to_label)
         return {"path": path}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        log.exception("Failed to find path")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+
+
+# ------------------------------------------------------------------
+# Source management
+# ------------------------------------------------------------------
+@router.get("/sources", dependencies=GRAPH_DEP)
+async def list_sources(request: Request):
+    """List ingested source documents with their entity counts."""
+    neo4j = request.app.state.neo4j
+    try:
+        sources = await neo4j.get_sources()
+    except Exception:
+        log.exception("Failed to list sources")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+    return {"sources": sources}
+
+
+@router.delete("/sources", dependencies=MUTATING_DEP)
+async def delete_source(
+    request: Request,
+    # Query param, not a path segment: source names are titles/URLs with slashes.
+    source_doc: str = Query(..., min_length=1, max_length=500),
+):
+    """Delete every entity that came from one source document."""
+    neo4j = request.app.state.neo4j
+    try:
+        result = await neo4j.delete_source(source_doc)
+    except Exception:
+        log.exception("Failed to delete source %r", source_doc)
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+
+    deleted = int(result.get("deleted_nodes", 0))
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="source not found")
+    return {"deleted_nodes": deleted}
+
+
+@router.post("/graph/clear", dependencies=MUTATING_DEP)
+async def clear_graph(request: Request):
+    """Delete every entity in the graph."""
+    neo4j = request.app.state.neo4j
+    try:
+        result = await neo4j.clear_graph()
+    except Exception:
+        log.exception("Failed to clear graph")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+    return {"deleted_nodes": int(result.get("deleted_nodes", 0))}
+
+
+# ------------------------------------------------------------------
+# Export
+# ------------------------------------------------------------------
+CSV_HEADER = ["source_id", "source_label", "type", "target_id", "target_label", "context"]
+
+
+def _edges_to_csv(nodes: list[dict], edges: list[dict]) -> str:
+    """Render edges as CSV, resolving endpoint ids to labels via the node list."""
+    labels = {n.get("id"): n.get("label", "") for n in nodes}
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(CSV_HEADER)
+    for edge in edges:
+        source = edge.get("source", "")
+        target = edge.get("target", "")
+        writer.writerow([
+            source,
+            labels.get(source, ""),
+            edge.get("type", ""),
+            target,
+            labels.get(target, ""),
+            edge.get("context", ""),
+        ])
+    return buffer.getvalue()
+
+
+@router.get("/graph/export", dependencies=GRAPH_DEP)
+async def graph_export(
+    request: Request,
+    # Invalid values are rejected as 422 by the pattern constraint.
+    fmt: str = Query(default="json", alias="format", pattern="^(json|csv)$"),
+):
+    """Download the whole graph as JSON (nodes + edges) or CSV (edge list)."""
+    neo4j = request.app.state.neo4j
+    try:
+        data = await neo4j.get_all_graph_data(limit=None)
+    except Exception:
+        log.exception("Failed to export graph (format=%s)", fmt)
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+
+    nodes = data.get("nodes", [])
+    edges = data.get("edges", [])
+
+    if fmt == "csv":
+        return Response(
+            content=_edges_to_csv(nodes, edges),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=graph-export.csv"},
+        )
+
+    return JSONResponse(
+        content={"nodes": nodes, "edges": edges},
+        headers={"Content-Disposition": "attachment; filename=graph-export.json"},
+    )

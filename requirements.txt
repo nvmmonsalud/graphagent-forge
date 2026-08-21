@@ -3,7 +3,6 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 python-dotenv>=1.0.1
 pydantic>=2.11.0
-pydantic-settings>=2.5.0
 
 # LLM — Kimi AI (OpenAI-compatible)
 openai>=1.50.0
@@ -19,12 +18,3 @@ httpx>=0.28.0
 
 # Ingestion
 beautifulsoup4>=4.12.0
-markdown>=3.7
-python-multipart>=0.0.31
-
-# WebSocket
-websockets>=12.0
-
-# Dev
-pytest>=8.3.0
-ruff>=0.6.0

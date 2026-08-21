@@ -573,6 +573,98 @@ footer a { color: var(--accent2); text-decoration: none; }
   margin-top: 1.2rem;
 }
 .query-input-wrapper input { flex: 1; }
+
+/* ═══════ CONNECTION STATUS ═══════ */
+.conn-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  font-family: 'JetBrains Mono', monospace;
+}
+.conn-status .conn-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent3);
+}
+.conn-status.live .conn-dot {
+  background: var(--accent2);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+/* ═══════ NODE LABELS ═══════ */
+.node-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  fill: var(--text);
+  pointer-events: none;
+  user-select: none;
+}
+
+/* ═══════ SOURCES / TOOLS ═══════ */
+.tools-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  margin-top: 1.5rem;
+}
+@media (max-width: 768px) { .tools-grid { grid-template-columns: 1fr; } }
+
+.source-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 0.6rem 0;
+  border-bottom: 1px solid var(--border);
+}
+.source-item:last-child { border-bottom: none; }
+.source-item-name {
+  font-size: 0.85rem;
+  font-weight: 600;
+  word-break: break-all;
+}
+.source-item-count {
+  font-size: 0.7rem;
+  color: var(--muted);
+  font-family: 'JetBrains Mono', monospace;
+}
+.source-item-actions { display: flex; gap: 0.4rem; flex-shrink: 0; }
+
+.mini-btn {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.7rem;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-family: 'Inter', sans-serif;
+}
+.mini-btn:hover { border-color: var(--accent); }
+.mini-btn.danger:hover { border-color: var(--accent3); color: var(--accent3); }
+
+.verify-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  font-size: 0.8rem;
+  padding: 0.2rem 0;
+  font-family: 'JetBrains Mono', monospace;
+}
+.verify-key { color: var(--muted); }
+
+/* ═══════ ERROR STATE ═══════ */
+.result-box.error {
+  border-left: 3px solid var(--accent3);
+  background: rgba(255,107,107,0.08);
+  color: #ffb3b3;
+}
 </style>
 </head>
 <body>
@@ -618,13 +710,16 @@ footer a { color: var(--accent2); text-decoration: none; }
   <div class="section-inner reveal">
     <div class="section-label">01 — Knowledge Graph</div>
     <div class="section-title">See the connections.</div>
-    <div class="section-desc">Every entity is a node. Every relationship is an edge. Hover to explore. Click to pin.</div>
+    <div class="section-desc">Every entity is a node. Every relationship is an edge. Hover to explore. Drag to pin. Double-click to release.</div>
 
     <div class="graph-vis-container">
       <div class="graph-overlay">
-        <div class="graph-badge">
-          <span class="dot"></span>
-          <span class="val" id="vis-nodes">0</span> nodes · <span class="val" id="vis-edges">0</span> edges
+        <div style="display:flex;flex-direction:column;gap:0.5rem;pointer-events:auto">
+          <div class="graph-badge">
+            <span class="dot"></span>
+            <span class="val" id="vis-nodes">0</span> nodes · <span class="val" id="vis-edges">0</span> edges
+          </div>
+          <div class="conn-status" id="conn-status"><span class="conn-dot"></span><span id="conn-label">connecting</span></div>
         </div>
         <div class="legend-bar" id="legend-bar"></div>
       </div>
@@ -633,6 +728,33 @@ footer a { color: var(--accent2); text-decoration: none; }
         <div class="tt-type" id="tt-type"></div>
         <div class="tt-label" id="tt-label"></div>
         <div class="tt-summary" id="tt-summary"></div>
+      </div>
+    </div>
+
+    <div class="tools-grid">
+      <div class="ingest-card" id="sources-card">
+        <div class="icon">📚</div>
+        <h3>Sources</h3>
+        <p>Documents ingested into the graph</p>
+        <div id="sources-list" style="margin-top:1rem;position:relative"></div>
+        <div style="display:flex;gap:0.6rem;margin-top:1rem;flex-wrap:wrap">
+          <button class="btn" id="btn-all-sources" onclick="focusSource(null)" style="margin-top:0">All sources</button>
+          <button class="btn" id="btn-clear-graph" onclick="doClearGraph()" style="margin-top:0;background:linear-gradient(135deg,var(--accent3),#c0392b)">🗑️ Clear graph</button>
+        </div>
+      </div>
+      <div class="ingest-card" id="tools-card">
+        <div class="icon">🛡️</div>
+        <h3>Graph tools</h3>
+        <p>Verify integrity and export the graph</p>
+        <button class="btn" id="btn-verify" onclick="doVerify()" style="margin-top:1rem">🛡️ Verify graph integrity</button>
+        <div id="verify-result" style="display:none"></div>
+        <div style="margin-top:1.2rem">
+          <div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.1em;color:var(--muted);margin-bottom:0.5rem">Export</div>
+          <div style="display:flex;gap:0.6rem;flex-wrap:wrap">
+            <a class="btn" style="margin-top:0" href="/api/graph/export?format=json" target="_blank" rel="noopener">⬇ JSON</a>
+            <a class="btn" style="margin-top:0" href="/api/graph/export?format=csv" target="_blank" rel="noopener">⬇ CSV</a>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -734,6 +856,32 @@ footer a { color: var(--accent2); text-decoration: none; }
 const API = '/api';
 
 // ═══════════════════════════════════════
+//  XSS-SAFE ESCAPE + FETCH HELPERS
+// ═══════════════════════════════════════
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function apiFetch(url, opts) {
+  const res = await fetch(url, opts);
+  let body = null;
+  try { body = await res.json(); } catch {}
+  if (!res.ok) {
+    const err = new Error((body && body.detail) || res.statusText || 'Request failed');
+    err.status = res.status;
+    err.detail = body && body.detail;
+    throw err;
+  }
+  return body;
+}
+
+function errorMessage(e) {
+  if (e && e.status === 401) return 'API key required';
+  if (e && e.status === 429) return 'Rate limited — try again in a minute';
+  if (e && e.status === 503) return 'Graph database unavailable';
+  if (e && e.status === 422) return (e.detail ? String(e.detail) : 'Invalid request');
+  return (e && (e.detail || e.message)) || 'Something went wrong';
+}
+
+// ═══════════════════════════════════════
 //  HERO PARTICLE BACKGROUND
 // ═══════════════════════════════════════
 (function() {
@@ -786,13 +934,97 @@ function tc(t) { return TYPE_COLORS[t] || '#6b6b80'; }
 // ═══════════════════════════════════════
 //  D3 FORCE GRAPH — THE SHOWSTOPPER
 // ═══════════════════════════════════════
-let simulation, svgEl, gLinks, gNodes, graphData;
+let simulation, svgEl, gLinks, gNodes, gLabels, graphData;
+let activeLegendTypes = new Set();
+let pathActive = false;
+let currentSourceFilter = null;
+let currentZoomK = 1;
 
-async function initForceGraph() {
+function truncateLabel(s) {
+  s = String(s ?? '');
+  return s.length > 14 ? s.slice(0, 13) + '…' : s;
+}
+
+function nodeBaseOpacity(d) {
+  if (activeLegendTypes.size && !activeLegendTypes.has(d.type)) return 0.12;
+  return 1;
+}
+
+function edgeEndpointTypes(d) {
+  const resolve = (ref) => (typeof ref === 'object' && ref) ? ref
+    : (graphData ? graphData.nodes.find(n => n.id === ref) : null);
+  const s = resolve(d.source);
+  const t = resolve(d.target);
+  return [s && s.type, t && t.type];
+}
+
+function edgeBaseVisible(d) {
+  if (!activeLegendTypes.size) return true;
+  const [sType, tType] = edgeEndpointTypes(d);
+  return activeLegendTypes.has(sType) || activeLegendTypes.has(tType);
+}
+
+function applyBaselineVisualState() {
+  if (!gNodes || !gLinks) return;
+  if (pathActive) { highlightPath(); return; }
+  gNodes.attr('opacity', nodeBaseOpacity);
+  gLinks
+    .attr('stroke', d => edgeBaseVisible(d) ? 'rgba(255,255,255,0.06)' : 'rgba(255,255,255,0.02)')
+    .attr('stroke-width', d => edgeBaseVisible(d) ? 0.5 : 0.3)
+    .attr('opacity', d => edgeBaseVisible(d) ? 1 : 0.3);
+}
+
+function setupLegendHandlers() {
+  document.querySelectorAll('#legend-bar .legend-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      const t = chip.dataset.type;
+      if (activeLegendTypes.has(t)) {
+        activeLegendTypes.delete(t);
+        chip.classList.remove('active');
+      } else {
+        activeLegendTypes.add(t);
+        chip.classList.add('active');
+      }
+      applyBaselineVisualState();
+    });
+  });
+}
+
+function dragStarted(event, d) {
+  if (!event.active) simulation.alphaTarget(0.3).restart();
+  d.fx = d.x; d.fy = d.y;
+}
+function dragged(event, d) {
+  d.fx = event.x; d.fy = event.y;
+}
+function dragEnded(event, d) {
+  if (!event.active) simulation.alphaTarget(0);
+  // fx/fy remain set — node stays pinned until double-click releases it
+}
+function releaseNode(event, d) {
+  d.fx = null; d.fy = null;
+  if (simulation) simulation.alpha(0.3).restart();
+}
+
+function wireNodeInteractions(sel) {
+  sel
+    .on('mouseover', showTooltip)
+    .on('mousemove', moveTooltip)
+    .on('mouseout', hideTooltip)
+    .on('dblclick', releaseNode)
+    .call(d3.drag().on('start', dragStarted).on('drag', dragged).on('end', dragEnded));
+}
+
+async function initForceGraph(sourceDoc) {
+  currentSourceFilter = sourceDoc || null;
+  let url = API + '/graph/data';
+  if (currentSourceFilter) url += '?source_doc=' + encodeURIComponent(currentSourceFilter);
   try {
-    const res = await fetch(API + '/graph/data');
-    graphData = await res.json();
-  } catch { return; }
+    graphData = await apiFetch(url);
+  } catch (e) {
+    console.error('[graph] failed to load:', errorMessage(e));
+    return;
+  }
 
   // Cancel any running simulation to prevent ghost animations
   if (simulation) {
@@ -821,12 +1053,18 @@ async function initForceGraph() {
   const g = svgEl.append('g');
 
   // Zoom
-  svgEl.call(d3.zoom().scaleExtent([0.2,5]).on('zoom', e => g.attr('transform', e.transform)));
+  const zoomBehavior = d3.zoom().scaleExtent([0.2,5]).on('zoom', e => {
+    g.attr('transform', e.transform);
+    currentZoomK = e.transform.k;
+    if (gLabels) gLabels.attr('opacity', currentZoomK > 1.2 ? 1 : 0);
+  });
+  svgEl.call(zoomBehavior);
 
   // Links
   gLinks = g.append('g').attr('class','links')
     .selectAll('line').data(graphData.edges).enter().append('line')
     .attr('stroke','rgba(255,255,255,0.06)').attr('stroke-width', 0.5);
+  gLinks.append('title').text(d => d.type || 'RELATES_TO');
 
   // Nodes
   gNodes = g.append('g').attr('class','nodes')
@@ -834,10 +1072,16 @@ async function initForceGraph() {
     .attr('r', d => d.type === 'Concept' ? 4 : d.type === 'Technology' ? 5 : 3.5)
     .attr('fill', d => tc(d.type))
     .attr('filter','url(#glow)')
-    .attr('cursor','pointer')
-    .on('mouseover', showTooltip)
-    .on('mousemove', moveTooltip)
-    .on('mouseout', hideTooltip);
+    .attr('cursor','pointer');
+  wireNodeInteractions(gNodes);
+
+  // Labels (hidden until zoomed in)
+  gLabels = g.append('g').attr('class','labels').attr('opacity', 0)
+    .selectAll('text').data(graphData.nodes).enter().append('text')
+    .attr('class','node-label')
+    .attr('text-anchor','middle')
+    .attr('dy', 14)
+    .text(d => truncateLabel(d.label));
 
   // Simulation
   simulation = d3.forceSimulation(graphData.nodes)
@@ -849,14 +1093,17 @@ async function initForceGraph() {
       gLinks.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y)
             .attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
       gNodes.attr('cx',d=>d.x).attr('cy',d=>d.y);
+      gLabels.attr('x',d=>d.x).attr('y',d=>d.y);
     });
 
   // Legend
+  activeLegendTypes = new Set();
   const usedTypes = [...new Set(graphData.nodes.map(n=>n.type))];
   const legend = document.getElementById('legend-bar');
   legend.innerHTML = usedTypes.map(t =>
-    `<div class="legend-chip" data-type="${t}"><div class="ldot" style="background:${tc(t)}"></div>${t}</div>`
+    `<div class="legend-chip" data-type="${esc(t)}"><div class="ldot" style="background:${tc(t)}"></div>${esc(t)}</div>`
   ).join('');
+  setupLegendHandlers();
 
   // Stats
   document.getElementById('vis-nodes').textContent = graphData.nodes.length;
@@ -872,17 +1119,26 @@ function showTooltip(event, d) {
   document.getElementById('tt-summary').textContent = d.summary || '';
   tt.classList.add('visible');
 
-  // Highlight neighbors
+  // Highlight neighbors (temporary — restored to baseline on mouseout)
   const neighbors = new Set();
   graphData.edges.forEach(e => {
-    if (e.source.id === d.id) neighbors.add(e.target.id);
-    if (e.target.id === d.id) neighbors.add(e.source.id);
+    const sId = typeof e.source === 'object' ? e.source.id : e.source;
+    const tId = typeof e.target === 'object' ? e.target.id : e.target;
+    if (sId === d.id) neighbors.add(tId);
+    if (tId === d.id) neighbors.add(sId);
   });
   neighbors.add(d.id);
 
   gNodes.attr('opacity', n => neighbors.has(n.id) ? 1 : 0.1);
-  gLinks.attr('stroke', l => (l.source.id===d.id||l.target.id===d.id) ? tc(d.type) : 'rgba(255,255,255,0.02)')
-        .attr('stroke-width', l => (l.source.id===d.id||l.target.id===d.id) ? 1.5 : 0.3);
+  gLinks.attr('stroke', l => {
+    const sId = typeof l.source === 'object' ? l.source.id : l.source;
+    const tId = typeof l.target === 'object' ? l.target.id : l.target;
+    return (sId===d.id||tId===d.id) ? tc(d.type) : 'rgba(255,255,255,0.02)';
+  }).attr('stroke-width', l => {
+    const sId = typeof l.source === 'object' ? l.source.id : l.source;
+    const tId = typeof l.target === 'object' ? l.target.id : l.target;
+    return (sId===d.id||tId===d.id) ? 1.5 : 0.3;
+  }).attr('opacity', 1);
 }
 
 function moveTooltip(event) {
@@ -898,8 +1154,25 @@ function moveTooltip(event) {
 
 function hideTooltip() {
   document.getElementById('tooltip').classList.remove('visible');
-  gNodes.attr('opacity', 1);
-  gLinks.attr('stroke','rgba(255,255,255,0.06)').attr('stroke-width', 0.5);
+  applyBaselineVisualState();
+}
+
+// ═══════════════════════════════════════
+//  RESIZE
+// ═══════════════════════════════════════
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(handleGraphResize, 200);
+});
+function handleGraphResize() {
+  if (!svgEl || !simulation) return;
+  const container = document.querySelector('.graph-vis-container');
+  const width = container.clientWidth;
+  const height = container.clientHeight;
+  svgEl.attr('width', width).attr('height', height);
+  simulation.force('center', d3.forceCenter(width/2, height/2));
+  simulation.alpha(0.2).restart();
 }
 
 // ═══════════════════════════════════════
@@ -946,12 +1219,15 @@ async function doIngestURL() {
   result.style.display='block';
   result.innerHTML='<div class="result-box"><span class="loader"></span> Extracting entities...</div>';
   try {
-    const d = await fetch(API+'/ingest/url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})}).then(r=>r.json());
+    const d = await apiFetch(API+'/ingest/url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
     if (d.success) {
-      result.innerHTML=`<div class="result-box success"><strong>✅ Ingested</strong> — <span style="color:var(--muted)">${d.extraction?.title||url}</span><br><span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${d.nodes}</span> <span style="color:var(--muted)">nodes</span> · <span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${d.edges}</span> <span style="color:var(--muted)">edges</span></div>`;
-      loadStats(); initForceGraph();
-    } else result.innerHTML=`<div class="result-box error">❌ ${d.error||'Failed'}</div>`;
-  } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${e.message}</div>`; }
+      result.innerHTML=`<div class="result-box success"><strong>✅ Ingested</strong> — <span style="color:var(--muted)">${esc(d.extraction?.title||url)}</span><br><span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(d.nodes)}</span> <span style="color:var(--muted)">nodes</span> · <span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(d.edges)}</span> <span style="color:var(--muted)">edges</span></div>`;
+      loadStats(); loadSources();
+      if (!ws || ws.readyState !== 1) initForceGraph(currentSourceFilter);
+    } else {
+      result.innerHTML=`<div class="result-box error">❌ ${esc(d.error||'Failed')}</div>`;
+    }
+  } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${esc(errorMessage(e))}</div>`; }
   btn.disabled=false; btn.innerHTML='🚀 Ingest URL';
 }
 
@@ -965,12 +1241,15 @@ async function doIngestText() {
   result.style.display='block';
   result.innerHTML='<div class="result-box"><span class="loader"></span> Extracting entities...</div>';
   try {
-    const d = await fetch(API+'/ingest/text',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,source})}).then(r=>r.json());
+    const d = await apiFetch(API+'/ingest/text',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,source})});
     if (d.success) {
-      result.innerHTML=`<div class="result-box success"><strong>✅ Ingested</strong><br><span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${d.nodes}</span> <span style="color:var(--muted)">nodes</span> · <span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${d.edges}</span> <span style="color:var(--muted)">edges</span></div>`;
-      loadStats(); initForceGraph();
-    } else result.innerHTML=`<div class="result-box error">❌ ${d.error||'Failed'}</div>`;
-  } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${e.message}</div>`; }
+      result.innerHTML=`<div class="result-box success"><strong>✅ Ingested</strong><br><span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(d.nodes)}</span> <span style="color:var(--muted)">nodes</span> · <span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(d.edges)}</span> <span style="color:var(--muted)">edges</span></div>`;
+      loadStats(); loadSources();
+      if (!ws || ws.readyState !== 1) initForceGraph(currentSourceFilter);
+    } else {
+      result.innerHTML=`<div class="result-box error">❌ ${esc(d.error||'Failed')}</div>`;
+    }
+  } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${esc(errorMessage(e))}</div>`; }
   btn.disabled=false; btn.innerHTML='🚀 Ingest Text';
 }
 
@@ -986,15 +1265,21 @@ async function doQuery() {
   result.style.display='block';
   result.innerHTML='<div class="result-box"><span class="loader"></span> Searching graph + reasoning with Kimi AI...</div>';
   try {
-    const d = await fetch(API+'/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})}).then(r=>r.json());
+    const d = await apiFetch(API+'/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});
+    if (!d || !d.answer) {
+      result.innerHTML = '<div class="result-box error">❌ No answer returned.</div>';
+      btn.disabled=false; btn.innerHTML='🧠 Ask';
+      return;
+    }
     let ctx = '';
     if (d.context_nodes?.length) {
       ctx=`<div style="margin-top:0.8rem;padding-top:0.8rem;border-top:1px solid var(--border)">
         <div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.1em;color:var(--muted);margin-bottom:0.4rem">Context</div>
-        ${d.context_nodes.map(n=>`<span style="display:inline-block;background:var(--accent);color:#fff;padding:0.15rem 0.5rem;border-radius:5px;font-size:0.72rem;margin:0.15rem 0.1rem">${n}</span>`).join(' → ')}</div>`;
+        ${d.context_nodes.map(n=>`<span style="display:inline-block;background:var(--accent);color:#fff;padding:0.15rem 0.5rem;border-radius:5px;font-size:0.72rem;margin:0.15rem 0.1rem">${esc(n)}</span>`).join(' → ')}</div>`;
     }
-    result.innerHTML=`<div class="result-box success"><div style="white-space:pre-wrap">${d.answer||'No answer'}</div>${ctx}${d.source_docs?.length ? `<div class="provenance"><div class="prov-label">Provenance</div>${d.source_docs.map(s=>`<span class="prov-tag">${s}</span>`).join(' ')}</div>` : ''}</div>`;
-  } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${e.message}</div>`; }
+    const answerHtml = esc(d.answer).replace(/\n/g, '<br>');
+    result.innerHTML=`<div class="result-box success"><div style="white-space:pre-wrap">${answerHtml}</div>${ctx}${d.source_docs?.length ? `<div class="provenance"><div class="prov-label">Provenance</div>${d.source_docs.map(s=>`<span class="prov-tag">${esc(s)}</span>`).join(' ')}</div>` : ''}</div>`;
+  } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${esc(errorMessage(e))}</div>`; }
   btn.disabled=false; btn.innerHTML='🧠 Ask';
 }
 
@@ -1008,11 +1293,11 @@ async function doSearch() {
   if (!q) return;
   btn.disabled=true; btn.innerHTML='<span class="loader"></span>Searching...';
   try {
-    const d = await fetch(API+'/graph/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})}).then(r=>r.json());
-    if (d.length) {
-      grid.innerHTML = d.map(e=>`<div class="search-card"><div class="type-badge" style="background:${tc(e.type)};color:${e.type==='Place'?'#333':'#fff'}">${e.type}</div><div class="entity-name">${e.label}</div><div class="entity-desc">${e.summary||''}</div></div>`).join('');
+    const d = await apiFetch(API+'/graph/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})});
+    if (d && d.length) {
+      grid.innerHTML = d.map(e=>`<div class="search-card"><div class="type-badge" style="background:${tc(e.type)};color:${e.type==='Place'?'#333':'#fff'}">${esc(e.type)}</div><div class="entity-name">${esc(e.label)}</div><div class="entity-desc">${esc(e.summary||'')}</div></div>`).join('');
     } else grid.innerHTML='<p style="color:var(--muted);grid-column:1/-1;text-align:center;padding:2rem">No matching entities found.</p>';
-  } catch(e) { grid.innerHTML=`<p style="color:var(--accent3);grid-column:1/-1">Error: ${e.message}</p>`; }
+  } catch(e) { grid.innerHTML=`<p style="color:var(--accent3);grid-column:1/-1">❌ ${esc(errorMessage(e))}</p>`; }
   btn.disabled=false; btn.innerHTML='🔎 Search';
 }
 
@@ -1032,12 +1317,12 @@ async function doFindPath() {
   result.style.display = 'block';
   result.innerHTML = '<div class="result-box"><span class="loader"></span> Searching for shortest path...</div>';
   try {
-    const d = await fetch(API + '/graph/path', {
+    const d = await apiFetch(API + '/graph/path', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ from_label: fromLabel, to_label: toLabel })
-    }).then(r => r.json());
-    if (d.path && d.path.length) {
+    });
+    if (d && d.path && d.path.length) {
       // Build visual path string
       let html = '<div class="path-result"><strong>🛤️ Shortest path:</strong><br>';
       currentPathNodeIds.clear();
@@ -1045,21 +1330,23 @@ async function doFindPath() {
       d.path.forEach(item => {
         if (item.node) {
           currentPathNodeIds.add(item.node.id);
-          html += `<span class="path-node">${item.node.label}</span>`;
+          html += `<span class="path-node">${esc(item.node.label)}</span>`;
         } else if (item.relationship) {
           const key = item.relationship.source + '->' + item.relationship.target;
           currentPathEdgeKeys.add(key);
-          html += `<span class="path-edge"> —[${item.relationship.type}]→ </span>`;
+          html += `<span class="path-edge"> —[${esc(item.relationship.type)}]→ </span>`;
         }
       });
+      html += '<div style="margin-top:0.8rem"><button class="btn" style="margin-top:0" onclick="clearPathHighlight()">✕ Clear path</button></div>';
       html += '</div>';
       result.innerHTML = html;
+      pathActive = true;
       highlightPath();
     } else {
       result.innerHTML = '<div class="path-result" style="border-left:3px solid var(--accent3)">No path found between those entities.</div>';
     }
   } catch (e) {
-    result.innerHTML = `<div class="result-box error">❌ ${e.message}</div>`;
+    result.innerHTML = `<div class="result-box error">❌ ${esc(errorMessage(e))}</div>`;
   }
   btn.disabled = false; btn.innerHTML = '🔍 Find Path';
 }
@@ -1078,20 +1365,30 @@ function highlightPath() {
       const srcId = typeof d.source === 'object' ? d.source.id : d.source;
       const tgtId = typeof d.target === 'object' ? d.target.id : d.target;
       return currentPathEdgeKeys.has(srcId + '->' + tgtId) ? 2.5 : 0.3;
-    });
+    })
+    .attr('opacity', 1);
 }
 
 function clearPathHighlight() {
   currentPathNodeIds.clear();
   currentPathEdgeKeys.clear();
-  if (gNodes) gNodes.attr('opacity', 1);
-  if (gLinks) gLinks.attr('stroke', 'rgba(255,255,255,0.06)').attr('stroke-width', 0.5);
+  pathActive = false;
+  applyBaselineVisualState();
 }
 
 // ═══════════════════════════════════════
 //  WEBSOCKET — LIVE GRAPH GROWTH
 // ═══════════════════════════════════════
 let ws = null;
+let wsPingInterval = null;
+
+function setConnStatus(live) {
+  const el = document.getElementById('conn-status');
+  const label = document.getElementById('conn-label');
+  if (!el || !label) return;
+  el.classList.toggle('live', live);
+  label.textContent = live ? 'live' : 'reconnecting';
+}
 
 function connectWebSocket() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -1099,8 +1396,9 @@ function connectWebSocket() {
 
   ws.onopen = () => {
     console.log('[WS] Connected to graph updates');
+    setConnStatus(true);
     // Send periodic pings to keep alive
-    setInterval(() => { if (ws.readyState === 1) ws.send('ping'); }, 30000);
+    wsPingInterval = setInterval(() => { if (ws.readyState === 1) ws.send('ping'); }, 30000);
   };
 
   ws.onmessage = (event) => {
@@ -1108,12 +1406,15 @@ function connectWebSocket() {
       const msg = JSON.parse(event.data);
       if (msg.type === 'graph_update' && msg.nodes && msg.edges) {
         handleGraphUpdate(msg.nodes, msg.edges);
+        loadSources();
       }
     } catch {}
   };
 
   ws.onclose = () => {
     console.log('[WS] Disconnected, reconnecting in 3s...');
+    setConnStatus(false);
+    if (wsPingInterval) { clearInterval(wsPingInterval); wsPingInterval = null; }
     setTimeout(connectWebSocket, 3000);
   };
 
@@ -1147,10 +1448,8 @@ function handleGraphUpdate(newNodes, newEdges) {
     .attr('r', 20)
     .attr('fill', d => tc(d.type))
     .attr('filter', 'url(#glow)')
-    .attr('cursor', 'pointer')
-    .on('mouseover', showTooltip)
-    .on('mousemove', moveTooltip)
-    .on('mouseout', hideTooltip);
+    .attr('cursor', 'pointer');
+  wireNodeInteractions(newCircles);
 
   // Animate: start large, shrink to normal
   newCircles.transition()
@@ -1158,9 +1457,18 @@ function handleGraphUpdate(newNodes, newEdges) {
     .ease(d3.easeBackOut)
     .attr('r', d => d.type === 'Concept' ? 4 : d.type === 'Technology' ? 5 : 3.5);
 
+  // Add new labels
+  const gLabelSel = svgEl.select('.labels');
+  gLabelSel.selectAll('.fresh-label').data(freshNodes, d => d.id).enter()
+    .append('text')
+    .attr('class', 'node-label fresh-label')
+    .attr('text-anchor', 'middle')
+    .attr('dy', 14)
+    .text(d => truncateLabel(d.label));
+
   // Add new links to SVG
   const gLinkSel = svgEl.select('.links');
-  gLinkSel.selectAll('.fresh-link').data(freshEdges, d => {
+  const newLines = gLinkSel.selectAll('.fresh-link').data(freshEdges, d => {
     const s = typeof d.source === 'object' ? d.source.id : d.source;
     const t = typeof d.target === 'object' ? d.target.id : d.target;
     return s + '->' + t;
@@ -1168,19 +1476,24 @@ function handleGraphUpdate(newNodes, newEdges) {
     .append('line')
     .attr('class', 'fresh-link')
     .attr('stroke', 'var(--accent2)')
-    .attr('stroke-width', 1)
-    .transition().duration(1000)
+    .attr('stroke-width', 1);
+  newLines.append('title').text(d => d.type || 'RELATES_TO');
+  newLines.transition().duration(1000)
     .attr('stroke', 'rgba(255,255,255,0.06)')
     .attr('stroke-width', 0.5);
 
   // Re-bind D3 data references
   gLinks = svgEl.select('.links').selectAll('line');
   gNodes = svgEl.select('.nodes').selectAll('circle');
+  gLabels = svgEl.select('.labels').selectAll('text');
 
   // Restart simulation with new data
   simulation.nodes(graphData.nodes);
   simulation.force('link').links(graphData.edges);
   simulation.alpha(0.3).restart();
+
+  // Re-apply legend filter / path highlight to the merged selection
+  applyBaselineVisualState();
 
   // Update stats
   document.getElementById('vis-nodes').textContent = graphData.nodes.length;
@@ -1190,10 +1503,109 @@ function handleGraphUpdate(newNodes, newEdges) {
 }
 
 // ═══════════════════════════════════════
+//  SOURCES PANEL
+// ═══════════════════════════════════════
+async function loadSources() {
+  const listEl = document.getElementById('sources-list');
+  if (!listEl) return;
+  try {
+    const d = await apiFetch(API + '/sources');
+    const sources = (d && d.sources) || [];
+    if (!sources.length) {
+      listEl.innerHTML = '<p style="color:var(--muted);font-size:0.82rem">No sources ingested yet.</p>';
+      return;
+    }
+    listEl.innerHTML = sources.map(s => `
+      <div class="source-item" data-source="${esc(s.source_doc)}">
+        <div>
+          <div class="source-item-name">${esc(s.source_doc)}</div>
+          <div class="source-item-count">${esc(s.node_count)} nodes</div>
+        </div>
+        <div class="source-item-actions">
+          <button type="button" class="mini-btn" data-action="focus">Focus</button>
+          <button type="button" class="mini-btn danger" data-action="delete">Delete</button>
+        </div>
+      </div>`).join('');
+  } catch (e) {
+    listEl.innerHTML = `<p style="color:var(--accent3);font-size:0.82rem">❌ ${esc(errorMessage(e))}</p>`;
+  }
+}
+
+// Event delegation — survives re-renders of #sources-list innerHTML
+document.getElementById('sources-list')?.addEventListener('click', (evt) => {
+  const btn = evt.target.closest('.mini-btn');
+  if (!btn) return;
+  const item = btn.closest('.source-item');
+  const src = item && item.dataset.source;
+  if (!src) return;
+  if (btn.dataset.action === 'focus') focusSource(src);
+  else if (btn.dataset.action === 'delete') deleteSource(src);
+});
+
+async function focusSource(sourceDoc) {
+  await initForceGraph(sourceDoc || null);
+}
+
+async function deleteSource(sourceDoc) {
+  if (!confirm(`Delete source "${sourceDoc}" and all its nodes? This cannot be undone.`)) return;
+  try {
+    await apiFetch(API + '/sources?source_doc=' + encodeURIComponent(sourceDoc), { method: 'DELETE' });
+    if (currentSourceFilter === sourceDoc) currentSourceFilter = null;
+    await loadSources();
+    await initForceGraph(currentSourceFilter);
+    loadStats();
+  } catch (e) {
+    alert('Failed to delete source: ' + errorMessage(e));
+  }
+}
+
+async function doClearGraph() {
+  const typed = prompt('Type "clear" to permanently delete the entire graph:');
+  if (typed !== 'clear') return;
+  try {
+    const d = await apiFetch(API + '/graph/clear', { method: 'POST' });
+    currentSourceFilter = null;
+    await loadSources();
+    await initForceGraph();
+    loadStats();
+    alert(`Cleared. ${(d && d.deleted_nodes) ?? 0} nodes deleted.`);
+  } catch (e) {
+    alert('Failed to clear graph: ' + errorMessage(e));
+  }
+}
+
+// ═══════════════════════════════════════
+//  VERIFY (Daytona integrity check)
+// ═══════════════════════════════════════
+async function doVerify() {
+  const btn = document.getElementById('btn-verify');
+  const result = document.getElementById('verify-result');
+  btn.disabled = true; btn.innerHTML = '<span class="loader"></span>Verifying...';
+  result.style.display = 'block';
+  result.innerHTML = '<div class="result-box"><span class="loader"></span> Running integrity check...</div>';
+  try {
+    const d = await apiFetch(API + '/graph/verify');
+    const valid = d && d.valid === true;
+    const rows = Object.entries(d || {})
+      .filter(([k]) => k !== 'valid')
+      .map(([k, v]) => `<div class="verify-row"><span class="verify-key">${esc(k)}</span><span class="verify-val">${esc(typeof v === 'object' && v !== null ? JSON.stringify(v) : v)}</span></div>`)
+      .join('');
+    result.innerHTML = `<div class="result-box ${valid ? 'success' : 'error'}">
+      <strong>${valid ? '✅ Graph is valid' : '⚠️ Integrity issues found'}</strong>
+      <div style="margin-top:0.6rem">${rows}</div>
+    </div>`;
+  } catch (e) {
+    result.innerHTML = `<div class="result-box error">❌ ${esc(errorMessage(e))}</div>`;
+  }
+  btn.disabled = false; btn.innerHTML = '🛡️ Verify graph integrity';
+}
+
+// ═══════════════════════════════════════
 //  INIT
 // ═══════════════════════════════════════
 loadStats();
 initForceGraph();
+loadSources();
 connectWebSocket();
 setInterval(loadStats, 60000);
 
