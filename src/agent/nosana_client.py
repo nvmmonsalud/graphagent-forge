@@ -11,7 +11,7 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-NOSANA_API = "https://api.nosana.com"
+DEFAULT_NOSANA_API = "https://dashboard.k8s.prd.nos.ci/api"
 
 
 class NosanaClient:
@@ -19,6 +19,8 @@ class NosanaClient:
 
     def __init__(self):
         self.api_key = os.getenv("NOSANA_API_KEY", "")
+        self.api_url = os.getenv("NOSANA_API_URL", DEFAULT_NOSANA_API).rstrip("/")
+        self.embedding_url = os.getenv("NOSANA_EMBEDDING_URL", "").strip()
         self.headers = {}
         self.last_embedding_method = "uninitialized"
         if self.api_key:
@@ -39,7 +41,7 @@ class NosanaClient:
         async with httpx.AsyncClient(timeout=60) as client:
             try:
                 response = await client.post(
-                    f"{NOSANA_API}/jobs",
+                    f"{self.api_url}/jobs",
                     json={
                         "type": job_type,
                         "model": model,
@@ -62,7 +64,7 @@ class NosanaClient:
         async with httpx.AsyncClient(timeout=30) as client:
             try:
                 response = await client.get(
-                    f"{NOSANA_API}/jobs/{job_id}",
+                    f"{self.api_url}/jobs/{job_id}",
                     headers=self.headers,
                 )
                 response.raise_for_status()
@@ -88,12 +90,14 @@ class NosanaClient:
         service is reachable.  Falls back to a deterministic hash-based
         pseudo-embedding so that downstream vector indexes always work.
         """
-        if self.api_key:
-
+        # Nosana's documented API manages GPU jobs/deployments; it does not
+        # guarantee a hosted OpenAI-compatible /embeddings route. Only call an
+        # embedding endpoint when the operator explicitly configures one.
+        if self.api_key and self.embedding_url:
             try:
                 async with httpx.AsyncClient(timeout=30) as client:
                     response = await client.post(
-                        f"{NOSANA_API}/embeddings",
+                        self.embedding_url,
                         json={"input": text},
                         headers=self.headers,
                     )
@@ -106,6 +110,9 @@ class NosanaClient:
                     log.warning("Nosana returned unexpected embedding shape, using fallback")
             except Exception as e:
                 log.warning("Nosana embedding failed (%s), using hash fallback", e)
+
+        if self.api_key and not self.embedding_url:
+            log.info("NOSANA_EMBEDDING_URL not configured; using local fallback")
 
         # Deterministic 384-dim pseudo-embedding from SHA-256
         digest = hashlib.sha256(text.encode("utf-8")).digest()

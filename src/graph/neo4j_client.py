@@ -208,8 +208,12 @@ class Neo4jClient:
     async def vector_search(self, embedding: list[float], limit: int = 10) -> list[dict]:
         """Find entities by cosine similarity against a pre-computed embedding vector."""
         query = """
-        CALL db.index.vector.queryNodes('entity_embedding', $limit, $embedding)
-        YIELD node AS n, score
+        MATCH (n:Entity)
+        SEARCH n IN (
+            VECTOR INDEX entity_embedding
+            FOR $embedding
+            LIMIT $limit
+        ) SCORE AS score
         RETURN n.id AS id, n.label AS label, n.type AS type,
                n.summary AS summary, n.source_doc AS source_doc, score
         ORDER BY score DESC
