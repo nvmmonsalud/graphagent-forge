@@ -107,7 +107,9 @@ All endpoints under `/api`: ingest (`POST /ingest/url`, `POST /ingest/text`),
 query (`POST /ask`, `POST /graph/search`, `POST /graph/path`), graph data
 (`GET /graph/data[?source_doc=]`, `GET /graph/stats`, `GET /graph/verify`,
 `GET /graph/export?format=json|csv`), and source management (`GET /sources`,
-`DELETE /sources?source_doc=`, `POST /graph/clear`). Live updates stream over
+`DELETE /sources?source_doc=`, `POST /graph/clear`). Duplicate entities across sources are surfaced by `GET /graph/duplicates`
+and merged via `POST /graph/merge` (suggest-only; set `AUTO_MERGE=exact` to
+auto-merge exact matches at ingest). Live updates stream over
 `WS /ws/graph`. Optional hardening via env: `API_KEY` (X-API-Key auth on
 mutating routes), `ALLOWED_ORIGINS` (CORS). Ingest and ask are rate-limited
 per IP.

@@ -311,6 +311,7 @@ body {
 }
 .node-tooltip .tt-label { font-weight: 600; font-size: 1rem; margin-bottom: 0.3rem; }
 .node-tooltip .tt-summary { color: var(--muted); font-size: 0.8rem; line-height: 1.4; }
+.node-tooltip .tt-aliases { color: var(--muted); font-size: 0.72rem; line-height: 1.4; margin-top: 0.3rem; font-family: 'JetBrains Mono', monospace; }
 
 /* ═══════ INGEST ═══════ */
 .ingest-grid {
@@ -659,6 +660,53 @@ footer a { color: var(--accent2); text-decoration: none; }
 }
 .verify-key { color: var(--muted); }
 
+/* ═══════ DUPLICATES ═══════ */
+.dup-group {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.7rem 0.8rem;
+  margin-bottom: 0.7rem;
+}
+.dup-group:last-child { margin-bottom: 0; }
+.dup-group-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+}
+.dup-tier-badge {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  color: var(--accent2);
+  background: rgba(0,229,200,0.1);
+  border: 1px solid rgba(0,229,200,0.2);
+  border-radius: 5px;
+  padding: 0.15rem 0.45rem;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.dup-member {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  padding: 0.3rem 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.82rem;
+}
+.dup-member:last-of-type { border-bottom: none; }
+.dup-member-label { margin-left: 0.4rem; font-weight: 500; }
+.dup-member-source {
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-family: 'JetBrains Mono', monospace;
+  text-align: right;
+  flex-shrink: 0;
+}
+
 /* ═══════ ERROR STATE ═══════ */
 .result-box.error {
   border-left: 3px solid var(--accent3);
@@ -728,6 +776,7 @@ footer a { color: var(--accent2); text-decoration: none; }
         <div class="tt-type" id="tt-type"></div>
         <div class="tt-label" id="tt-label"></div>
         <div class="tt-summary" id="tt-summary"></div>
+        <div class="tt-aliases" id="tt-aliases"></div>
       </div>
     </div>
 
@@ -755,6 +804,13 @@ footer a { color: var(--accent2); text-decoration: none; }
             <a class="btn" style="margin-top:0" href="/api/graph/export?format=csv" target="_blank" rel="noopener">⬇ CSV</a>
           </div>
         </div>
+      </div>
+      <div class="ingest-card" id="duplicates-card" style="grid-column:1/-1">
+        <div class="icon">🧬</div>
+        <h3>Duplicates</h3>
+        <p>Find entities that likely refer to the same thing and merge them</p>
+        <div id="duplicates-list" style="margin-top:1rem;position:relative"></div>
+        <button class="btn" id="btn-scan-duplicates" onclick="loadDuplicates()" style="margin-top:1rem">↻ Scan for duplicates</button>
       </div>
     </div>
   </div>
@@ -875,7 +931,7 @@ async function apiFetch(url, opts) {
 
 function errorMessage(e) {
   if (e && e.status === 401) return 'API key required';
-  if (e && e.status === 429) return 'Rate limited — try again in a minute';
+  if (e && e.status === 429) return e.detail ? String(e.detail) : 'Rate limited — try again in a minute';
   if (e && e.status === 503) return 'Graph database unavailable';
   if (e && e.status === 422) return (e.detail ? String(e.detail) : 'Invalid request');
   return (e && (e.detail || e.message)) || 'Something went wrong';
@@ -939,10 +995,27 @@ let activeLegendTypes = new Set();
 let pathActive = false;
 let currentSourceFilter = null;
 let currentZoomK = 1;
+let duplicateGroups = [];
+let activeIngestJob = null;
+let jobPollInterval = null;
 
 function truncateLabel(s) {
   s = String(s ?? '');
   return s.length > 14 ? s.slice(0, 13) + '…' : s;
+}
+
+// Shared helper: resolve a D3 edge's endpoint ids whether source/target
+// have already been resolved to node objects by the simulation, or are
+// still plain id strings — and build the stable "a->b" key used for
+// dedupe / keyed data joins.
+function edgeEndpointIds(e) {
+  const s = (typeof e.source === 'object' && e.source) ? e.source.id : e.source;
+  const t = (typeof e.target === 'object' && e.target) ? e.target.id : e.target;
+  return [s, t];
+}
+function edgeKey(e) {
+  const [s, t] = edgeEndpointIds(e);
+  return s + '->' + t;
 }
 
 function nodeBaseOpacity(d) {
@@ -1117,13 +1190,14 @@ function showTooltip(event, d) {
   document.getElementById('tt-type').style.color = d.type === 'Place' ? '#333' : '#fff';
   document.getElementById('tt-label').textContent = d.label;
   document.getElementById('tt-summary').textContent = d.summary || '';
+  const aliasesEl = document.getElementById('tt-aliases');
+  aliasesEl.textContent = (d.aliases && d.aliases.length) ? ('aka: ' + d.aliases.join(', ')) : '';
   tt.classList.add('visible');
 
   // Highlight neighbors (temporary — restored to baseline on mouseout)
   const neighbors = new Set();
   graphData.edges.forEach(e => {
-    const sId = typeof e.source === 'object' ? e.source.id : e.source;
-    const tId = typeof e.target === 'object' ? e.target.id : e.target;
+    const [sId, tId] = edgeEndpointIds(e);
     if (sId === d.id) neighbors.add(tId);
     if (tId === d.id) neighbors.add(sId);
   });
@@ -1131,12 +1205,10 @@ function showTooltip(event, d) {
 
   gNodes.attr('opacity', n => neighbors.has(n.id) ? 1 : 0.1);
   gLinks.attr('stroke', l => {
-    const sId = typeof l.source === 'object' ? l.source.id : l.source;
-    const tId = typeof l.target === 'object' ? l.target.id : l.target;
+    const [sId, tId] = edgeEndpointIds(l);
     return (sId===d.id||tId===d.id) ? tc(d.type) : 'rgba(255,255,255,0.02)';
   }).attr('stroke-width', l => {
-    const sId = typeof l.source === 'object' ? l.source.id : l.source;
-    const tId = typeof l.target === 'object' ? l.target.id : l.target;
+    const [sId, tId] = edgeEndpointIds(l);
     return (sId===d.id||tId===d.id) ? 1.5 : 0.3;
   }).attr('opacity', 1);
 }
@@ -1208,8 +1280,59 @@ function animNum(id, target) {
 }
 
 // ═══════════════════════════════════════
-//  INGEST
+//  INGEST (submit-then-track jobs)
 // ═══════════════════════════════════════
+function stopJobPoll() {
+  if (jobPollInterval) { clearInterval(jobPollInterval); jobPollInterval = null; }
+}
+
+function startJobPoll(id) {
+  stopJobPoll();
+  jobPollInterval = setInterval(async () => {
+    try {
+      const job = await apiFetch(API + '/jobs/' + encodeURIComponent(id));
+      renderIngestJob(job);
+    } catch {
+      stopJobPoll();
+    }
+  }, 3000);
+}
+
+function renderIngestJob(job) {
+  if (!activeIngestJob || !job || job.id !== activeIngestJob.id) return;
+  const result = document.getElementById('ingest-result');
+  result.style.display = 'block';
+
+  if (job.status === 'queued') {
+    result.innerHTML = `<div class="result-box"><span class="loader"></span> Queued…</div>`;
+    return;
+  }
+  if (job.status === 'running') {
+    result.innerHTML = `<div class="result-box"><span class="loader"></span> Running — ${esc(job.stage || 'starting')}</div>`;
+    return;
+  }
+  if (job.status === 'failed') {
+    result.innerHTML = `<div class="result-box error">❌ ${esc(job.error || 'Failed')}</div>`;
+    stopJobPoll();
+    activeIngestJob = null;
+    return;
+  }
+  if (job.status === 'succeeded') {
+    if (job.result?.success) {
+      const titleHtml = activeIngestJob.kind === 'url'
+        ? ` — <span style="color:var(--muted)">${esc(job.result.extraction?.title || activeIngestJob.label)}</span>`
+        : '';
+      result.innerHTML = `<div class="result-box success"><strong>✅ Ingested</strong>${titleHtml}<br><span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(job.result.nodes)}</span> <span style="color:var(--muted)">nodes</span> · <span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(job.result.edges)}</span> <span style="color:var(--muted)">edges</span></div>`;
+      loadStats(); loadSources();
+      if (!ws || ws.readyState !== 1) initForceGraph(currentSourceFilter);
+    } else {
+      result.innerHTML = `<div class="result-box error">❌ ${esc(job.result?.error || 'Failed')}</div>`;
+    }
+    stopJobPoll();
+    activeIngestJob = null;
+  }
+}
+
 async function doIngestURL() {
   const btn = document.getElementById('btn-ingest-url');
   const result = document.getElementById('ingest-result');
@@ -1217,16 +1340,13 @@ async function doIngestURL() {
   if (!url) return;
   btn.disabled=true; btn.innerHTML='<span class="loader"></span>Ingesting...';
   result.style.display='block';
-  result.innerHTML='<div class="result-box"><span class="loader"></span> Extracting entities...</div>';
+  result.innerHTML='<div class="result-box"><span class="loader"></span> Submitting...</div>';
+  stopJobPoll();
   try {
     const d = await apiFetch(API+'/ingest/url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
-    if (d.success) {
-      result.innerHTML=`<div class="result-box success"><strong>✅ Ingested</strong> — <span style="color:var(--muted)">${esc(d.extraction?.title||url)}</span><br><span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(d.nodes)}</span> <span style="color:var(--muted)">nodes</span> · <span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(d.edges)}</span> <span style="color:var(--muted)">edges</span></div>`;
-      loadStats(); loadSources();
-      if (!ws || ws.readyState !== 1) initForceGraph(currentSourceFilter);
-    } else {
-      result.innerHTML=`<div class="result-box error">❌ ${esc(d.error||'Failed')}</div>`;
-    }
+    activeIngestJob = { id: d.job_id, kind: 'url', label: url };
+    renderIngestJob({ id: d.job_id, status: 'queued' });
+    if (!ws || ws.readyState !== 1) startJobPoll(d.job_id);
   } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${esc(errorMessage(e))}</div>`; }
   btn.disabled=false; btn.innerHTML='🚀 Ingest URL';
 }
@@ -1239,16 +1359,13 @@ async function doIngestText() {
   if (!text) return;
   btn.disabled=true; btn.innerHTML='<span class="loader"></span>Ingesting...';
   result.style.display='block';
-  result.innerHTML='<div class="result-box"><span class="loader"></span> Extracting entities...</div>';
+  result.innerHTML='<div class="result-box"><span class="loader"></span> Submitting...</div>';
+  stopJobPoll();
   try {
     const d = await apiFetch(API+'/ingest/text',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,source})});
-    if (d.success) {
-      result.innerHTML=`<div class="result-box success"><strong>✅ Ingested</strong><br><span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(d.nodes)}</span> <span style="color:var(--muted)">nodes</span> · <span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(d.edges)}</span> <span style="color:var(--muted)">edges</span></div>`;
-      loadStats(); loadSources();
-      if (!ws || ws.readyState !== 1) initForceGraph(currentSourceFilter);
-    } else {
-      result.innerHTML=`<div class="result-box error">❌ ${esc(d.error||'Failed')}</div>`;
-    }
+    activeIngestJob = { id: d.job_id, kind: 'text', label: source };
+    renderIngestJob({ id: d.job_id, status: 'queued' });
+    if (!ws || ws.readyState !== 1) startJobPoll(d.job_id);
   } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${esc(errorMessage(e))}</div>`; }
   btn.disabled=false; btn.innerHTML='🚀 Ingest Text';
 }
@@ -1356,16 +1473,8 @@ function highlightPath() {
   // Dim everything, then highlight path nodes and edges
   gNodes.attr('opacity', d => currentPathNodeIds.has(d.id) ? 1 : 0.1);
   gLinks
-    .attr('stroke', d => {
-      const srcId = typeof d.source === 'object' ? d.source.id : d.source;
-      const tgtId = typeof d.target === 'object' ? d.target.id : d.target;
-      return currentPathEdgeKeys.has(srcId + '->' + tgtId) ? 'var(--accent3)' : 'rgba(255,255,255,0.02)';
-    })
-    .attr('stroke-width', d => {
-      const srcId = typeof d.source === 'object' ? d.source.id : d.source;
-      const tgtId = typeof d.target === 'object' ? d.target.id : d.target;
-      return currentPathEdgeKeys.has(srcId + '->' + tgtId) ? 2.5 : 0.3;
-    })
+    .attr('stroke', d => currentPathEdgeKeys.has(edgeKey(d)) ? 'var(--accent3)' : 'rgba(255,255,255,0.02)')
+    .attr('stroke-width', d => currentPathEdgeKeys.has(edgeKey(d)) ? 2.5 : 0.3)
     .attr('opacity', 1);
 }
 
@@ -1407,6 +1516,13 @@ function connectWebSocket() {
       if (msg.type === 'graph_update' && msg.nodes && msg.edges) {
         handleGraphUpdate(msg.nodes, msg.edges);
         loadSources();
+        loadDuplicates();
+      } else if (msg.type === 'graph_merge' && msg.removed_ids) {
+        handleGraphMerge(msg);
+        loadSources();
+        loadDuplicates();
+      } else if (msg.type === 'job_update' && msg.job) {
+        renderIngestJob(msg.job);
       }
     } catch {}
   };
@@ -1427,12 +1543,8 @@ function handleGraphUpdate(newNodes, newEdges) {
   // Dedupe against existing nodes
   const existingIds = new Set(graphData.nodes.map(n => n.id));
   const freshNodes = newNodes.filter(n => !existingIds.has(n.id));
-  const existingEdges = new Set(graphData.edges.map(e => {
-    const s = typeof e.source === 'object' ? e.source.id : e.source;
-    const t = typeof e.target === 'object' ? e.target.id : e.target;
-    return s + '->' + t;
-  }));
-  const freshEdges = newEdges.filter(e => !existingEdges.has(e.source + '->' + e.target));
+  const existingEdges = new Set(graphData.edges.map(edgeKey));
+  const freshEdges = newEdges.filter(e => !existingEdges.has(edgeKey(e)));
 
   if (!freshNodes.length && !freshEdges.length) return;
 
@@ -1468,11 +1580,7 @@ function handleGraphUpdate(newNodes, newEdges) {
 
   // Add new links to SVG
   const gLinkSel = svgEl.select('.links');
-  const newLines = gLinkSel.selectAll('.fresh-link').data(freshEdges, d => {
-    const s = typeof d.source === 'object' ? d.source.id : d.source;
-    const t = typeof d.target === 'object' ? d.target.id : d.target;
-    return s + '->' + t;
-  }).enter()
+  const newLines = gLinkSel.selectAll('.fresh-link').data(freshEdges, edgeKey).enter()
     .append('line')
     .attr('class', 'fresh-link')
     .attr('stroke', 'var(--accent2)')
@@ -1500,6 +1608,88 @@ function handleGraphUpdate(newNodes, newEdges) {
   document.getElementById('vis-edges').textContent = graphData.edges.length;
 
   console.log(`[WS] Graph updated: +${freshNodes.length} nodes, +${freshEdges.length} edges`);
+}
+
+function handleGraphMerge(msg) {
+  // SAFE PATH FIRST: never let a bad in-place patch leave the graph blank.
+  // D3's forceLink throws if an edge still references a removed node id
+  // after the SVG has already been cleared/rebuilt — if anything here
+  // goes wrong, fall back to a full reload of the current view.
+  try {
+    if (!graphData || !simulation || !svgEl) { initForceGraph(currentSourceFilter); return; }
+
+    const removedIds = new Set(msg.removed_ids || []);
+    if (!removedIds.size) return;
+
+    // Drop removed nodes, and any edge that still touches one of them.
+    graphData.nodes = graphData.nodes.filter(n => !removedIds.has(n.id));
+    graphData.edges = graphData.edges.filter(e => {
+      const [s, t] = edgeEndpointIds(e);
+      return !removedIds.has(s) && !removedIds.has(t);
+    });
+
+    // Update-or-insert the canonical (merged) node.
+    if (msg.canonical && msg.canonical.id) {
+      const idx = graphData.nodes.findIndex(n => n.id === msg.canonical.id);
+      if (idx >= 0) graphData.nodes[idx] = Object.assign({}, graphData.nodes[idx], msg.canonical);
+      else graphData.nodes.push(msg.canonical);
+    }
+
+    // Append re-pointed edges from the merge, only when both endpoints
+    // still exist and the edge isn't already present.
+    const nodeIds = new Set(graphData.nodes.map(n => n.id));
+    const existingKeys = new Set(graphData.edges.map(edgeKey));
+    (msg.edges || []).forEach(e => {
+      const key = edgeKey(e);
+      if (nodeIds.has(e.source) && nodeIds.has(e.target) && !existingKeys.has(key)) {
+        graphData.edges.push(e);
+        existingKeys.add(key);
+      }
+    });
+
+    // Keyed rebind of nodes/labels/links so removed elements exit cleanly
+    // and the canonical node's visuals (type/label) refresh in place.
+    const nodeSel = svgEl.select('.nodes').selectAll('circle').data(graphData.nodes, d => d.id);
+    nodeSel.exit().remove();
+    const nodeEnter = nodeSel.enter().append('circle')
+      .attr('fill', d => tc(d.type))
+      .attr('filter', 'url(#glow)')
+      .attr('cursor', 'pointer');
+    wireNodeInteractions(nodeEnter);
+    gNodes = nodeEnter.merge(nodeSel)
+      .attr('r', d => d.type === 'Concept' ? 4 : d.type === 'Technology' ? 5 : 3.5)
+      .attr('fill', d => tc(d.type));
+
+    const labelSel = svgEl.select('.labels').selectAll('text').data(graphData.nodes, d => d.id);
+    labelSel.exit().remove();
+    const labelEnter = labelSel.enter().append('text')
+      .attr('class', 'node-label')
+      .attr('text-anchor', 'middle')
+      .attr('dy', 14);
+    gLabels = labelEnter.merge(labelSel).text(d => truncateLabel(d.label));
+
+    const linkSel = svgEl.select('.links').selectAll('line').data(graphData.edges, edgeKey);
+    linkSel.exit().remove();
+    const linkEnter = linkSel.enter().append('line')
+      .attr('stroke', 'rgba(255,255,255,0.06)')
+      .attr('stroke-width', 0.5);
+    linkEnter.append('title').text(d => d.type || 'RELATES_TO');
+    gLinks = linkEnter.merge(linkSel);
+
+    simulation.nodes(graphData.nodes);
+    simulation.force('link').links(graphData.edges);
+    simulation.alpha(0.3).restart();
+
+    applyBaselineVisualState();
+
+    document.getElementById('vis-nodes').textContent = graphData.nodes.length;
+    document.getElementById('vis-edges').textContent = graphData.edges.length;
+
+    console.log(`[WS] Graph merge: -${removedIds.size} nodes, canonical=${msg.canonical && msg.canonical.id}`);
+  } catch (err) {
+    console.warn('[WS] graph_merge in-place update failed, falling back to full reload:', err);
+    initForceGraph(currentSourceFilter);
+  }
 }
 
 // ═══════════════════════════════════════
@@ -1559,6 +1749,85 @@ async function deleteSource(sourceDoc) {
   }
 }
 
+// ═══════════════════════════════════════
+//  DUPLICATES / MERGE
+// ═══════════════════════════════════════
+async function loadDuplicates() {
+  const listEl = document.getElementById('duplicates-list');
+  if (!listEl) return;
+  const btn = document.getElementById('btn-scan-duplicates');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="loader"></span>Scanning...'; }
+  listEl.innerHTML = '<p style="color:var(--muted);font-size:0.82rem"><span class="loader"></span> Scanning for duplicates...</p>';
+  try {
+    const d = await apiFetch(API + '/graph/duplicates?limit=20');
+    duplicateGroups = (d && d.groups) || [];
+    if (!duplicateGroups.length) {
+      let html = '<p style="color:var(--muted);font-size:0.82rem">No duplicates found.</p>';
+      if (d && d.tier2_reason) {
+        html += `<p style="color:var(--muted);font-size:0.72rem;margin-top:0.3rem">${esc(d.tier2_reason)}</p>`;
+      }
+      listEl.innerHTML = html;
+    } else {
+      listEl.innerHTML = duplicateGroups.map((g, i) => {
+        const tierLabel = g.tier === 2
+          ? `Tier 2 · ~${Math.round((g.similarity || 0) * 100)}%`
+          : 'Tier 1 · exact';
+        const members = g.nodes.map(n => `
+          <div class="dup-member">
+            <div>
+              <span class="type-badge" style="background:${tc(n.type)};color:${n.type==='Place'?'#333':'#fff'}">${esc(n.type)}</span>
+              <span class="dup-member-label">${esc(n.label)}</span>
+            </div>
+            <div class="dup-member-source">${esc((n.source_docs || []).join(', '))}</div>
+          </div>`).join('');
+        return `
+          <div class="dup-group">
+            <div class="dup-group-header">
+              <span>${esc(g.norm_label || 'similar pair')}</span>
+              <span class="dup-tier-badge">${esc(tierLabel)}</span>
+            </div>
+            ${members}
+            <button type="button" class="mini-btn" data-action="merge" data-group="${i}" style="margin-top:0.5rem">🔀 Merge</button>
+          </div>`;
+      }).join('');
+    }
+  } catch (e) {
+    listEl.innerHTML = `<p style="color:var(--accent3);font-size:0.82rem">❌ ${esc(errorMessage(e))}</p>`;
+  }
+  if (btn) { btn.disabled = false; btn.innerHTML = '↻ Scan for duplicates'; }
+}
+
+// Event delegation — survives re-renders of #duplicates-list innerHTML.
+// Groups are referenced BY INDEX (data-group) — node ids are never
+// serialized into the HTML.
+document.getElementById('duplicates-list')?.addEventListener('click', async (evt) => {
+  const btn = evt.target.closest('[data-action="merge"]');
+  if (!btn) return;
+  const idx = parseInt(btn.dataset.group, 10);
+  const group = duplicateGroups[idx];
+  if (!group || !group.nodes || !group.nodes.length) return;
+  const names = group.nodes.map(n => n.label).join(', ');
+  if (!confirm(`Merge these entities into one? ${names}`)) return;
+
+  const original = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="loader"></span>Merging...';
+  try {
+    await apiFetch(API + '/graph/merge', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ node_ids: group.nodes.map(n => n.id) })
+    });
+    await Promise.all([loadDuplicates(), loadSources()]);
+    loadStats();
+    await initForceGraph(currentSourceFilter);
+  } catch (e) {
+    alert('Failed to merge: ' + errorMessage(e));
+    btn.disabled = false;
+    btn.innerHTML = original;
+  }
+});
+
 async function doClearGraph() {
   const typed = prompt('Type "clear" to permanently delete the entire graph:');
   if (typed !== 'clear') return;
@@ -1606,6 +1875,7 @@ async function doVerify() {
 loadStats();
 initForceGraph();
 loadSources();
+loadDuplicates();
 connectWebSocket();
 setInterval(loadStats, 60000);
 

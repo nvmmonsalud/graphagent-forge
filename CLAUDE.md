@@ -35,7 +35,15 @@ Two pipelines share state initialized in `src/main.py`'s lifespan hook (`app.sta
 **Query** (`GraphRAGEngine.query` in `src/graph/graphrag.py`):
 vector search via `db.index.vector.queryNodes` (only if a real Nosana embedding was produced) → keyword search (terms batched with `asyncio.gather`) → fetch 2-hop neighborhood context for top-5 candidates (also gathered) → Kimi answers using only that graph context (`answer_query` in `entity_parser.py`).
 
-HTTP endpoints live in `src/api/routes.py` (mounted at `/api`); they pull `agent`/`neo4j` off `request.app.state`. Beyond the core routes there are: `GET /sources`, `DELETE /sources?source_doc=`, `POST /graph/clear`, `GET /graph/data?source_doc=`, `GET /graph/export?format=json|csv`. Security middleware/deps: optional `X-API-Key` auth on mutating routes (only when env `API_KEY` is set), in-memory per-IP rate limiting (10/min, shared across `/ingest/*` and `/ask`, per-process), CORS origins from `ALLOWED_ORIGINS`, 500s log server-side (`log.exception`) and return only `"internal error"` to clients.
+HTTP endpoints live in `src/api/routes.py` (mounted at `/api`); they pull `agent`/`neo4j` off `request.app.state`. Beyond the core routes there are: `GET /sources`, `DELETE /sources?source_doc=`, `POST /graph/clear`, `GET /graph/data?source_doc=`, `GET /graph/export?format=json|csv`, `GET /graph/duplicates?limit=`, `POST /graph/merge`. Security middleware/deps: optional `X-API-Key` auth on mutating routes (only when env `API_KEY` is set), in-memory per-IP rate limiting (10/min, shared across `/ingest/*` and `/ask`, per-process), CORS origins from `ALLOWED_ORIGINS`, 500s log server-side (`log.exception`) and return only `"internal error"` to clients.
+
+### Ingest job queue
+
+Ingests run through a submit-then-track queue (`src/agent/jobs.py`, `JobManager` on `app.state.jobs`, created and `start()`ed in the lifespan hook right after `ws_manager`). A route calls `jobs.submit(kind, params, run)` and returns the queued job record immediately; 2 workers pull from an `asyncio.Queue` and execute the injected async `run(progress_cb)`, which reports stages back. Every transition (queued → running → each stage → terminal) is broadcast over `/ws/graph` as `{"type": "job_update", "job": {...}}`; clients can also poll `GET /api/jobs/{id}` or pass `?wait=true` on submit as a synchronous escape hatch. `INGEST_JOB_TIMEOUT` (default 600s) caps a single job.
+
+Status semantics matter: **`failed` means the job crashed — unhandled exception, timeout, or shutdown, nothing else.** A business failure (bad URL, missing `KIMI_API_KEY`, 0 entities) is a *`succeeded`* job whose `result.success` is false. `error` is only ever one of three literals — `"internal error"`, `"timed out"`, `"server shutdown"`; raw exception text is logged via `log.exception` and must never reach the record. `jobs.py` stays generic: it imports neither `src.main` nor `src.agent.core` (the broadcast sink is injected), and treats `params`/`result` as opaque dicts.
+
+The registry is in-memory and per-process — jobs vanish on restart, and the dev server's `reload=True` kills anything in flight. `shutdown()` runs first in the lifespan `finally` (before the Neo4j driver and shared httpx clients close) so in-flight jobs can drain; whatever is still queued/running is failed with `"server shutdown"` and its waiters unblocked. Finished jobs beyond `history_limit` (100) are evicted oldest-first; `submit` raises `JobQueueFull` once queued+running hits `max_active` (20).
 
 ### Graceful-degradation pattern
 
@@ -49,11 +57,15 @@ When touching these clients, preserve the fallback behavior and the `method` / `
 
 ### Graph schema
 
-Single node label `:Entity` with properties `id` (unique constraint), `label`, `type`, `summary`, `source_doc`, `embedding` (384-dim vector index, cosine). All relationships are stored with the fixed label `:RELATES_TO`; the LLM's semantic relationship name lives in the `r.type` property, and every read path returns `coalesce(r.type, type(r))` — new queries must do the same or the UI/LLM will see the literal string `RELATES_TO`. Schema/indexes are created idempotently on startup by `Neo4jClient.init_schema`.
+Single node label `:Entity` with properties `id` (unique constraint), `label`, `type`, `summary`, `norm_label` (indexed; from `src/graph/normalize.py:normalize_label` — compute it for any new node write), `source_docs` (LIST of provenance strings — membership tests use `$source_doc IN coalesce(n.source_docs, [])`; edges keep a scalar `r.source_doc` because an edge is a per-document assertion), `aliases` (list, set by merges), `embedding` + `embedding_method` (384-dim vector index, cosine; only `embedding_method = 'nosana'` vectors are semantic). All relationships are stored with the fixed label `:RELATES_TO`; the LLM's semantic relationship name lives in the `r.type` property, and every read path returns `coalesce(r.type, type(r))` — new queries must do the same or the UI/LLM will see the literal string `RELATES_TO`. Schema/indexes are created idempotently on startup by `Neo4jClient.init_schema`, which also runs the idempotent scalar-`source_doc` → `source_docs` migration and `norm_label` backfill (rollback recipe: `MATCH (n:Entity) WHERE n.source_docs IS NOT NULL SET n.source_doc = head(n.source_docs) REMOVE n.source_docs`).
+
+### Entity dedup/merge
+
+Suggest-only by design: `GET /api/graph/duplicates` returns tier-1 (exact `norm_label` match across differing source sets) and tier-2 (embedding cosine ≥0.9, only over `embedding_method='nosana'` nodes; disabled with a `tier2_reason` under the hash fallback) candidate groups; `POST /api/graph/merge` merges explicitly listed node ids via `Neo4jClient.merge_nodes` (plain-Cypher transactional: repoint edges both directions preserving `r.source_doc`/`context`, union `source_docs`, absorb labels into `aliases`, longest summary wins, canonical = longest label → newest → smallest id). `AUTO_MERGE=exact` env opts into automatic tier-1 merging at ingest (off by default). `delete_source` removes membership + that doc's edges and deletes a node only when its membership empties. `get_graph_data_by_source` includes boundary nodes so every returned edge endpoint is present — the frontend's D3 forceLink hard-crashes otherwise; preserve that invariant in new per-source queries.
 
 ### WebSocket coupling
 
-`GraphAgent._get_ws_manager` lazily imports `ws_manager` from `src.main` to avoid a circular import — the agent module must not import `src.main` at top level. Broadcast payloads are `{"type": "graph_update", "nodes": [...], "edges": [...]}`; the frontend merges them incrementally and only refetches when the socket is closed.
+`GraphAgent._get_ws_manager` lazily imports `ws_manager` from `src.main` to avoid a circular import — the agent module must not import `src.main` at top level. Broadcast payloads: `{"type": "graph_update", "nodes": [...], "edges": [...]}` (append-only incremental merge) and `{"type": "graph_merge", "removed_ids": [...], "canonical": {...}, "edges": [...]}` (frontend removes merged nodes in place, falling back to a full redraw on any error — never leave the graph blank). Unknown message types are ignored; the frontend only refetches when the socket is closed.
 
 ## Notes
 
@@ -61,4 +73,5 @@ Single node label `:Entity` with properties `id` (unique constraint), `label`, `
 - `load_dotenv()` runs in `src/main.py` *before* the app-module imports — keep it there so import-time env reads see `.env`.
 - The frontend escapes all dynamic content through its `esc()` helper before any `innerHTML` write — route new dynamic values through it too (scraped/LLM content is untrusted).
 - Tests are offline by default (mocked LLM/Neo4j); Neo4j-dependent tests are marked `integration` and skip without `NEO4J_URI`/`NEO4J_USER`/`NEO4J_PASSWORD`.
-- Known limitation (deliberate): the md5 doc-prefix means the same real-world entity appearing in two documents becomes two nodes — entity resolution/merge is future work.
+- The md5 doc-prefix still namespaces node ids per document; cross-document duplicates are handled by the suggest-only merge feature (see Entity dedup/merge above).
+- Known issue: `source_doc` identity for URL ingests is the HTML `<title>` (URL fallback) — two different pages with the same title share an identity and md5 prefix. Unchanged for now.

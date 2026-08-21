@@ -62,7 +62,7 @@ with tab_ingest:
                 with st.spinner("Fetching, extracting entities, building graph..."):
                     try:
                         result = httpx.post(
-                            f"{API_BASE}/ingest/url",
+                            f"{API_BASE}/ingest/url?wait=true",
                             json={"url": url},
                             timeout=120,
                         ).json()
@@ -93,7 +93,7 @@ with tab_ingest:
                 with st.spinner("Extracting entities, building graph..."):
                     try:
                         result = httpx.post(
-                            f"{API_BASE}/ingest/text",
+                            f"{API_BASE}/ingest/text?wait=true",
                             json={"text": text, "source": source},
                             timeout=120,
                         ).json()
