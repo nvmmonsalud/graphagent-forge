@@ -127,7 +127,7 @@ class DaytonaExecutor:
                 "error": stderr.decode() if stderr else None,
                 "method": "local",
             }
-        except asyncio.TimeoutError:
+        except TimeoutError:
             try:
                 proc.kill()
             except Exception:

@@ -16,8 +16,8 @@ Daytona HackSprint Tokyo (Sept 12, 2026).
                                                │
                                                ▼
 ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│  Dashboard   │◀──▶│  GraphRAG    │◀──▶│   Neo4j      │
-│  (Streamlit) │    │  Query Eng.  │    │  (Graph DB)  │
+│   Web UI     │◀──▶│  GraphRAG    │◀──▶│   Neo4j      │
+│ (D3/FastAPI) │    │  Query Eng.  │    │  (Graph DB)  │
 └──────────────┘    └──────────────┘    └──────────────┘
                            │
                            ▼
@@ -44,13 +44,29 @@ pip install -r requirements.txt
 
 # 2. Configure environment
 cp .env.example .env
-# Edit .env with your API keys
+# Edit .env with your API keys (the app boots with none configured,
+# in a degraded mode — KIMI_API_KEY is needed for extraction/answers)
 
 # 3. Run the app
 python -m src.main
 
-# 4. Open dashboard
+# 4. Open the web UI
 open http://localhost:8000
+```
+
+Or with Docker (bundles Neo4j):
+
+```bash
+docker compose up
+```
+
+Development:
+
+```bash
+pip install -r requirements-dev.txt
+ruff check src/ tests/     # lint (configured in pyproject.toml)
+pytest                     # offline test suite — no keys or Neo4j needed
+pytest -m integration      # extra tests against a live Neo4j (reads NEO4J_* env)
 ```
 
 ## 📁 Project Structure
@@ -58,29 +74,43 @@ open http://localhost:8000
 ```
 graphagent-forge/
 ├── src/
-│   ├── main.py              # FastAPI app entry point
+│   ├── main.py              # FastAPI app entry point, WebSocket manager
 │   ├── agent/
 │   │   ├── core.py          # Main agent loop
-│   │   ├── prompts.py       # LLM prompt templates
-│   │   └── daytona_exec.py  # Daytona sandbox execution
+│   │   ├── daytona_exec.py  # Daytona sandbox execution (local fallback)
+│   │   └── nosana_client.py # Nosana GPU embeddings (hash fallback)
 │   ├── graph/
-│   │   ├── neo4j_client.py  # Neo4j connection & queries
-│   │   ├── schema.py        # Graph schema definitions
+│   │   ├── neo4j_client.py  # Neo4j connection, schema & queries
 │   │   └── graphrag.py      # GraphRAG query engine
 │   ├── ingestion/
-│   │   ├── extractor.py     # URL/document content extraction
-│   │   ├── entity_parser.py # Kimi-powered entity extraction
+│   │   ├── extractor.py     # URL/document content extraction (SSRF-guarded)
+│   │   ├── entity_parser.py # Kimi-powered entity extraction & answering
 │   │   └── graph_writer.py  # Write entities to Neo4j
 │   └── api/
-│       └── routes.py        # FastAPI endpoints
+│       └── routes.py        # FastAPI endpoints (/api/*)
 ├── frontend/
-│   └── app.py               # Streamlit dashboard
-├── static/                  # Assets
-├── tests/                   # Tests
+│   ├── index.html           # Primary web UI (D3 graph, served at /)
+│   └── app.py               # Optional Streamlit dashboard
+├── tests/                   # Offline unit/route tests + Neo4j integration tests
 ├── .env.example             # Environment template
-├── requirements.txt         # Python dependencies
+├── requirements.txt         # Runtime dependencies
+├── requirements-dev.txt     # Dev/test dependencies
+├── pyproject.toml           # ruff + pytest configuration
+├── Dockerfile               # App image
+├── docker-compose.yml       # App + Neo4j
 └── README.md                # This file
 ```
+
+## 🔌 API Highlights
+
+All endpoints under `/api`: ingest (`POST /ingest/url`, `POST /ingest/text`),
+query (`POST /ask`, `POST /graph/search`, `POST /graph/path`), graph data
+(`GET /graph/data[?source_doc=]`, `GET /graph/stats`, `GET /graph/verify`,
+`GET /graph/export?format=json|csv`), and source management (`GET /sources`,
+`DELETE /sources?source_doc=`, `POST /graph/clear`). Live updates stream over
+`WS /ws/graph`. Optional hardening via env: `API_KEY` (X-API-Key auth on
+mutating routes), `ALLOWED_ORIGINS` (CORS). Ingest and ask are rate-limited
+per IP.
 
 ## 🎯 Judging Criteria Alignment
 
