@@ -1,6 +1,7 @@
 """GraphRAG query engine — combines graph traversal with LLM reasoning."""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from src.agent.nosana_client import NosanaClient
@@ -13,9 +14,11 @@ log = logging.getLogger(__name__)
 class GraphRAGEngine:
     """Graph-enhanced RAG: retrieve from graph, reason with LLM."""
 
-    def __init__(self, neo4j: Neo4jClient):
+    def __init__(self, neo4j: Neo4jClient, nosana: "NosanaClient | None" = None):
         self.neo4j = neo4j
-        self.nosana = NosanaClient()
+        # Share the agent's client when one is passed so `last_embedding_method`
+        # has a single source of truth; otherwise stand up our own.
+        self.nosana = nosana or NosanaClient()
 
     async def query(self, question: str) -> dict:
         """Full GraphRAG pipeline: vector search → keyword search → traverse → reason → answer."""
@@ -37,14 +40,17 @@ class GraphRAGEngine:
         except Exception as e:
             log.warning("Vector search unavailable, falling back to keyword only: %s", e)
 
-        # Step 1: Keyword search for remaining gaps
+        # Step 1: Keyword search for remaining gaps — all terms fan out in parallel
         search_terms = self._extract_search_terms(question)
-        for term in search_terms:
-            results = await self.neo4j.search_nodes(term, limit=8)
-            for r in results:
-                if r["id"] not in seen_ids:
-                    seen_ids.add(r["id"])
-                    candidates.append(r)
+        if search_terms:
+            term_results = await asyncio.gather(
+                *[self.neo4j.search_nodes(t, limit=8) for t in search_terms]
+            )
+            for results in term_results:
+                for r in results:
+                    if r["id"] not in seen_ids:
+                        seen_ids.add(r["id"])
+                        candidates.append(r)
 
         if not candidates:
             return {
@@ -52,21 +58,23 @@ class GraphRAGEngine:
                           "Try ingesting some data first!",
                 "context_nodes": [],
                 "sources": [],
+                "source_docs": [],
             }
 
-        # Step 2: Get neighborhood context for top candidates
-        seen_labels = set()
-        context_parts = []
+        # Step 2: Get neighborhood context for top candidates, fetched in parallel
+        seen_labels: set[str] = set()
+        labels: list[str] = []
         for candidate in candidates[:5]:  # Top 5 unique
             label = candidate["label"]
             if label in seen_labels:
                 continue
             seen_labels.add(label)
-            ctx = await self.neo4j.get_node_context(label, depth=2)
-            if ctx:
-                context_parts.append(ctx)
+            labels.append(label)
 
-        context = "\n\n".join(context_parts)
+        contexts = await asyncio.gather(
+            *[self.neo4j.get_node_context(label, depth=2) for label in labels]
+        )
+        context = "\n\n".join(ctx for ctx in contexts if ctx)
 
         # Collect source_doc from candidates for provenance display
         source_docs = []
@@ -80,13 +88,13 @@ class GraphRAGEngine:
 
         return {
             "answer": answer,
-            "context_nodes": list(seen_labels),
+            "context_nodes": labels,
             "sources": candidates[:5],
             "source_docs": source_docs,
         }
 
     def _extract_search_terms(self, question: str) -> list[str]:
-        """Keyword extraction from question, with the full question included."""
+        """Keyword extraction from a question — stopwords dropped, capped at 6 terms."""
         stopwords = {
             "what", "who", "where", "when", "how", "why", "is", "are", "was",
             "were", "does", "do", "did", "has", "have", "had", "can", "could",
@@ -94,10 +102,14 @@ class GraphRAGEngine:
             "of", "with", "by", "from", "and", "or", "not", "this", "that",
             "these", "those", "it", "its", "about", "tell", "me", "know",
         }
-        words = question.lower().split()
-        terms = [w for w in words if w not in stopwords and len(w) > 2]
-        # Always include the full question as a search term for better recall
-        full = question.strip()
-        if full and full not in terms:
-            terms.insert(0, full)
+        words = [w.strip(".,!?;:\"'()[]") for w in question.lower().split()]
+        terms: list[str] = []
+        for w in words:
+            # The full question is deliberately NOT included — a CONTAINS match
+            # against it can never hit a label or summary.
+            if w in stopwords or len(w) <= 2 or w in terms:
+                continue
+            terms.append(w)
+            if len(terms) == 6:
+                break
         return terms
