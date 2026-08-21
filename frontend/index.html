@@ -1,0 +1,920 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🧠 GraphAgent Forge</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+:root {
+  --bg: #05050a;
+  --surface: rgba(12,12,20,0.8);
+  --surface-solid: #0c0c14;
+  --border: rgba(255,255,255,0.06);
+  --text: #e8e8f0;
+  --muted: #6b6b80;
+  --accent: #7c5cfc;
+  --accent2: #00e5c8;
+  --accent3: #ff6b6b;
+  --glow: rgba(124,92,252,0.15);
+}
+
+* { margin:0; padding:0; box-sizing:border-box; }
+html { scroll-behavior: smooth; }
+body {
+  font-family: 'Inter', -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  overflow-x: hidden;
+  line-height: 1.6;
+}
+
+/* ═══════ HERO ═══════ */
+.hero {
+  position: relative;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+#graph-canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+
+.hero-overlay {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse at center, transparent 20%, var(--bg) 75%);
+  z-index: 1;
+  pointer-events: none;
+}
+
+.hero-content {
+  position: relative;
+  z-index: 2;
+  text-align: center;
+  padding: 2rem;
+}
+
+.hero-content h1 {
+  font-size: clamp(3rem, 8vw, 6.5rem);
+  font-weight: 900;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  background: linear-gradient(135deg, #fff 0%, var(--accent) 50%, var(--accent2) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  margin-bottom: 1rem;
+  animation: fadeUp 1s ease-out;
+}
+
+.hero-content .tagline {
+  font-size: clamp(1rem, 2.5vw, 1.3rem);
+  color: var(--muted);
+  font-weight: 300;
+  letter-spacing: 0.01em;
+  max-width: 550px;
+  margin: 0 auto 2.5rem;
+  animation: fadeUp 1s ease-out 0.2s both;
+}
+
+.hero-stats {
+  display: flex;
+  gap: 3rem;
+  justify-content: center;
+  flex-wrap: wrap;
+  animation: fadeUp 1s ease-out 0.4s both;
+}
+
+.hero-stat .number {
+  font-size: 3.5rem;
+  font-weight: 800;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--accent2);
+  line-height: 1;
+}
+
+.hero-stat .label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--muted);
+  margin-top: 0.3rem;
+}
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(30px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.scroll-indicator {
+  position: absolute;
+  bottom: 2rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--muted);
+  font-size: 0.7rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  animation: pulse 2s ease-in-out infinite;
+}
+.scroll-indicator::after {
+  content: '';
+  width: 1px;
+  height: 40px;
+  background: linear-gradient(to bottom, var(--accent), transparent);
+}
+@keyframes pulse { 0%,100%{opacity:.3} 50%{opacity:1} }
+
+/* ═══════ SPONSORS ═══════ */
+.sponsors-strip {
+  padding: 3rem 2rem;
+  text-align: center;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  backdrop-filter: blur(20px);
+}
+.sponsors-strip .label {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.25em;
+  color: var(--muted);
+  margin-bottom: 1.5rem;
+}
+.sponsors-logos {
+  display: flex;
+  justify-content: center;
+  gap: 4rem;
+  flex-wrap: wrap;
+}
+.sponsor-item {
+  text-align: center;
+  opacity: 0.4;
+  transition: all 0.3s;
+}
+.sponsor-item:hover { opacity: 1; transform: translateY(-2px); }
+.sponsor-item .name { font-size: 1.1rem; font-weight: 700; }
+.sponsor-item .role { font-size: 0.7rem; color: var(--muted); margin-top: 0.1rem; }
+
+/* ═══════ SECTIONS ═══════ */
+.section {
+  min-height: 100vh;
+  padding: 6rem 2rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.section-inner { max-width: 1100px; width: 100%; }
+.section-label {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--accent);
+  font-weight: 600;
+  margin-bottom: 0.8rem;
+}
+.section-title {
+  font-size: clamp(2rem, 5vw, 3.5rem);
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  margin-bottom: 0.5rem;
+  line-height: 1.05;
+}
+.section-desc {
+  color: var(--muted);
+  font-size: 1rem;
+  max-width: 550px;
+  margin-bottom: 2.5rem;
+}
+
+/* ═══════ GRAPH VIS — THE STAR ═══════ */
+.graph-vis-container {
+  position: relative;
+  width: 100%;
+  height: 500px;
+  background: var(--surface-solid);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  overflow: hidden;
+  margin-top: 1.5rem;
+}
+
+#force-graph {
+  width: 100%;
+  height: 100%;
+}
+
+.graph-vis-container .graph-overlay {
+  position: absolute;
+  top: 1rem;
+  left: 1rem;
+  right: 1rem;
+  display: flex;
+  justify-content: space-between;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.graph-badge {
+  background: rgba(5,5,10,0.85);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.5rem 0.9rem;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.graph-badge .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent2);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.graph-badge .val { color: var(--accent2); font-weight: 600; }
+
+.legend-bar {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  pointer-events: auto;
+}
+
+.legend-chip {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  background: rgba(5,5,10,0.85);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.3rem 0.6rem;
+  font-size: 0.65rem;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.legend-chip:hover { border-color: var(--accent); color: var(--text); }
+.legend-chip.active { border-color: var(--accent); color: var(--text); background: rgba(124,92,252,0.1); }
+
+.legend-chip .ldot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+/* Node tooltip */
+.node-tooltip {
+  position: absolute;
+  background: rgba(5,5,10,0.95);
+  backdrop-filter: blur(20px);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1rem;
+  pointer-events: none;
+  z-index: 10;
+  max-width: 300px;
+  opacity: 0;
+  transition: opacity 0.15s;
+  font-size: 0.85rem;
+}
+.node-tooltip.visible { opacity: 1; }
+.node-tooltip .tt-type {
+  display: inline-block;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.4rem;
+}
+.node-tooltip .tt-label { font-weight: 600; font-size: 1rem; margin-bottom: 0.3rem; }
+.node-tooltip .tt-summary { color: var(--muted); font-size: 0.8rem; line-height: 1.4; }
+
+/* ═══════ INGEST ═══════ */
+.ingest-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+}
+@media (max-width: 768px) { .ingest-grid { grid-template-columns: 1fr; } }
+
+.ingest-card {
+  background: var(--surface);
+  backdrop-filter: blur(20px);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 2rem;
+  transition: all 0.3s;
+  position: relative;
+  overflow: hidden;
+}
+.ingest-card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, var(--glow), transparent);
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.ingest-card:hover::before { opacity: 1; }
+.ingest-card:hover { border-color: rgba(124,92,252,0.3); }
+.ingest-card .icon { font-size: 2rem; margin-bottom: 0.8rem; position: relative; }
+.ingest-card h3 { font-size: 1.1rem; font-weight: 600; margin-bottom: 0.3rem; position: relative; }
+.ingest-card p { color: var(--muted); font-size: 0.85rem; position: relative; }
+
+/* ═══════ FORMS ═══════ */
+.input-group { margin-top: 1.2rem; position: relative; }
+.input-group label {
+  display: block;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  margin-bottom: 0.4rem;
+}
+.input-group input, .input-group textarea {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 0.8rem 1rem;
+  font-size: 0.9rem;
+  font-family: 'Inter', sans-serif;
+  transition: all 0.2s;
+}
+.input-group input:focus, .input-group textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--glow);
+}
+.input-group textarea { min-height: 90px; resize: vertical; }
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: linear-gradient(135deg, var(--accent), #5a3fd4);
+  color: white;
+  border: none;
+  border-radius: 10px;
+  padding: 0.8rem 1.5rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-family: 'Inter', sans-serif;
+  position: relative;
+  overflow: hidden;
+  margin-top: 1rem;
+}
+.btn::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(135deg, transparent, rgba(255,255,255,0.1));
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+.btn:hover::after { opacity: 1; }
+.btn:hover { transform: translateY(-1px); box-shadow: 0 8px 24px rgba(124,92,252,0.3); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+/* ═══════ RESULTS ═══════ */
+.result-box {
+  margin-top: 1.2rem;
+  padding: 1.2rem;
+  background: var(--surface-solid);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  font-size: 0.88rem;
+  line-height: 1.7;
+}
+.result-box.success { border-left: 3px solid var(--accent2); }
+.result-box.error { border-left: 3px solid var(--accent3); }
+
+/* ═══════ SEARCH GRID ═══════ */
+.search-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 1rem;
+  margin-top: 1.2rem;
+}
+.search-card {
+  background: var(--surface);
+  backdrop-filter: blur(20px);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.1rem;
+  transition: all 0.2s;
+}
+.search-card:hover { border-color: rgba(124,92,252,0.3); }
+.search-card .type-badge {
+  display: inline-block;
+  padding: 0.12rem 0.45rem;
+  border-radius: 4px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.4rem;
+}
+.search-card .entity-name { font-weight: 600; font-size: 0.95rem; margin-bottom: 0.2rem; }
+.search-card .entity-desc { color: var(--muted); font-size: 0.8rem; }
+
+/* ═══════ LOADER ═══════ */
+.loader {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255,255,255,0.15);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+  vertical-align: middle;
+  margin-right: 0.4rem;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ═══════ SCROLL REVEAL ═══════ */
+.reveal {
+  opacity: 0;
+  transform: translateY(40px);
+  transition: all 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.reveal.visible { opacity: 1; transform: translateY(0); }
+
+/* ═══════ GLOW LINE ═══════ */
+.glow-line {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent), var(--accent2), transparent);
+  width: 200px;
+  margin: 0 auto;
+  opacity: 0.4;
+}
+
+/* ═══════ FOOTER ═══════ */
+footer {
+  padding: 4rem 2rem;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+footer a { color: var(--accent2); text-decoration: none; }
+
+/* ═══════ QUERY WRAPPER ═══════ */
+.query-input-wrapper {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 1.2rem;
+}
+.query-input-wrapper input { flex: 1; }
+</style>
+</head>
+<body>
+
+<!-- ═══════ HERO ═══════ -->
+<section class="hero">
+  <canvas id="graph-canvas"></canvas>
+  <div class="hero-overlay"></div>
+  <div class="hero-content">
+    <h1>GraphAgent<br>Forge</h1>
+    <p class="tagline">Turn scattered information into connected intelligence.</p>
+    <div class="hero-stats">
+      <div class="hero-stat">
+        <div class="number" id="hero-nodes">0</div>
+        <div class="label">Nodes</div>
+      </div>
+      <div class="hero-stat">
+        <div class="number" id="hero-edges">0</div>
+        <div class="label">Edges</div>
+      </div>
+      <div class="hero-stat">
+        <div class="number" id="hero-types">0</div>
+        <div class="label">Entity Types</div>
+      </div>
+    </div>
+  </div>
+  <div class="scroll-indicator">Scroll</div>
+</section>
+
+<!-- ═══════ SPONSORS ═══════ -->
+<div class="sponsors-strip reveal">
+  <div class="label">Powered by</div>
+  <div class="sponsors-logos">
+    <div class="sponsor-item"><div class="name">Kimi AI</div><div class="role">LLM Reasoning</div></div>
+    <div class="sponsor-item"><div class="name">Neo4j</div><div class="role">Knowledge Graph</div></div>
+    <div class="sponsor-item"><div class="name">Daytona</div><div class="role">Agent Sandboxes</div></div>
+    <div class="sponsor-item"><div class="name">Nosana</div><div class="role">GPU Compute</div></div>
+  </div>
+</div>
+
+<!-- ═══════ GRAPH VIS ═══════ -->
+<section class="section" id="graph">
+  <div class="section-inner reveal">
+    <div class="section-label">01 — Knowledge Graph</div>
+    <div class="section-title">See the connections.</div>
+    <div class="section-desc">Every entity is a node. Every relationship is an edge. Hover to explore. Click to pin.</div>
+
+    <div class="graph-vis-container">
+      <div class="graph-overlay">
+        <div class="graph-badge">
+          <span class="dot"></span>
+          <span class="val" id="vis-nodes">0</span> nodes · <span class="val" id="vis-edges">0</span> edges
+        </div>
+        <div class="legend-bar" id="legend-bar"></div>
+      </div>
+      <svg id="force-graph"></svg>
+      <div class="node-tooltip" id="tooltip">
+        <div class="tt-type" id="tt-type"></div>
+        <div class="tt-label" id="tt-label"></div>
+        <div class="tt-summary" id="tt-summary"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════ INGEST ═══════ -->
+<section class="section" id="ingest">
+  <div class="section-inner reveal">
+    <div class="section-label">02 — Ingest</div>
+    <div class="section-title">Feed the graph.</div>
+    <div class="section-desc">Paste a URL or raw text. Kimi AI extracts entities and writes them to Neo4j.</div>
+
+    <div class="ingest-grid">
+      <div class="ingest-card">
+        <div class="icon">🌐</div>
+        <h3>From URL</h3>
+        <p>Extract entities from any web page</p>
+        <div class="input-group">
+          <label>URL</label>
+          <input type="url" id="ingest-url-input" placeholder="https://example.com/article">
+        </div>
+        <button class="btn" id="btn-ingest-url" onclick="doIngestURL()">🚀 Ingest URL</button>
+      </div>
+      <div class="ingest-card">
+        <div class="icon">📝</div>
+        <h3>From Text</h3>
+        <p>Paste notes, articles, or documents</p>
+        <div class="input-group">
+          <label>Content</label>
+          <textarea id="ingest-text-input" placeholder="Paste text here..."></textarea>
+        </div>
+        <div class="input-group">
+          <label>Source label</label>
+          <input type="text" id="ingest-source" value="manual-input">
+        </div>
+        <button class="btn" id="btn-ingest-text" onclick="doIngestText()">🚀 Ingest Text</button>
+      </div>
+    </div>
+    <div id="ingest-result" style="display:none"></div>
+  </div>
+</section>
+
+<!-- ═══════ QUERY ═══════ -->
+<section class="section" id="query">
+  <div class="section-inner reveal">
+    <div class="section-label">03 — Query</div>
+    <div class="section-title">Ask anything.</div>
+    <div class="section-desc">GraphRAG retrieves from the knowledge graph, Kimi AI reasons over it.</div>
+    <div class="query-input-wrapper">
+      <input type="text" id="query-input" placeholder="Who are the sponsors and what do they provide?">
+      <button class="btn" id="btn-query" onclick="doQuery()">🧠 Ask</button>
+    </div>
+    <div id="query-result" style="display:none"></div>
+  </div>
+</section>
+
+<!-- ═══════ SEARCH ═══════ -->
+<section class="section" id="search">
+  <div class="section-inner reveal">
+    <div class="section-label">04 — Search</div>
+    <div class="section-title">Find entities.</div>
+    <div class="section-desc">Search across all nodes by name or description.</div>
+    <div class="query-input-wrapper">
+      <input type="text" id="search-input" placeholder="Daytona, Neo4j, hackathon, Tokyo...">
+      <button class="btn" id="btn-search" onclick="doSearch()">🔎 Search</button>
+    </div>
+    <div class="search-grid" id="search-results"></div>
+  </div>
+</section>
+
+<div class="glow-line"></div>
+<footer>
+  Built for <a href="https://luma.com/daytonatokyo">Daytona HackSprint Tokyo 2026</a> 🤙<br>
+  <span style="font-size:0.7rem; margin-top:0.4rem; display:block">Kimi AI × Neo4j × Daytona × Nosana</span>
+</footer>
+
+<script>
+const API = '/api';
+
+// ═══════════════════════════════════════
+//  HERO PARTICLE BACKGROUND
+// ═══════════════════════════════════════
+(function() {
+  const c = document.getElementById('graph-canvas');
+  const ctx = c.getContext('2d');
+  let W, H, pts = [];
+  const colors = ['#7c5cfc','#00e5c8','#ff6b6b','#fdcb6e','#e84393','#0984e3'];
+  function resize() { W = c.width = innerWidth; H = c.height = innerHeight; }
+  resize(); addEventListener('resize', resize);
+  for (let i = 0; i < 70; i++) pts.push({
+    x: Math.random()*innerWidth, y: Math.random()*innerHeight,
+    vx: (Math.random()-0.5)*0.25, vy: (Math.random()-0.5)*0.25,
+    r: Math.random()*1.5+0.8, color: colors[~~(Math.random()*colors.length)]
+  });
+  (function loop() {
+    ctx.clearRect(0,0,W,H);
+    pts.forEach(p => {
+      p.x += p.vx; p.y += p.vy;
+      if (p.x<0||p.x>W) p.vx *= -1;
+      if (p.y<0||p.y>H) p.vy *= -1;
+    });
+    for (let i=0;i<pts.length;i++) for (let j=i+1;j<pts.length;j++) {
+      const dx=pts[i].x-pts[j].x, dy=pts[i].y-pts[j].y, d=Math.sqrt(dx*dx+dy*dy);
+      if (d<140) {
+        ctx.beginPath(); ctx.moveTo(pts[i].x,pts[i].y); ctx.lineTo(pts[j].x,pts[j].y);
+        ctx.strokeStyle=`rgba(124,92,252,${(1-d/140)*0.12})`; ctx.lineWidth=0.5; ctx.stroke();
+      }
+    }
+    pts.forEach(p => {
+      ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2); ctx.fillStyle=p.color; ctx.fill();
+      ctx.beginPath(); ctx.arc(p.x,p.y,p.r*3,0,Math.PI*2);
+      const g=ctx.createRadialGradient(p.x,p.y,0,p.x,p.y,p.r*3);
+      g.addColorStop(0,p.color+'25'); g.addColorStop(1,'transparent');
+      ctx.fillStyle=g; ctx.fill();
+    });
+    requestAnimationFrame(loop);
+  })();
+})();
+
+// ═══════════════════════════════════════
+//  TYPE COLORS
+// ═══════════════════════════════════════
+const TYPE_COLORS = {
+  'Person':'#e84393','Org':'#0984e3','Technology':'#7c5cfc',
+  'Concept':'#00b894','Event':'#e17055','Place':'#fdcb6e',
+  'Resource':'#00cec9','Project':'#a29bfe'
+};
+function tc(t) { return TYPE_COLORS[t] || '#6b6b80'; }
+
+// ═══════════════════════════════════════
+//  D3 FORCE GRAPH — THE SHOWSTOPPER
+// ═══════════════════════════════════════
+let simulation, svgEl, gLinks, gNodes, graphData;
+
+async function initForceGraph() {
+  try {
+    const res = await fetch(API + '/graph/data');
+    graphData = await res.json();
+  } catch { return; }
+
+  const container = document.querySelector('.graph-vis-container');
+  const width = container.clientWidth;
+  const height = container.clientHeight;
+
+  svgEl = d3.select('#force-graph')
+    .attr('width', width).attr('height', height);
+
+  // Defs for glow
+  const defs = svgEl.append('defs');
+  const filter = defs.append('filter').attr('id','glow');
+  filter.append('feGaussianBlur').attr('stdDeviation','3').attr('result','blur');
+  const merge = filter.append('feMerge');
+  merge.append('feMergeNode').attr('in','blur');
+  merge.append('feMergeNode').attr('in','SourceGraphic');
+
+  const g = svgEl.append('g');
+
+  // Zoom
+  svgEl.call(d3.zoom().scaleExtent([0.2,5]).on('zoom', e => g.attr('transform', e.transform)));
+
+  // Links
+  gLinks = g.append('g').attr('class','links')
+    .selectAll('line').data(graphData.edges).enter().append('line')
+    .attr('stroke','rgba(255,255,255,0.06)').attr('stroke-width', 0.5);
+
+  // Nodes
+  gNodes = g.append('g').attr('class','nodes')
+    .selectAll('circle').data(graphData.nodes).enter().append('circle')
+    .attr('r', d => d.type === 'Concept' ? 4 : d.type === 'Technology' ? 5 : 3.5)
+    .attr('fill', d => tc(d.type))
+    .attr('filter','url(#glow)')
+    .attr('cursor','pointer')
+    .on('mouseover', showTooltip)
+    .on('mousemove', moveTooltip)
+    .on('mouseout', hideTooltip);
+
+  // Simulation
+  simulation = d3.forceSimulation(graphData.nodes)
+    .force('link', d3.forceLink(graphData.edges).id(d => d.id).distance(60).strength(0.3))
+    .force('charge', d3.forceManyBody().strength(-80))
+    .force('center', d3.forceCenter(width/2, height/2))
+    .force('collision', d3.forceCollide().radius(8))
+    .on('tick', () => {
+      gLinks.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y)
+            .attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
+      gNodes.attr('cx',d=>d.x).attr('cy',d=>d.y);
+    });
+
+  // Legend
+  const usedTypes = [...new Set(graphData.nodes.map(n=>n.type))];
+  const legend = document.getElementById('legend-bar');
+  legend.innerHTML = usedTypes.map(t =>
+    `<div class="legend-chip" data-type="${t}"><div class="ldot" style="background:${tc(t)}"></div>${t}</div>`
+  ).join('');
+
+  // Stats
+  document.getElementById('vis-nodes').textContent = graphData.nodes.length;
+  document.getElementById('vis-edges').textContent = graphData.edges.length;
+}
+
+function showTooltip(event, d) {
+  const tt = document.getElementById('tooltip');
+  document.getElementById('tt-type').textContent = d.type;
+  document.getElementById('tt-type').style.background = tc(d.type);
+  document.getElementById('tt-type').style.color = d.type === 'Place' ? '#333' : '#fff';
+  document.getElementById('tt-label').textContent = d.label;
+  document.getElementById('tt-summary').textContent = d.summary || '';
+  tt.classList.add('visible');
+
+  // Highlight neighbors
+  const neighbors = new Set();
+  graphData.edges.forEach(e => {
+    if (e.source.id === d.id) neighbors.add(e.target.id);
+    if (e.target.id === d.id) neighbors.add(e.source.id);
+  });
+  neighbors.add(d.id);
+
+  gNodes.attr('opacity', n => neighbors.has(n.id) ? 1 : 0.1);
+  gLinks.attr('stroke', l => (l.source.id===d.id||l.target.id===d.id) ? tc(d.type) : 'rgba(255,255,255,0.02)')
+        .attr('stroke-width', l => (l.source.id===d.id||l.target.id===d.id) ? 1.5 : 0.3);
+}
+
+function moveTooltip(event) {
+  const tt = document.getElementById('tooltip');
+  const rect = document.querySelector('.graph-vis-container').getBoundingClientRect();
+  let x = event.clientX - rect.left + 15;
+  let y = event.clientY - rect.top - 10;
+  if (x + 300 > rect.width) x = x - 330;
+  if (y + 100 > rect.height) y = y - 110;
+  tt.style.left = x + 'px';
+  tt.style.top = y + 'px';
+}
+
+function hideTooltip() {
+  document.getElementById('tooltip').classList.remove('visible');
+  gNodes.attr('opacity', 1);
+  gLinks.attr('stroke','rgba(255,255,255,0.06)').attr('stroke-width', 0.5);
+}
+
+// ═══════════════════════════════════════
+//  SCROLL REVEAL
+// ═══════════════════════════════════════
+const observer = new IntersectionObserver(es => {
+  es.forEach(e => { if (e.isIntersecting) e.target.classList.add('visible'); });
+}, { threshold: 0.1 });
+document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
+
+// ═══════════════════════════════════════
+//  STATS
+// ═══════════════════════════════════════
+async function loadStats() {
+  try {
+    const d = await fetch(API+'/graph/stats').then(r=>r.json());
+    animNum('hero-nodes', d.nodes||0);
+    animNum('hero-edges', d.edges||0);
+    animNum('hero-types', (d.entity_types||[]).length);
+  } catch {}
+}
+function animNum(id, target) {
+  const el = document.getElementById(id);
+  const start = parseInt(el.textContent)||0;
+  const diff = target - start;
+  if (!diff) return;
+  const t0 = Date.now();
+  (function tick() {
+    const p = Math.min((Date.now()-t0)/800, 1);
+    el.textContent = Math.round(start + diff * (1-Math.pow(1-p,3)));
+    if (p<1) requestAnimationFrame(tick);
+  })();
+}
+
+// ═══════════════════════════════════════
+//  INGEST
+// ═══════════════════════════════════════
+async function doIngestURL() {
+  const btn = document.getElementById('btn-ingest-url');
+  const result = document.getElementById('ingest-result');
+  const url = document.getElementById('ingest-url-input').value;
+  if (!url) return;
+  btn.disabled=true; btn.innerHTML='<span class="loader"></span>Ingesting...';
+  result.style.display='block';
+  result.innerHTML='<div class="result-box"><span class="loader"></span> Extracting entities...</div>';
+  try {
+    const d = await fetch(API+'/ingest/url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})}).then(r=>r.json());
+    if (d.success) {
+      result.innerHTML=`<div class="result-box success"><strong>✅ Ingested</strong> — <span style="color:var(--muted)">${d.extraction?.title||url}</span><br><span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${d.nodes}</span> <span style="color:var(--muted)">nodes</span> · <span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${d.edges}</span> <span style="color:var(--muted)">edges</span></div>`;
+      loadStats(); initForceGraph();
+    } else result.innerHTML=`<div class="result-box error">❌ ${d.error||'Failed'}</div>`;
+  } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${e.message}</div>`; }
+  btn.disabled=false; btn.innerHTML='🚀 Ingest URL';
+}
+
+async function doIngestText() {
+  const btn = document.getElementById('btn-ingest-text');
+  const result = document.getElementById('ingest-result');
+  const text = document.getElementById('ingest-text-input').value;
+  const source = document.getElementById('ingest-source').value;
+  if (!text) return;
+  btn.disabled=true; btn.innerHTML='<span class="loader"></span>Ingesting...';
+  result.style.display='block';
+  result.innerHTML='<div class="result-box"><span class="loader"></span> Extracting entities...</div>';
+  try {
+    const d = await fetch(API+'/ingest/text',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,source})}).then(r=>r.json());
+    if (d.success) {
+      result.innerHTML=`<div class="result-box success"><strong>✅ Ingested</strong><br><span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${d.nodes}</span> <span style="color:var(--muted)">nodes</span> · <span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${d.edges}</span> <span style="color:var(--muted)">edges</span></div>`;
+      loadStats(); initForceGraph();
+    } else result.innerHTML=`<div class="result-box error">❌ ${d.error||'Failed'}</div>`;
+  } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${e.message}</div>`; }
+  btn.disabled=false; btn.innerHTML='🚀 Ingest Text';
+}
+
+// ═══════════════════════════════════════
+//  QUERY
+// ═══════════════════════════════════════
+async function doQuery() {
+  const btn = document.getElementById('btn-query');
+  const result = document.getElementById('query-result');
+  const q = document.getElementById('query-input').value;
+  if (!q) return;
+  btn.disabled=true; btn.innerHTML='<span class="loader"></span>Reasoning...';
+  result.style.display='block';
+  result.innerHTML='<div class="result-box"><span class="loader"></span> Searching graph + reasoning with Kimi AI...</div>';
+  try {
+    const d = await fetch(API+'/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})}).then(r=>r.json());
+    let ctx = '';
+    if (d.context_nodes?.length) {
+      ctx=`<div style="margin-top:0.8rem;padding-top:0.8rem;border-top:1px solid var(--border)">
+        <div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.1em;color:var(--muted);margin-bottom:0.4rem">Context</div>
+        ${d.context_nodes.map(n=>`<span style="display:inline-block;background:var(--accent);color:#fff;padding:0.15rem 0.5rem;border-radius:5px;font-size:0.72rem;margin:0.15rem 0.1rem">${n}</span>`).join(' → ')}</div>`;
+    }
+    result.innerHTML=`<div class="result-box success"><div style="white-space:pre-wrap">${d.answer||'No answer'}</div>${ctx}</div>`;
+  } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${e.message}</div>`; }
+  btn.disabled=false; btn.innerHTML='🧠 Ask';
+}
+
+// ═══════════════════════════════════════
+//  SEARCH
+// ═══════════════════════════════════════
+async function doSearch() {
+  const btn = document.getElementById('btn-search');
+  const grid = document.getElementById('search-results');
+  const q = document.getElementById('search-input').value;
+  if (!q) return;
+  btn.disabled=true; btn.innerHTML='<span class="loader"></span>Searching...';
+  try {
+    const d = await fetch(API+'/graph/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})}).then(r=>r.json());
+    if (d.length) {
+      grid.innerHTML = d.map(e=>`<div class="search-card"><div class="type-badge" style="background:${tc(e.type)};color:${e.type==='Place'?'#333':'#fff'}">${e.type}</div><div class="entity-name">${e.label}</div><div class="entity-desc">${e.summary||''}</div></div>`).join('');
+    } else grid.innerHTML='<p style="color:var(--muted);grid-column:1/-1;text-align:center;padding:2rem">No matching entities found.</p>';
+  } catch(e) { grid.innerHTML=`<p style="color:var(--accent3);grid-column:1/-1">Error: ${e.message}</p>`; }
+  btn.disabled=false; btn.innerHTML='🔎 Search';
+}
+
+// ═══════════════════════════════════════
+//  INIT
+// ═══════════════════════════════════════
+loadStats();
+initForceGraph();
+setInterval(loadStats, 60000);
+
+// Enter key handlers
+document.getElementById('query-input').addEventListener('keydown', e => { if(e.key==='Enter') doQuery(); });
+document.getElementById('search-input').addEventListener('keydown', e => { if(e.key==='Enter') doSearch(); });
+document.getElementById('ingest-url-input').addEventListener('keydown', e => { if(e.key==='Enter') doIngestURL(); });
+</script>
+</body>
+</html>
