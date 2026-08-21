@@ -11,7 +11,7 @@ from collections import deque
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 log = logging.getLogger(__name__)
 
@@ -133,6 +133,33 @@ class PathRequest(BaseModel):
     )
 
 
+class MergeRequest(BaseModel):
+    node_ids: list[str] = Field(..., min_length=2, max_length=50)
+    canonical_id: str | None = Field(default=None, max_length=300)
+
+    @field_validator("node_ids")
+    @classmethod
+    def _clean_node_ids(cls, value: list[str]) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for raw in value:
+            node_id = raw.strip()
+            if not node_id or len(node_id) > 300:
+                raise ValueError("node_ids entries must be 1..300 characters")
+            if node_id not in seen:
+                seen.add(node_id)
+                deduped.append(node_id)
+        if len(deduped) < 2:
+            raise ValueError("node_ids must contain at least 2 unique ids")
+        return deduped
+
+    @model_validator(mode="after")
+    def _canonical_in_node_ids(self) -> MergeRequest:
+        if self.canonical_id is not None and self.canonical_id not in self.node_ids:
+            raise ValueError("canonical_id must be one of node_ids")
+        return self
+
+
 # ------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------
@@ -248,6 +275,34 @@ async def graph_path(req: PathRequest, request: Request):
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 
+@router.get("/graph/duplicates", dependencies=GRAPH_DEP)
+async def graph_duplicates(request: Request, limit: int = Query(default=20, ge=1, le=100)):
+    """Find candidate duplicate entity groups for merge review."""
+    agent = request.app.state.agent
+    try:
+        return await agent.find_duplicates(limit=limit)
+    except Exception:
+        log.exception("Failed to find duplicates")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+
+
+@router.post("/graph/merge", dependencies=MUTATING_DEP)
+async def graph_merge(req: MergeRequest, request: Request):
+    """Merge a set of duplicate entity nodes into one canonical node."""
+    agent = request.app.state.agent
+    try:
+        result = await agent.merge_entities(req.node_ids, req.canonical_id)
+    except Exception:
+        log.exception("Failed to merge entities")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+
+    if result.get("error") == "not_found":
+        raise HTTPException(
+            status_code=404, detail="nodes not found: " + ", ".join(result.get("missing", []))
+        )
+    return result
+
+
 # ------------------------------------------------------------------
 # Source management
 # ------------------------------------------------------------------
@@ -277,10 +332,11 @@ async def delete_source(
         log.exception("Failed to delete source %r", source_doc)
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
-    deleted = int(result.get("deleted_nodes", 0))
-    if deleted == 0:
+    keys = ("deleted_nodes", "removed_memberships", "deleted_edges")
+    touched = sum(int(result.get(k, 0)) for k in keys)
+    if touched == 0:
         raise HTTPException(status_code=404, detail="source not found")
-    return {"deleted_nodes": deleted}
+    return result
 
 
 @router.post("/graph/clear", dependencies=MUTATING_DEP)

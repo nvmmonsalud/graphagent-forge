@@ -76,12 +76,13 @@ class GraphRAGEngine:
         )
         context = "\n\n".join(ctx for ctx in contexts if ctx)
 
-        # Collect source_doc from candidates for provenance display
-        source_docs = []
+        # Collect provenance from candidates — each carries a list of source docs
+        # (merged canonicals span several documents).
+        source_docs: list[str] = []
         for candidate in candidates[:5]:
-            src = candidate.get("source_doc", "")
-            if src and src not in source_docs:
-                source_docs.append(src)
+            for src in candidate.get("source_docs") or []:
+                if src and src not in source_docs:
+                    source_docs.append(src)
 
         # Step 3: Reason with LLM using graph context
         answer = await answer_query(question, context)
