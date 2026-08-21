@@ -18,6 +18,9 @@ ALLOWED_CONTENT_TYPES = ("text/html", "text/plain", "application/xhtml")
 MAX_REDIRECTS = 5
 MAX_BODY_BYTES = 3 * 1024 * 1024  # 3 MB hard cap on downloaded bytes
 MAX_CHARS = 50_000  # Kimi has 1M context, but keep the prompt focused
+# Appended to any body clipped at MAX_CHARS. Shared with file_extractor so both
+# ingestion paths truncate byte-identically.
+TRUNCATION_SUFFIX = "\n\n[...truncated...]"
 REQUEST_TIMEOUT = 30
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -56,7 +59,7 @@ async def aclose_client() -> None:
 
 
 def _envelope(
-    url: str,
+    url: str | None,
     *,
     title: str = "",
     domain: str = "",
@@ -197,7 +200,7 @@ def _parse_html(html: str) -> tuple[str, str]:
     clean_text = "\n".join(lines)
 
     if len(clean_text) > MAX_CHARS:
-        clean_text = clean_text[:MAX_CHARS] + "\n\n[...truncated...]"
+        clean_text = clean_text[:MAX_CHARS] + TRUNCATION_SUFFIX
 
     return title.strip(), clean_text
 

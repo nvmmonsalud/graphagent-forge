@@ -345,6 +345,30 @@ body {
 .ingest-card h3 { font-size: 1.1rem; font-weight: 600; margin-bottom: 0.3rem; position: relative; }
 .ingest-card p { color: var(--muted); font-size: 0.85rem; position: relative; }
 
+.file-drop {
+  margin-top: 1.2rem;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  flex-wrap: wrap;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  padding: 1.2rem;
+  transition: all 0.2s;
+}
+.file-drop.dragover {
+  border-color: var(--accent);
+  background: var(--glow);
+}
+.file-drop .btn { margin-top: 0; }
+.file-name {
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-family: 'JetBrains Mono', monospace;
+  word-break: break-all;
+}
+
 /* ═══════ FORMS ═══════ */
 .input-group { margin-top: 1.2rem; position: relative; }
 .input-group label {
@@ -821,7 +845,7 @@ footer a { color: var(--accent2); text-decoration: none; }
   <div class="section-inner reveal">
     <div class="section-label">02 — Ingest</div>
     <div class="section-title">Feed the graph.</div>
-    <div class="section-desc">Paste a URL or raw text. Kimi AI extracts entities and writes them to Neo4j.</div>
+    <div class="section-desc">Paste a URL, raw text, or upload a file. Kimi AI extracts entities and writes them to Neo4j.</div>
 
     <div class="ingest-grid">
       <div class="ingest-card">
@@ -847,6 +871,21 @@ footer a { color: var(--accent2); text-decoration: none; }
           <input type="text" id="ingest-source" value="manual-input">
         </div>
         <button class="btn" id="btn-ingest-text" onclick="doIngestText()">🚀 Ingest Text</button>
+      </div>
+      <div class="ingest-card" id="ingest-file-card" style="grid-column:1/-1">
+        <div class="icon">📄</div>
+        <h3>From File</h3>
+        <p>Upload a PDF, .txt or .md — parsed in memory, never stored</p>
+        <div class="file-drop" id="ingest-file-drop">
+          <label class="btn" for="ingest-file-input">📎 Choose file</label>
+          <span id="ingest-file-name" class="file-name">no file selected</span>
+        </div>
+        <input type="file" id="ingest-file-input" style="display:none" accept=".pdf,.txt,.md,application/pdf,text/plain,text/markdown" onchange="onIngestFileChange(this)">
+        <div class="input-group">
+          <label>Source label</label>
+          <input type="text" id="ingest-file-source" placeholder="defaults to filename">
+        </div>
+        <button class="btn" id="btn-ingest-file" onclick="doIngestFile()">🚀 Ingest File</button>
       </div>
     </div>
     <div id="ingest-result" style="display:none"></div>
@@ -934,6 +973,8 @@ function errorMessage(e) {
   if (e && e.status === 429) return e.detail ? String(e.detail) : 'Rate limited — try again in a minute';
   if (e && e.status === 503) return 'Graph database unavailable';
   if (e && e.status === 422) return (e.detail ? String(e.detail) : 'Invalid request');
+  if (e && e.status === 413) return 'File too large (max 3 MB)';
+  if (e && e.status === 415) return e.detail ? String(e.detail) : 'Unsupported file type';
   return (e && (e.detail || e.message)) || 'Something went wrong';
 }
 
@@ -998,6 +1039,9 @@ let currentZoomK = 1;
 let duplicateGroups = [];
 let activeIngestJob = null;
 let jobPollInterval = null;
+let selectedIngestFile = null;
+const UPLOAD_MAX_BYTES = 3 * 1024 * 1024;
+const UPLOAD_EXTS = ['.pdf', '.txt', '.md'];
 
 function truncateLabel(s) {
   s = String(s ?? '');
@@ -1319,7 +1363,7 @@ function renderIngestJob(job) {
   }
   if (job.status === 'succeeded') {
     if (job.result?.success) {
-      const titleHtml = activeIngestJob.kind === 'url'
+      const titleHtml = (activeIngestJob.kind === 'url' || activeIngestJob.kind === 'file')
         ? ` — <span style="color:var(--muted)">${esc(job.result.extraction?.title || activeIngestJob.label)}</span>`
         : '';
       result.innerHTML = `<div class="result-box success"><strong>✅ Ingested</strong>${titleHtml}<br><span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(job.result.nodes)}</span> <span style="color:var(--muted)">nodes</span> · <span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(job.result.edges)}</span> <span style="color:var(--muted)">edges</span></div>`;
@@ -1368,6 +1412,74 @@ async function doIngestText() {
     if (!ws || ws.readyState !== 1) startJobPoll(d.job_id);
   } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${esc(errorMessage(e))}</div>`; }
   btn.disabled=false; btn.innerHTML='🚀 Ingest Text';
+}
+
+function setIngestFile(f) {
+  const nameEl = document.getElementById('ingest-file-name');
+  const result = document.getElementById('ingest-result');
+  if (!f) { selectedIngestFile = null; nameEl.textContent = 'no file selected'; return; }
+
+  const lowerName = f.name.toLowerCase();
+  const hasValidExt = UPLOAD_EXTS.some(ext => lowerName.endsWith(ext));
+  if (!hasValidExt) {
+    selectedIngestFile = null;
+    nameEl.textContent = 'no file selected';
+    result.style.display = 'block';
+    result.innerHTML = `<div class="result-box error">❌ Unsupported file type — choose a .pdf, .txt, or .md file.</div>`;
+    return;
+  }
+  if (f.size > UPLOAD_MAX_BYTES) {
+    selectedIngestFile = null;
+    nameEl.textContent = 'no file selected';
+    result.style.display = 'block';
+    result.innerHTML = `<div class="result-box error">❌ File too large (max 3 MB).</div>`;
+    return;
+  }
+
+  selectedIngestFile = f;
+  nameEl.textContent = esc(f.name);
+}
+
+function onIngestFileChange(input) {
+  setIngestFile(input.files && input.files[0]);
+}
+
+(function setupFileDropzone() {
+  const drop = document.getElementById('ingest-file-drop');
+  if (!drop) return;
+  drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('dragover'); });
+  drop.addEventListener('dragleave', e => { e.preventDefault(); drop.classList.remove('dragover'); });
+  drop.addEventListener('drop', e => {
+    e.preventDefault();
+    drop.classList.remove('dragover');
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) setIngestFile(f);
+  });
+})();
+
+async function doIngestFile() {
+  const btn = document.getElementById('btn-ingest-file');
+  const result = document.getElementById('ingest-result');
+  if (!selectedIngestFile) {
+    result.style.display = 'block';
+    result.innerHTML = '<div class="result-box error">❌ Choose a file first.</div>';
+    return;
+  }
+  btn.disabled=true; btn.innerHTML='<span class="loader"></span>Ingesting...';
+  result.style.display='block';
+  result.innerHTML='<div class="result-box"><span class="loader"></span> Submitting...</div>';
+  stopJobPoll();
+  try {
+    const fd = new FormData();
+    fd.append('file', selectedIngestFile);
+    const src = document.getElementById('ingest-file-source').value.trim();
+    if (src) fd.append('source', src);
+    const d = await apiFetch(API+'/ingest/file', {method:'POST', body: fd});
+    activeIngestJob = { id: d.job_id, kind: 'file', label: selectedIngestFile.name };
+    renderIngestJob({ id: d.job_id, status: 'queued' });
+    if (!ws || ws.readyState !== 1) startJobPoll(d.job_id);
+  } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${esc(errorMessage(e))}</div>`; }
+  btn.disabled=false; btn.innerHTML='🚀 Ingest File';
 }
 
 // ═══════════════════════════════════════

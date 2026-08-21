@@ -9,11 +9,23 @@ import secrets
 import time
 from collections import deque
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 from src.agent.jobs import JobQueueFull
+from src.ingestion.file_extractor import MAX_UPLOAD_BYTES, check_upload_shape, safe_filename
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +34,26 @@ router = APIRouter(tags=["graphagent"])
 #: Generic 500 detail. Exception text is logged, never returned — raw errors
 #: leak bolt URIs, credentials and upstream API metadata to the client.
 INTERNAL_ERROR = "internal error"
+
+# `File`/`Form` make FastAPI evaluate multipart support at ROUTE-DEFINITION
+# time (i.e. at `import src.api.routes`) — if python-multipart isn't
+# installed, registering the route below would raise on import and take the
+# whole app down with it, the opposite of this project's graceful-degradation
+# pattern (and this repo has already lost python-multipart to a dead-dep
+# sweep once). So probe for it explicitly and only register /ingest/file when
+# it's present; everything else keeps working, that one route 404s instead.
+try:
+    import python_multipart  # noqa: F401  (>=0.0.12 module name)
+
+    HAS_MULTIPART = True
+except ImportError:
+    try:
+        import multipart  # noqa: F401  (older releases)
+
+        HAS_MULTIPART = True
+    except ImportError:
+        HAS_MULTIPART = False
+        log.warning("python-multipart not installed — /ingest/file disabled")
 
 
 # ------------------------------------------------------------------
@@ -246,6 +278,99 @@ async def ingest_text(req: IngestTextRequest, request: Request, wait: bool = Que
     if final["status"] != "succeeded":
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR)
     return JSONResponse(status_code=200, content=final["result"])
+
+
+async def _read_upload_capped(file: UploadFile) -> bytes | None:
+    """Read an upload up to MAX_UPLOAD_BYTES; never materialize more.
+
+    Honest limit: by the time this handler runs, Starlette has already
+    buffered the entire multipart body (spooling to a temp file past 1MB) —
+    so this cap bounds our in-process bytes and the job's payload, not the
+    network transfer itself. A reverse-proxy body limit is the real front
+    door against an oversized upload saturating the connection.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(65_536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+if HAS_MULTIPART:
+
+    @router.post("/ingest/file", status_code=202, dependencies=INGEST_DEP)
+    async def ingest_file(
+        request: Request,
+        file: UploadFile = File(...),  # noqa: B008 (FastAPI DI pattern; UploadFile isn't a ruff-recognized immutable type)
+        source: str | None = Form(default=None, max_length=300),
+        wait: bool = Query(default=False),
+    ):
+        """Submit a file ingest job. Returns 202 with a job id, or the ingest
+        result synchronously (200) when `wait=true`.
+        """
+        agent = request.app.state.agent
+        jobs = request.app.state.jobs
+
+        # Validation before reading bytes — reject cheaply on filename/type
+        # before paying for the (capped) body read.
+        name = safe_filename(file.filename or "")
+        if name is None:
+            # 422: same meaning pydantic body-validation failures already use
+            # in this file — a malformed/missing filename, not a content issue.
+            raise HTTPException(status_code=422, detail="invalid filename")
+        declared = (file.content_type or "").split(";", 1)[0].strip().lower() or None
+        type_error = check_upload_shape(name, declared)
+        if type_error:
+            # 415: purpose-built "unsupported media type" — the frontend maps
+            # this status to a friendly "we can't read that file type" message.
+            raise HTTPException(status_code=415, detail=type_error)
+        data = await _read_upload_capped(file)
+        if data is None:
+            # 413: oversize payload.
+            raise HTTPException(status_code=413, detail="file too large (max 3 MB)")
+        if not data:
+            raise HTTPException(status_code=422, detail="empty file")
+        source = (source or "").strip() or None
+
+        # The UploadFile is closed once the response is sent — long before a
+        # queued job's worker runs — so `run` must close over the bytes
+        # already read (`data`), never `file` itself.
+        async def run(progress):
+            return await agent.ingest_file(
+                data, name, content_type=declared, source=source, progress=progress
+            )
+
+        try:
+            # Job params carry only filename/content_type/size_bytes — never
+            # the bytes themselves, since the record is public via GET
+            # /api/jobs.
+            record = jobs.submit(
+                "file", {"filename": name, "content_type": declared, "size_bytes": len(data)}, run
+            )
+        except JobQueueFull:
+            raise HTTPException(status_code=429, detail="job queue full") from None
+        except Exception:
+            log.exception("Failed to submit ingest job")
+            raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+
+        if not wait:
+            content = {"job_id": record["id"], "status": record["status"]}
+            return JSONResponse(status_code=202, content=content)
+
+        try:
+            final = await jobs.wait(record["id"])
+        except Exception:
+            log.exception("Failed waiting for ingest job")
+            raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+        if final["status"] != "succeeded":
+            raise HTTPException(status_code=500, detail=INTERNAL_ERROR)
+        return JSONResponse(status_code=200, content=final["result"])
 
 
 # ------------------------------------------------------------------
