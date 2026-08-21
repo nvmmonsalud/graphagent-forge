@@ -1,12 +1,35 @@
 """Kimi AI (Moonshot) client — OpenAI-compatible wrapper."""
 from __future__ import annotations
 
+import json
+import logging
 import os
 from typing import Any
 
 from openai import AsyncOpenAI
 
+log = logging.getLogger(__name__)
+
+DEFAULT_KIMI_MODEL = os.getenv("KIMI_MODEL", "kimi-k2.7-code-highspeed")
+DEFAULT_KIMI_BASE_URL = "https://api.moonshot.ai/v1"
+MISSING_KEY_ERROR = "KIMI_API_KEY not configured"
+
 _kimi_client: AsyncOpenAI | None = None
+
+
+def _api_key() -> str:
+    """Return the configured Kimi API key, or '' if unset/blank."""
+    return (os.getenv("KIMI_API_KEY") or "").strip()
+
+
+def _resolve_model(model: str | None) -> str:
+    """Explicit argument > live env > module default.
+
+    The live env re-read matters because src/main.py calls load_dotenv() *after*
+    importing this module, so KIMI_MODEL can land in os.environ only after
+    DEFAULT_KIMI_MODEL was computed at import time.
+    """
+    return model or os.environ.get("KIMI_MODEL") or DEFAULT_KIMI_MODEL
 
 
 def get_kimi_client() -> AsyncOpenAI:
@@ -14,17 +37,21 @@ def get_kimi_client() -> AsyncOpenAI:
     global _kimi_client
     if _kimi_client is None:
         _kimi_client = AsyncOpenAI(
-            api_key=os.getenv("KIMI_API_KEY", "«redacted:sk-…»"),
-            base_url=os.getenv("KIMI_BASE_URL", "https://api.moonshot.cn/v1"),
+            api_key=_api_key(),
+            base_url=os.getenv("KIMI_BASE_URL", DEFAULT_KIMI_BASE_URL),
         )
     return _kimi_client
 
 
-async def extract_entities(text: str, model: str = "kimi-k2.7-code-highspeed") -> dict[str, Any]:
+async def extract_entities(text: str, model: str | None = None) -> dict[str, Any]:
     """Ask Kimi to extract entities and relationships from text.
 
     Returns structured JSON with nodes and edges for graph insertion.
     """
+    if not _api_key():
+        log.warning("extract_entities called without KIMI_API_KEY configured")
+        return {"nodes": [], "edges": [], "error": MISSING_KEY_ERROR}
+
     client = get_kimi_client()
 
     system_prompt = """You are an expert knowledge graph builder.
@@ -33,10 +60,13 @@ Given text, extract ALL entities and their relationships.
 Return valid JSON with this exact structure:
 {
   "nodes": [
-    {"id": "unique_id", "label": "EntityName", "type": "Person|Org|Concept|Event|Place|Technology", "properties": {"summary": "one-line description"}}
+    {"id": "unique_id", "label": "EntityName",
+     "type": "Person|Org|Concept|Event|Place|Technology",
+     "properties": {"summary": "one-line description"}}
   ],
   "edges": [
-    {"source": "source_id", "target": "target_id", "relationship": "RELATES_TO", "properties": {"context": "brief context"}}
+    {"source": "source_id", "target": "target_id", "relationship": "RELATES_TO",
+     "properties": {"context": "brief context"}}
   ]
 }
 
@@ -47,17 +77,22 @@ Rules:
 - Capture temporal relationships when present
 - Be specific, not generic"""
 
-    response = await client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Extract knowledge graph from:\n\n{text}"},
-        ],
-        temperature=1,
-        response_format={"type": "json_object"},
-    )
-
-    import json
+    try:
+        response = await client.chat.completions.create(
+            model=_resolve_model(model),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Extract knowledge graph from:\n\n{text}"},
+            ],
+            # Structured JSON extraction must be near-deterministic.
+            temperature=0.2,
+            max_tokens=4096,
+            timeout=60,
+            response_format={"type": "json_object"},
+        )
+    except Exception as e:
+        log.error("Kimi extract_entities request failed: %s", e)
+        return {"nodes": [], "edges": [], "error": f"LLM request failed: {type(e).__name__}"}
 
     try:
         return json.loads(response.choices[0].message.content or "{}")
@@ -65,27 +100,37 @@ Rules:
         return {"nodes": [], "edges": [], "error": f"Failed to parse LLM JSON output: {e}"}
 
 
-async def answer_query(question: str, context: str, model: str = "kimi-k2.7-code-highspeed") -> str:
+async def answer_query(question: str, context: str, model: str | None = None) -> str:
     """Answer a question using graph context (GraphRAG style)."""
+    if not _api_key():
+        log.warning("answer_query called without KIMI_API_KEY configured")
+        return f"Cannot answer: {MISSING_KEY_ERROR}."
+
     client = get_kimi_client()
 
-    response = await client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a precise research assistant. Answer questions using ONLY "
-                    "the provided knowledge graph context. Cite specific entities and "
-                    "relationships. If the context doesn't contain enough info, say so."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Knowledge Graph Context:\n{context}\n\nQuestion: {question}",
-            },
-        ],
-        temperature=1,
-    )
+    try:
+        response = await client.chat.completions.create(
+            model=_resolve_model(model),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a precise research assistant. Answer questions using ONLY "
+                        "the provided knowledge graph context. Cite specific entities and "
+                        "relationships. If the context doesn't contain enough info, say so."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Knowledge Graph Context:\n{context}\n\nQuestion: {question}",
+                },
+            ],
+            temperature=0.6,
+            max_tokens=1024,
+            timeout=60,
+        )
+    except Exception as e:
+        log.error("Kimi answer_query request failed: %s", e)
+        return f"Cannot answer: LLM request failed ({type(e).__name__})."
 
     return response.choices[0].message.content or "No response generated."

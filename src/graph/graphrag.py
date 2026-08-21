@@ -14,7 +14,7 @@ log = logging.getLogger(__name__)
 class GraphRAGEngine:
     """Graph-enhanced RAG: retrieve from graph, reason with LLM."""
 
-    def __init__(self, neo4j: Neo4jClient, nosana: "NosanaClient | None" = None):
+    def __init__(self, neo4j: Neo4jClient, nosana: NosanaClient | None = None):
         self.neo4j = neo4j
         # Share the agent's client when one is passed so `last_embedding_method`
         # has a single source of truth; otherwise stand up our own.
