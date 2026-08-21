@@ -8,6 +8,7 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+pythonpath = ["."]
 markers = [
     "integration: requires a live Neo4j",
 ]
