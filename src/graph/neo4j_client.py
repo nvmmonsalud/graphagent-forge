@@ -6,7 +6,22 @@ from typing import Any
 
 from neo4j import AsyncGraphDatabase
 
+from src.graph.normalize import normalize_label
+
 log = logging.getLogger(__name__)
+
+# Node provenance is a LIST property (`source_docs`) — the same entity can be
+# asserted by several documents. Edges keep a SCALAR `r.source_doc` because an
+# edge is a per-document assertion.
+_NODE_FIELDS = (
+    "n.id AS id, n.label AS label, n.type AS type, "
+    "n.summary AS summary, n.source_docs AS source_docs, n.aliases AS aliases"
+)
+
+# Shared map projection for candidate/merge payloads.
+_NODE_PROJECTION = "{.id, .label, .type, .summary, .source_docs}"
+
+_MIGRATE_BATCH = 500
 
 
 class Neo4jClient:
@@ -36,13 +51,74 @@ class Neo4jClient:
             "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Entity) REQUIRE n.id IS UNIQUE",
             "CREATE INDEX IF NOT EXISTS FOR (n:Entity) ON (n.label)",
             "CREATE INDEX IF NOT EXISTS FOR (n:Entity) ON (n.type)",
+            # Legacy scalar-provenance index: kept so pre-migration graphs stay
+            # queryable while `_migrate_source_docs` drains them.
             "CREATE INDEX IF NOT EXISTS FOR (n:Entity) ON (n.source_doc)",
+            "CREATE INDEX entity_norm_label IF NOT EXISTS FOR (n:Entity) ON (n.norm_label)",
         ]
         async with self.driver.session() as session:
             for q in queries:
                 await session.run(q)
+
+        await self._migrate_source_docs()
+        await self._backfill_norm_labels()
         await self.init_vector_index()
         log.info("Neo4j schema initialized")
+
+    async def _migrate_source_docs(self) -> None:
+        """Fold the legacy scalar `n.source_doc` into the `n.source_docs` list.
+
+        Idempotent (nodes lose `source_doc` as they are migrated, so a re-run
+        matches nothing) and batched. MUST run as an auto-commit query:
+        `CALL {} IN TRANSACTIONS` is rejected inside an explicit transaction.
+        """
+        query = f"""
+        MATCH (n:Entity) WHERE n.source_doc IS NOT NULL
+        CALL {{
+          WITH n
+          SET n.source_docs = coalesce(n.source_docs, []) + n.source_doc
+          REMOVE n.source_doc
+        }} IN TRANSACTIONS OF {_MIGRATE_BATCH} ROWS
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query)
+            summary = await result.consume()
+        migrated = summary.counters.properties_set if summary else 0
+        if migrated:
+            log.info("Migrated legacy source_doc → source_docs (%d property writes)", migrated)
+
+    async def _backfill_norm_labels(self) -> None:
+        """Fill `n.norm_label` for nodes written before normalization existed.
+
+        Done in Python because punctuation stripping isn't expressible in plain
+        Cypher (no APOC). Idempotent: normalized nodes are never re-selected,
+        and a punctuation-only label normalizes to '' which is still non-null.
+        """
+        fetch = f"""
+        MATCH (n:Entity)
+        WHERE n.norm_label IS NULL AND n.label IS NOT NULL
+        RETURN n.id AS id, n.label AS label
+        LIMIT {_MIGRATE_BATCH}
+        """
+        write = """
+        UNWIND $items AS it
+        MATCH (n:Entity {id: it.id})
+        SET n.norm_label = it.norm_label
+        """
+        total = 0
+        async with self.driver.session() as session:
+            while True:
+                result = await session.run(fetch)
+                rows = [dict(record) async for record in result]
+                if not rows:
+                    break
+                items = [
+                    {"id": r["id"], "norm_label": normalize_label(r["label"])} for r in rows
+                ]
+                await session.run(write, items=items)
+                total += len(items)
+        if total:
+            log.info("Backfilled norm_label on %d nodes", total)
 
     async def init_vector_index(self):
         """Create a vector index on Entity.embedding for semantic similarity."""
@@ -70,17 +146,23 @@ class Neo4jClient:
         SET n.label = $label,
             n.type = $type,
             n.summary = $summary,
-            n.source_doc = $source_doc,
+            n.norm_label = $norm_label,
+            n.source_docs = CASE
+              WHEN n.source_docs IS NULL THEN [$source_doc]
+              WHEN NOT $source_doc IN n.source_docs THEN n.source_docs + $source_doc
+              ELSE n.source_docs END,
             n.updated_at = datetime()
         """
         props = node.get("properties", {})
+        label = node.get("label", "")
         async with self.driver.session() as session:
             await session.run(
                 query,
                 id=node["id"],
-                label=node.get("label", ""),
+                label=label,
                 type=node.get("type", "Unknown"),
                 summary=props.get("summary", ""),
+                norm_label=normalize_label(label),
                 source_doc=source_doc,
             )
 
@@ -121,6 +203,7 @@ class Neo4jClient:
                 "label": n.get("label", ""),
                 "type": n.get("type", "Unknown"),
                 "summary": n.get("properties", {}).get("summary", ""),
+                "norm_label": normalize_label(n.get("label", "")),
             }
             for n in nodes
         ]
@@ -140,7 +223,11 @@ class Neo4jClient:
         SET n.label = node.label,
             n.type = node.type,
             n.summary = node.summary,
-            n.source_doc = $source_doc,
+            n.norm_label = node.norm_label,
+            n.source_docs = CASE
+              WHEN n.source_docs IS NULL THEN [$source_doc]
+              WHEN NOT $source_doc IN n.source_docs THEN n.source_docs + $source_doc
+              ELSE n.source_docs END,
             n.updated_at = datetime()
         """
         edge_query = """
@@ -173,12 +260,17 @@ class Neo4jClient:
     # Read / query operations
     # ------------------------------------------------------------------
     async def get_node_context(self, label: str, depth: int = 2) -> str:
-        """Get a node and its N-hop neighborhood as text context for GraphRAG."""
+        """Get a node and its N-hop neighborhood as text context for GraphRAG.
+
+        The center is matched case-insensitively on `label` *or* on any merged
+        alias, so questions phrased with a duplicate's wording still resolve.
+        """
         # Neo4j requires a literal bound for variable-length patterns.
         # Clamp the caller-provided value before safe interpolation.
         safe_depth = max(1, min(int(depth), 4))
         query = f"""
-        MATCH (n:Entity {{label: $label}})
+        MATCH (n:Entity)
+        WHERE toLower(n.label) = toLower($label) OR $label IN coalesce(n.aliases, [])
         MATCH path = (n)-[r*1..{safe_depth}]-(m:Entity)
         RETURN n.label AS center, n.type AS center_type, n.summary AS center_summary,
                [rel in r | coalesce(rel.type, type(rel))] AS rel_types,
@@ -201,13 +293,13 @@ class Neo4jClient:
         return "\n".join(lines) if lines else f"No context found for '{label}'"
 
     async def search_nodes(self, query_text: str, limit: int = 10) -> list[dict]:
-        """Full-text search across entity labels and summaries."""
-        query = """
+        """Full-text search across entity labels, aliases, and summaries."""
+        query = f"""
         MATCH (n:Entity)
         WHERE toLower(n.label) CONTAINS toLower($q)
            OR toLower(n.summary) CONTAINS toLower($q)
-        RETURN n.id AS id, n.label AS label, n.type AS type,
-               n.summary AS summary, n.source_doc AS source_doc
+           OR any(a IN coalesce(n.aliases, []) WHERE toLower(a) CONTAINS toLower($q))
+        RETURN {_NODE_FIELDS}
         LIMIT $limit
         """
         async with self.driver.session() as session:
@@ -220,7 +312,8 @@ class Neo4jClient:
         CALL db.index.vector.queryNodes('entity_embedding', $limit, $embedding)
         YIELD node, score
         RETURN node.id AS id, node.label AS label, node.type AS type,
-               node.summary AS summary, node.source_doc AS source_doc, score
+               node.summary AS summary, node.source_docs AS source_docs,
+               node.aliases AS aliases, score
         """
         async with self.driver.session() as session:
             result = await session.run(query, embedding=embedding, limit=int(limit))
@@ -249,11 +342,16 @@ class Neo4jClient:
 
         Each endpoint is resolved separately (LIMIT 1) to avoid a cartesian
         product, and the path length is bounded to keep the search cheap.
+        Endpoints also resolve through merged aliases.
         """
         query = """
-        MATCH (a:Entity) WHERE toLower(a.label) = toLower($from_label)
+        MATCH (a:Entity)
+        WHERE toLower(a.label) = toLower($from_label)
+           OR $from_label IN coalesce(a.aliases, [])
         WITH a LIMIT 1
-        MATCH (b:Entity) WHERE toLower(b.label) = toLower($to_label)
+        MATCH (b:Entity)
+        WHERE toLower(b.label) = toLower($to_label)
+           OR $to_label IN coalesce(b.aliases, [])
         WITH a, b LIMIT 1
         MATCH path = shortestPath((a)-[*..6]-(b))
         RETURN [n IN nodes(path) | {
@@ -291,8 +389,7 @@ class Neo4jClient:
         edge_limit = f"LIMIT {safe_limit * 2}" if safe_limit is not None else ""
         nodes_query = f"""
         MATCH (n:Entity)
-        RETURN n.id AS id, n.label AS label, n.type AS type,
-               n.summary AS summary, n.source_doc AS source_doc
+        RETURN {_NODE_FIELDS}
         {node_limit}
         """
         edges_query = f"""
@@ -315,9 +412,9 @@ class Neo4jClient:
         # clamp the caller-provided value before safe interpolation.
         safe_limit = max(1, min(int(limit), 5000))
         query = f"""
-        MATCH (n:Entity {{source_doc: $source_doc}})
-        RETURN n.id AS id, n.label AS label, n.type AS type,
-               n.summary AS summary, n.source_doc AS source_doc
+        MATCH (n:Entity)
+        WHERE $source_doc IN coalesce(n.source_docs, [])
+        RETURN {_NODE_FIELDS}
         LIMIT {safe_limit}
         """
         async with self.driver.session() as session:
@@ -325,11 +422,17 @@ class Neo4jClient:
             return [dict(record) async for record in result]
 
     async def get_graph_data_by_source(self, source_doc: str) -> dict:
-        """Get the nodes + edges belonging to one source document (for visualization)."""
-        nodes_query = """
-        MATCH (n:Entity {source_doc: $source_doc})
-        RETURN n.id AS id, n.label AS label, n.type AS type,
-               n.summary AS summary, n.source_doc AS source_doc
+        """Get the nodes + edges belonging to one source document (for visualization).
+
+        Boundary nodes (endpoints of this source's edges that are themselves
+        members of other sources only — e.g. after a merge) are included so no
+        edge can reference a missing node: the D3 view hard-crashes on that.
+        """
+        nodes_query = f"""
+        MATCH (n:Entity)
+        WHERE $source_doc IN coalesce(n.source_docs, [])
+           OR EXISTS {{ MATCH (n)-[r:RELATES_TO]-() WHERE r.source_doc = $source_doc }}
+        RETURN {_NODE_FIELDS}
         """
         edges_query = """
         MATCH (a:Entity)-[r]->(b:Entity)
@@ -348,11 +451,11 @@ class Neo4jClient:
     async def get_sources(self) -> list[dict]:
         """List ingested source documents with their entity counts."""
         query = """
-        MATCH (n:Entity)
-        WHERE n.source_doc IS NOT NULL AND n.source_doc <> ''
-        RETURN n.source_doc AS source_doc,
-               count(n) AS node_count,
-               toString(max(n.updated_at)) AS updated_at
+        MATCH (n:Entity) WHERE n.source_docs IS NOT NULL
+        UNWIND n.source_docs AS src
+        WITH src AS source_doc, count(*) AS node_count, toString(max(n.updated_at)) AS updated_at
+        WHERE source_doc <> ''
+        RETURN source_doc, node_count, updated_at
         ORDER BY node_count DESC
         """
         async with self.driver.session() as session:
@@ -360,20 +463,65 @@ class Neo4jClient:
             return [dict(record) async for record in result]
 
     async def delete_source(self, source_doc: str) -> dict:
-        """Delete every entity (and its relationships) from one source document."""
-        query = """
-        MATCH (n:Entity {source_doc: $source_doc})
+        """Remove one source document from the graph.
+
+        Edges are per-document assertions, so they are deleted outright. Nodes
+        only lose their membership in `source_docs`; a node is deleted once no
+        source claims it any more.
+        """
+        edges_query = """
+        MATCH ()-[r:RELATES_TO]->()
+        WHERE r.source_doc = $source_doc
+        WITH collect(r) AS rels, count(r) AS deleted
+        FOREACH (x IN rels | DELETE x)
+        RETURN deleted
+        """
+        membership_query = """
+        MATCH (n:Entity)
+        WHERE $source_doc IN coalesce(n.source_docs, [])
+        SET n.source_docs = [s IN n.source_docs WHERE s <> $source_doc]
+        RETURN count(n) AS removed
+        """
+        orphans_query = """
+        MATCH (n:Entity)
+        WHERE n.source_docs = []
         WITH collect(n) AS nodes, count(n) AS deleted
         FOREACH (x IN nodes | DETACH DELETE x)
         RETURN deleted
         """
-        async with self.driver.session() as session:
-            result = await session.run(query, source_doc=source_doc)
-            record = await result.single()
-            deleted = record["deleted"] if record else 0
 
-        log.info("Deleted %d nodes for source: %s", deleted, source_doc)
-        return {"deleted_nodes": deleted}
+        async with self.driver.session() as session:
+            tx = await session.begin_transaction()
+            try:
+                result = await tx.run(edges_query, source_doc=source_doc)
+                record = await result.single()
+                deleted_edges = record["deleted"] if record else 0
+
+                result = await tx.run(membership_query, source_doc=source_doc)
+                record = await result.single()
+                removed_memberships = record["removed"] if record else 0
+
+                result = await tx.run(orphans_query)
+                record = await result.single()
+                deleted_nodes = record["deleted"] if record else 0
+
+                await tx.commit()
+            except Exception:
+                await tx.rollback()
+                raise
+
+        log.info(
+            "Deleted source '%s': %d nodes, %d memberships, %d edges",
+            source_doc,
+            deleted_nodes,
+            removed_memberships,
+            deleted_edges,
+        )
+        return {
+            "deleted_nodes": deleted_nodes,
+            "removed_memberships": removed_memberships,
+            "deleted_edges": deleted_edges,
+        }
 
     async def clear_graph(self) -> dict:
         """Delete every entity in the graph. Counts and deletes in one transaction."""
@@ -391,17 +539,273 @@ class Neo4jClient:
         log.info("Graph cleared: %d nodes deleted", deleted)
         return {"deleted_nodes": deleted}
 
-    async def set_node_embeddings(self, items: list[dict]) -> None:
+    async def set_node_embeddings(self, items: list[dict], method: str = "unknown") -> None:
         """Batch-attach embedding vectors to existing nodes.
 
-        Each item is {"id": str, "embedding": list[float]}.
+        Each item is {"id": str, "embedding": list[float]}. `method` records
+        which embedding path produced the vectors ("nosana" vs the local hash
+        fallback) — duplicate suggestion only trusts real semantic vectors.
         """
         if not items:
             return
         query = """
         UNWIND $items AS it
         MATCH (n:Entity {id: it.id})
-        SET n.embedding = it.embedding
+        SET n.embedding = it.embedding,
+            n.embedding_method = $method
         """
         async with self.driver.session() as session:
-            await session.run(query, items=items)
+            await session.run(query, items=items, method=method)
+
+    # ------------------------------------------------------------------
+    # Deduplication: candidate generation
+    # ------------------------------------------------------------------
+    async def find_duplicate_groups(
+        self, limit: int = 20, source_doc: str | None = None
+    ) -> list[dict]:
+        """Group entities that share a normalized label.
+
+        Groups whose members all carry the exact same provenance set are
+        dropped: those are same-document repeats, not cross-document
+        duplicates worth merging. Returns
+        ``[{"norm_label": str, "nodes": [{id, label, type, summary, source_docs}]}]``.
+        """
+        safe_limit = max(1, min(int(limit), 100))
+        # Over-fetch: the "not sharing all sources" post-filter runs in Python,
+        # so a raw LIMIT would silently starve the result.
+        fetch_limit = min(safe_limit * 5, 500)
+        query = f"""
+        MATCH (n:Entity)
+        WHERE n.norm_label IS NOT NULL AND n.norm_label <> ''
+        WITH n.norm_label AS norm_label, collect(n {_NODE_PROJECTION}) AS nodes
+        WITH norm_label, nodes, size(nodes) AS group_size
+        WHERE group_size > 1
+        RETURN norm_label, nodes
+        ORDER BY group_size DESC
+        LIMIT $fetch_limit
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, fetch_limit=fetch_limit)
+            rows = [dict(record) async for record in result]
+
+        groups: list[dict] = []
+        for row in rows:
+            nodes = row["nodes"] or []
+            doc_sets = {frozenset(n.get("source_docs") or []) for n in nodes}
+            if len(doc_sets) <= 1:
+                # Every member has identical provenance — nothing cross-document.
+                continue
+            if source_doc is not None and not any(
+                source_doc in (n.get("source_docs") or []) for n in nodes
+            ):
+                continue
+            groups.append({"norm_label": row["norm_label"], "nodes": nodes})
+            if len(groups) >= safe_limit:
+                break
+
+        return groups
+
+    async def suggest_similar(
+        self, threshold: float = 0.90, cap: int = 200, limit: int = 20
+    ) -> dict:
+        """Suggest near-duplicate pairs by embedding similarity.
+
+        Only real (Nosana) embeddings are considered — the deterministic hash
+        fallback carries no semantic signal, so suggesting from it would be
+        noise. Returns
+        ``{"pairs": [{"nodes": [a, b], "similarity": float}], "enabled": bool,
+        "reason": str | None}``.
+        """
+        safe_threshold = max(0.5, min(float(threshold), 1.0))
+        safe_cap = max(2, min(int(cap), 500))
+        safe_limit = max(1, min(int(limit), 100))
+
+        count_query = """
+        MATCH (n:Entity)
+        WHERE n.embedding_method = 'nosana' AND n.embedding IS NOT NULL
+        RETURN count(n) AS embedded
+        """
+        pairs_query = f"""
+        MATCH (a:Entity) WHERE a.embedding_method = 'nosana' AND a.embedding IS NOT NULL
+        WITH a ORDER BY a.updated_at DESC LIMIT $cap
+        WITH collect(a) AS ns
+        UNWIND range(0, size(ns)-2) AS i
+        UNWIND range(i+1, size(ns)-1) AS j
+        WITH ns[i] AS a, ns[j] AS b
+        WHERE a.norm_label <> b.norm_label
+        WITH a, b, vector.similarity.cosine(a.embedding, b.embedding) AS sim
+        WHERE sim >= $threshold
+        RETURN a {_NODE_PROJECTION} AS a, b {_NODE_PROJECTION} AS b, sim
+        ORDER BY sim DESC
+        LIMIT $limit
+        """
+
+        async with self.driver.session() as session:
+            result = await session.run(count_query)
+            record = await result.single()
+            embedded = record["embedded"] if record else 0
+            if embedded < 2:
+                return {
+                    "pairs": [],
+                    "enabled": False,
+                    "reason": (
+                        "semantic embeddings unavailable (hash fallback or no embedded "
+                        "nodes); set NOSANA_API_KEY and NOSANA_EMBEDDING_URL"
+                    ),
+                }
+
+            result = await session.run(
+                pairs_query, cap=safe_cap, threshold=safe_threshold, limit=safe_limit
+            )
+            pairs = [
+                {"nodes": [record["a"], record["b"]], "similarity": float(record["sim"])}
+                async for record in result
+            ]
+
+        return {"pairs": pairs, "enabled": True, "reason": None}
+
+    # ------------------------------------------------------------------
+    # Deduplication: merge
+    # ------------------------------------------------------------------
+    async def merge_nodes(self, node_ids: list[str], canonical_id: str | None = None) -> dict:
+        """Merge duplicate entities into one canonical node, in one transaction.
+
+        Edges of the duplicates are repointed at the canonical node (identical
+        (endpoint, type) pairs collapse), provenance is unioned, the
+        duplicates' labels/aliases become the canonical node's `aliases`, and
+        the longest summary wins. The canonical node's `norm_label` and
+        `embedding` are left alone — re-embedding is the agent layer's job.
+
+        Returns on success::
+
+            {"ok": True, "canonical_id": str, "aliases": [str], "merged": int,
+             "removed_ids": [str],
+             "canonical": {id, label, type, summary, source_docs, aliases},
+             "edges": [{"source", "target", "type"}]}
+
+        and ``{"ok": False, "missing": [ids]}`` when any id does not exist.
+        """
+        # De-duplicate while preserving order; fold in an explicit canonical id
+        # even when the caller left it out of node_ids.
+        ids: list[str] = []
+        for nid in list(node_ids or []) + ([canonical_id] if canonical_id else []):
+            if nid and nid not in ids:
+                ids.append(nid)
+        if not ids:
+            return {"ok": False, "missing": []}
+
+        validate_query = "MATCH (n:Entity) WHERE n.id IN $ids RETURN collect(n.id) AS found"
+        pick_query = """
+        MATCH (n:Entity) WHERE n.id IN $ids
+        WITH n ORDER BY size(coalesce(n.label, '')) DESC, n.updated_at DESC, n.id ASC
+        RETURN collect(n.id)[0] AS canonical_id
+        """
+        # `coalesce(r.type, 'RELATES_TO')` rather than a bare `r.type`: MERGE
+        # rejects a null property value, and both forms read back identically
+        # through `coalesce(r.type, type(r))`.
+        repoint_out_query = """
+        MATCH (c:Entity {id: $canonical_id})
+        UNWIND $dup_ids AS did
+        MATCH (d:Entity {id: did})-[r:RELATES_TO]->(m:Entity)
+        WHERE m.id <> $canonical_id AND NOT m.id IN $dup_ids
+        MERGE (c)-[nr:RELATES_TO {type: coalesce(r.type, 'RELATES_TO')}]->(m)
+        ON CREATE SET nr.context = r.context,
+                      nr.source_doc = r.source_doc,
+                      nr.updated_at = r.updated_at
+        DELETE r
+        """
+        repoint_in_query = """
+        MATCH (c:Entity {id: $canonical_id})
+        UNWIND $dup_ids AS did
+        MATCH (m:Entity)-[r:RELATES_TO]->(d:Entity {id: did})
+        WHERE m.id <> $canonical_id AND NOT m.id IN $dup_ids
+        MERGE (m)-[nr:RELATES_TO {type: coalesce(r.type, 'RELATES_TO')}]->(c)
+        ON CREATE SET nr.context = r.context,
+                      nr.source_doc = r.source_doc,
+                      nr.updated_at = r.updated_at
+        DELETE r
+        """
+        absorb_query = """
+        MATCH (c:Entity {id: $canonical_id})
+        OPTIONAL MATCH (d:Entity) WHERE d.id IN $dup_ids
+        WITH c, [x IN collect(d) WHERE x IS NOT NULL] AS dups
+        WITH c, dups,
+             coalesce(c.source_docs, [])
+               + reduce(acc = [], d IN dups | acc + coalesce(d.source_docs, [])) AS raw_docs,
+             coalesce(c.aliases, [])
+               + reduce(acc = [], d IN dups | acc + coalesce(d.aliases, []))
+               + [d IN dups WHERE d.label IS NOT NULL | d.label] AS raw_aliases,
+             reduce(best = coalesce(c.summary, ''), d IN dups |
+               CASE WHEN size(coalesce(d.summary, '')) > size(best)
+                    THEN coalesce(d.summary, '') ELSE best END) AS best_summary
+        WITH c, dups, best_summary,
+             reduce(u = [], s IN raw_docs |
+               CASE WHEN s IS NULL OR s IN u THEN u ELSE u + s END) AS source_docs,
+             reduce(u = [], s IN raw_aliases |
+               CASE WHEN s IS NULL OR s = '' OR s = c.label OR s IN u
+                    THEN u ELSE u + s END) AS aliases
+        SET c.source_docs = source_docs,
+            c.aliases = aliases,
+            c.summary = best_summary,
+            c.updated_at = datetime()
+        WITH c, dups, aliases, size(dups) AS merged
+        FOREACH (d IN dups | DETACH DELETE d)
+        RETURN c {.id, .label, .type, .summary, .source_docs, .aliases} AS canonical,
+               aliases, merged
+        """
+        edges_query = """
+        MATCH (a:Entity {id: $canonical_id})-[r:RELATES_TO]-(b:Entity)
+        RETURN startNode(r).id AS source, endNode(r).id AS target,
+               coalesce(r.type, type(r)) AS type
+        """
+
+        async with self.driver.session() as session:
+            tx = await session.begin_transaction()
+            try:
+                result = await tx.run(validate_query, ids=ids)
+                record = await result.single()
+                found = set(record["found"]) if record else set()
+                missing = [nid for nid in ids if nid not in found]
+                if missing:
+                    await tx.rollback()
+                    return {"ok": False, "missing": missing}
+
+                chosen = canonical_id
+                if chosen is None:
+                    result = await tx.run(pick_query, ids=ids)
+                    record = await result.single()
+                    chosen = record["canonical_id"] if record else None
+                if chosen is None:
+                    await tx.rollback()
+                    return {"ok": False, "missing": ids}
+
+                dup_ids = [nid for nid in ids if nid != chosen]
+
+                if dup_ids:
+                    await tx.run(repoint_out_query, canonical_id=chosen, dup_ids=dup_ids)
+                    await tx.run(repoint_in_query, canonical_id=chosen, dup_ids=dup_ids)
+
+                result = await tx.run(absorb_query, canonical_id=chosen, dup_ids=dup_ids)
+                record = await result.single()
+                canonical = dict(record["canonical"]) if record else {}
+                aliases = list(record["aliases"]) if record else []
+                merged = int(record["merged"]) if record else 0
+
+                result = await tx.run(edges_query, canonical_id=chosen)
+                edges = [dict(r) async for r in result]
+
+                await tx.commit()
+            except Exception:
+                await tx.rollback()
+                raise
+
+        log.info("Merged %d node(s) into '%s'", merged, chosen)
+        return {
+            "ok": True,
+            "canonical_id": chosen,
+            "aliases": aliases,
+            "merged": merged,
+            "removed_ids": dup_ids,
+            "canonical": canonical,
+            "edges": edges,
+        }
