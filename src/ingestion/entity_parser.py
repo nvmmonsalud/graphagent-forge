@@ -6,13 +6,18 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+_kimi_client: AsyncOpenAI | None = None
+
 
 def get_kimi_client() -> AsyncOpenAI:
-    """Create an AsyncOpenAI client pointed at Kimi/Moonshot."""
-    return AsyncOpenAI(
-        api_key=os.getenv("KIMI_API_KEY", "sk-placeholder"),
-        base_url=os.getenv("KIMI_BASE_URL", "https://api.moonshot.cn/v1"),
-    )
+    """Return a singleton AsyncOpenAI client pointed at Kimi/Moonshot."""
+    global _kimi_client
+    if _kimi_client is None:
+        _kimi_client = AsyncOpenAI(
+            api_key=os.getenv("KIMI_API_KEY", "«redacted:sk-…»"),
+            base_url=os.getenv("KIMI_BASE_URL", "https://api.moonshot.cn/v1"),
+        )
+    return _kimi_client
 
 
 async def extract_entities(text: str, model: str = "kimi-k2.7-code-highspeed") -> dict[str, Any]:
@@ -54,7 +59,10 @@ Rules:
 
     import json
 
-    return json.loads(response.choices[0].message.content or "{}")
+    try:
+        return json.loads(response.choices[0].message.content or "{}")
+    except json.JSONDecodeError as e:
+        return {"nodes": [], "edges": [], "error": f"Failed to parse LLM JSON output: {e}"}
 
 
 async def answer_query(question: str, context: str, model: str = "kimi-k2.7-code-highspeed") -> str:

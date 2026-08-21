@@ -41,7 +41,24 @@ class Neo4jClient:
         async with self.driver.session() as session:
             for q in queries:
                 await session.run(q)
+        await self.init_vector_index()
         log.info("Neo4j schema initialized")
+
+    async def init_vector_index(self):
+        """Create a vector index on Entity.embedding for semantic similarity."""
+        query = """
+        CREATE VECTOR INDEX entity_embedding IF NOT EXISTS
+        FOR (n:Entity) ON (n.embedding)
+        OPTIONS {
+          indexConfig: {
+            `vector.dimensions`: 384,
+            `vector.similarity_function`: 'cosine'
+          }
+        }
+        """
+        async with self.driver.session() as session:
+            await session.run(query)
+        log.info("Vector index created / already exists")
 
     # ------------------------------------------------------------------
     # Write operations
@@ -89,15 +106,56 @@ class Neo4jClient:
             )
 
     async def write_graph(self, graph_data: dict, source_doc: str = ""):
-        """Write a complete graph (nodes + edges) from extraction output."""
+        """Write a complete graph (nodes + edges) from extraction output.
+
+        Uses UNWIND for batch writes — one query per label instead of one per node.
+        """
         nodes = graph_data.get("nodes", [])
         edges = graph_data.get("edges", [])
 
-        for node in nodes:
-            await self.upsert_node(node, source_doc)
+        if nodes:
+            batch_nodes = [
+                {
+                    "id": n["id"],
+                    "label": n.get("label", ""),
+                    "type": n.get("type", "Unknown"),
+                    "summary": n.get("properties", {}).get("summary", ""),
+                }
+                for n in nodes
+            ]
+            node_query = """
+            UNWIND $nodes AS node
+            MERGE (n:Entity {id: node.id})
+            SET n.label = node.label,
+                n.type = node.type,
+                n.summary = node.summary,
+                n.source_doc = $source_doc,
+                n.updated_at = datetime()
+            """
+            async with self.driver.session() as session:
+                await session.run(node_query, nodes=batch_nodes, source_doc=source_doc)
 
-        for edge in edges:
-            await self.upsert_edge(edge, source_doc)
+        if edges:
+            batch_edges = [
+                {
+                    "source": e["source"],
+                    "target": e["target"],
+                    "rel_type": e.get("relationship", "RELATES_TO"),
+                    "context": e.get("properties", {}).get("context", ""),
+                }
+                for e in edges
+            ]
+            edge_query = """
+            UNWIND $edges AS edge
+            MATCH (a:Entity {id: edge.source})
+            MATCH (b:Entity {id: edge.target})
+            MERGE (a)-[r:RELATES_TO {type: edge.rel_type}]->(b)
+            SET r.context = edge.context,
+                r.source_doc = $source_doc,
+                r.updated_at = datetime()
+            """
+            async with self.driver.session() as session:
+                await session.run(edge_query, edges=batch_edges, source_doc=source_doc)
 
         log.info("Graph written: %d nodes, %d edges", len(nodes), len(edges))
         return {"nodes_written": len(nodes), "edges_written": len(edges)}
@@ -107,15 +165,18 @@ class Neo4jClient:
     # ------------------------------------------------------------------
     async def get_node_context(self, label: str, depth: int = 2) -> str:
         """Get a node and its N-hop neighborhood as text context for GraphRAG."""
-        query = """
-        MATCH (n:Entity {label: $label})
-        MATCH path = (n)-[r*1..%d]-(m:Entity)
+        # Neo4j requires a literal bound for variable-length patterns.
+        # Clamp the caller-provided value before safe interpolation.
+        safe_depth = max(1, min(int(depth), 4))
+        query = f"""
+        MATCH (n:Entity {{label: $label}})
+        MATCH path = (n)-[r*1..{safe_depth}]-(m:Entity)
         RETURN n.label AS center, n.type AS center_type, n.summary AS center_summary,
                [rel in r | type(rel)] AS rel_types,
                m.label AS neighbor, m.type AS neighbor_type, m.summary AS neighbor_summary
         ORDER BY length(path)
         LIMIT 50
-        """ % depth
+        """
 
         lines = []
         async with self.driver.session() as session:
@@ -136,11 +197,25 @@ class Neo4jClient:
         MATCH (n:Entity)
         WHERE toLower(n.label) CONTAINS toLower($q)
            OR toLower(n.summary) CONTAINS toLower($q)
-        RETURN n.id AS id, n.label AS label, n.type AS type, n.summary AS summary
+        RETURN n.id AS id, n.label AS label, n.type AS type,
+               n.summary AS summary, n.source_doc AS source_doc
         LIMIT $limit
         """
         async with self.driver.session() as session:
             result = await session.run(query, q=query_text, limit=limit)
+            return [dict(record) async for record in result]
+
+    async def vector_search(self, embedding: list[float], limit: int = 10) -> list[dict]:
+        """Find entities by cosine similarity against a pre-computed embedding vector."""
+        query = """
+        CALL db.index.vector.queryNodes('entity_embedding', $limit, $embedding)
+        YIELD node AS n, score
+        RETURN n.id AS id, n.label AS label, n.type AS type,
+               n.summary AS summary, n.source_doc AS source_doc, score
+        ORDER BY score DESC
+        """
+        async with self.driver.session() as session:
+            result = await session.run(query, embedding=embedding, limit=limit)
             return [dict(record) async for record in result]
 
     async def get_stats(self) -> dict:
@@ -161,17 +236,56 @@ class Neo4jClient:
                 "entity_types": record["entity_types"],
             }
 
-    async def get_all_graph_data(self) -> dict:
-        """Get all nodes and edges for visualization."""
-        nodes_query = """
-        MATCH (n:Entity)
-        RETURN n.id AS id, n.label AS label, n.type AS type, n.summary AS summary
-        LIMIT 500
+    async def find_path(self, from_label: str, to_label: str) -> list[dict]:
+        """Find shortest path between two entities using Cypher shortestPath."""
+        query = """
+        MATCH (a:Entity), (b:Entity)
+        WHERE toLower(a.label) = toLower($from_label)
+          AND toLower(b.label) = toLower($to_label)
+        MATCH path = shortestPath((a)-[*]-(b))
+        RETURN [n IN nodes(path) | {
+            id: n.id, label: n.label, type: n.type, summary: n.summary
+        }] AS path_nodes,
+        [r IN relationships(path) | {
+            source: startNode(r).id,
+            target: endNode(r).id,
+            type: type(r),
+            context: r.context
+        }] AS path_edges
+        LIMIT 1
         """
-        edges_query = """
+        async with self.driver.session() as session:
+            result = await session.run(query, from_label=from_label, to_label=to_label)
+            record = await result.single()
+            if not record:
+                return []
+
+            path_nodes = record["path_nodes"]
+            path_edges = record["path_edges"]
+
+            # Build alternating node/edge list
+            path = []
+            for i, node in enumerate(path_nodes):
+                path.append({"node": node})
+                if i < len(path_edges):
+                    path.append({"relationship": path_edges[i]})
+            return path
+
+    async def get_all_graph_data(self, limit: int | None = 500) -> dict:
+        """Get graph data for visualization or full integrity checks."""
+        safe_limit = max(1, min(int(limit), 5000)) if limit is not None else None
+        node_limit = f"LIMIT {safe_limit}" if safe_limit is not None else ""
+        edge_limit = f"LIMIT {safe_limit * 2}" if safe_limit is not None else ""
+        nodes_query = f"""
+        MATCH (n:Entity)
+        RETURN n.id AS id, n.label AS label, n.type AS type,
+               n.summary AS summary, n.source_doc AS source_doc
+        {node_limit}
+        """
+        edges_query = f"""
         MATCH (a:Entity)-[r]->(b:Entity)
         RETURN a.id AS source, b.id AS target, type(r) AS type
-        LIMIT 1000
+        {edge_limit}
         """
         async with self.driver.session() as session:
             nodes_result = await session.run(nodes_query)

@@ -1,7 +1,9 @@
 """URL and document content extraction."""
 from __future__ import annotations
 
+import ipaddress
 import logging
+import socket
 from typing import Any
 from urllib.parse import urlparse
 
@@ -13,6 +15,17 @@ log = logging.getLogger(__name__)
 
 async def extract_from_url(url: str) -> dict[str, Any]:
     """Fetch a URL and extract clean text content."""
+    # SSRF guard: block requests to private/reserved IPs
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+    try:
+        resolved = socket.getaddrinfo(hostname, None)
+        ip = ipaddress.ip_address(resolved[0][4][0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            return {"url": url, "content": "", "error": f"Blocked: {hostname} resolves to private/reserved IP {ip}"}
+    except (socket.gaierror, ValueError) as e:
+        return {"url": url, "content": "", "error": f"Failed to resolve hostname {hostname}: {e}"}
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                        "AppleWebKit/537.36 (KHTML, like Gecko) "

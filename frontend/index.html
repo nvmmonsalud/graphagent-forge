@@ -458,6 +458,88 @@ body {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ═══════ PATH FINDER ═══════ */
+.path-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 1rem;
+  align-items: end;
+  margin-top: 1.2rem;
+}
+@media (max-width: 600px) { .path-grid { grid-template-columns: 1fr; } }
+
+.path-result {
+  margin-top: 1.2rem;
+  padding: 1.2rem;
+  background: var(--surface-solid);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  font-size: 0.88rem;
+  line-height: 1.7;
+}
+.path-node {
+  display: inline-block;
+  background: var(--accent);
+  color: #fff;
+  padding: 0.2rem 0.6rem;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  margin: 0.1rem 0.2rem;
+}
+.path-edge {
+  display: inline-block;
+  color: var(--accent2);
+  font-size: 0.75rem;
+  font-family: 'JetBrains Mono', monospace;
+  padding: 0 0.3rem;
+}
+.path-arrow {
+  color: var(--muted);
+  font-size: 1rem;
+  vertical-align: middle;
+}
+
+/* ═══════ PROVENANCE ═══════ */
+.provenance {
+  margin-top: 0.8rem;
+  padding-top: 0.8rem;
+  border-top: 1px solid var(--border);
+}
+.provenance .prov-label {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  margin-bottom: 0.3rem;
+}
+.provenance .prov-tag {
+  display: inline-block;
+  background: rgba(0,229,200,0.1);
+  color: var(--accent2);
+  border: 1px solid rgba(0,229,200,0.2);
+  padding: 0.15rem 0.5rem;
+  border-radius: 5px;
+  font-size: 0.72rem;
+  margin: 0.1rem 0.15rem;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* ═══════ LIVE PULSE ═══════ */
+@keyframes nodePulse {
+  0% { r: 20; opacity: 1; }
+  50% { opacity: 0.8; }
+  100% { opacity: 1; }
+}
+.node-new {
+  animation: nodeGrow 0.6s ease-out forwards;
+}
+@keyframes nodeGrow {
+  0% { r: 20; }
+  60% { r: 6; }
+  100% { /* handled by D3 default radius */ }
+}
+
 /* ═══════ SCROLL REVEAL ═══════ */
 .reveal {
   opacity: 0;
@@ -621,6 +703,27 @@ footer a { color: var(--accent2); text-decoration: none; }
   </div>
 </section>
 
+<!-- ═══════ PATH FINDER ═══════ -->
+<section class="section" id="path">
+  <div class="section-inner reveal">
+    <div class="section-label">05 — Path Finder</div>
+    <div class="section-title">Connect the dots.</div>
+    <div class="section-desc">Find the shortest path between any two entities in the knowledge graph.</div>
+    <div class="path-grid">
+      <div class="input-group">
+        <label>From entity</label>
+        <input type="text" id="path-from" placeholder="e.g. Daytona">
+      </div>
+      <div class="input-group">
+        <label>To entity</label>
+        <input type="text" id="path-to" placeholder="e.g. Neo4j">
+      </div>
+      <button class="btn" id="btn-path" onclick="doFindPath()" style="margin-top:0">🔍 Find Path</button>
+    </div>
+    <div id="path-result" style="display:none"></div>
+  </div>
+</section>
+
 <div class="glow-line"></div>
 <footer>
   Built for <a href="https://luma.com/daytonatokyo">Daytona HackSprint Tokyo 2026</a> 🤙<br>
@@ -691,12 +794,21 @@ async function initForceGraph() {
     graphData = await res.json();
   } catch { return; }
 
+  // Cancel any running simulation to prevent ghost animations
+  if (simulation) {
+    simulation.stop();
+    simulation = null;
+  }
+
   const container = document.querySelector('.graph-vis-container');
   const width = container.clientWidth;
   const height = container.clientHeight;
 
   svgEl = d3.select('#force-graph')
     .attr('width', width).attr('height', height);
+
+  // Clear previous graph elements to avoid duplicates
+  svgEl.selectAll('*').remove();
 
   // Defs for glow
   const defs = svgEl.append('defs');
@@ -881,7 +993,7 @@ async function doQuery() {
         <div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.1em;color:var(--muted);margin-bottom:0.4rem">Context</div>
         ${d.context_nodes.map(n=>`<span style="display:inline-block;background:var(--accent);color:#fff;padding:0.15rem 0.5rem;border-radius:5px;font-size:0.72rem;margin:0.15rem 0.1rem">${n}</span>`).join(' → ')}</div>`;
     }
-    result.innerHTML=`<div class="result-box success"><div style="white-space:pre-wrap">${d.answer||'No answer'}</div>${ctx}</div>`;
+    result.innerHTML=`<div class="result-box success"><div style="white-space:pre-wrap">${d.answer||'No answer'}</div>${ctx}${d.source_docs?.length ? `<div class="provenance"><div class="prov-label">Provenance</div>${d.source_docs.map(s=>`<span class="prov-tag">${s}</span>`).join(' ')}</div>` : ''}</div>`;
   } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${e.message}</div>`; }
   btn.disabled=false; btn.innerHTML='🧠 Ask';
 }
@@ -905,16 +1017,192 @@ async function doSearch() {
 }
 
 // ═══════════════════════════════════════
+//  PATH FINDER
+// ═══════════════════════════════════════
+let currentPathNodeIds = new Set();
+let currentPathEdgeKeys = new Set();
+
+async function doFindPath() {
+  const btn = document.getElementById('btn-path');
+  const result = document.getElementById('path-result');
+  const fromLabel = document.getElementById('path-from').value.trim();
+  const toLabel = document.getElementById('path-to').value.trim();
+  if (!fromLabel || !toLabel) return;
+  btn.disabled = true; btn.innerHTML = '<span class="loader"></span>Finding...';
+  result.style.display = 'block';
+  result.innerHTML = '<div class="result-box"><span class="loader"></span> Searching for shortest path...</div>';
+  try {
+    const d = await fetch(API + '/graph/path', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from_label: fromLabel, to_label: toLabel })
+    }).then(r => r.json());
+    if (d.path && d.path.length) {
+      // Build visual path string
+      let html = '<div class="path-result"><strong>🛤️ Shortest path:</strong><br>';
+      currentPathNodeIds.clear();
+      currentPathEdgeKeys.clear();
+      d.path.forEach(item => {
+        if (item.node) {
+          currentPathNodeIds.add(item.node.id);
+          html += `<span class="path-node">${item.node.label}</span>`;
+        } else if (item.relationship) {
+          const key = item.relationship.source + '->' + item.relationship.target;
+          currentPathEdgeKeys.add(key);
+          html += `<span class="path-edge"> —[${item.relationship.type}]→ </span>`;
+        }
+      });
+      html += '</div>';
+      result.innerHTML = html;
+      highlightPath();
+    } else {
+      result.innerHTML = '<div class="path-result" style="border-left:3px solid var(--accent3)">No path found between those entities.</div>';
+    }
+  } catch (e) {
+    result.innerHTML = `<div class="result-box error">❌ ${e.message}</div>`;
+  }
+  btn.disabled = false; btn.innerHTML = '🔍 Find Path';
+}
+
+function highlightPath() {
+  if (!gNodes || !gLinks) return;
+  // Dim everything, then highlight path nodes and edges
+  gNodes.attr('opacity', d => currentPathNodeIds.has(d.id) ? 1 : 0.1);
+  gLinks
+    .attr('stroke', d => {
+      const srcId = typeof d.source === 'object' ? d.source.id : d.source;
+      const tgtId = typeof d.target === 'object' ? d.target.id : d.target;
+      return currentPathEdgeKeys.has(srcId + '->' + tgtId) ? 'var(--accent3)' : 'rgba(255,255,255,0.02)';
+    })
+    .attr('stroke-width', d => {
+      const srcId = typeof d.source === 'object' ? d.source.id : d.source;
+      const tgtId = typeof d.target === 'object' ? d.target.id : d.target;
+      return currentPathEdgeKeys.has(srcId + '->' + tgtId) ? 2.5 : 0.3;
+    });
+}
+
+function clearPathHighlight() {
+  currentPathNodeIds.clear();
+  currentPathEdgeKeys.clear();
+  if (gNodes) gNodes.attr('opacity', 1);
+  if (gLinks) gLinks.attr('stroke', 'rgba(255,255,255,0.06)').attr('stroke-width', 0.5);
+}
+
+// ═══════════════════════════════════════
+//  WEBSOCKET — LIVE GRAPH GROWTH
+// ═══════════════════════════════════════
+let ws = null;
+
+function connectWebSocket() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/graph`);
+
+  ws.onopen = () => {
+    console.log('[WS] Connected to graph updates');
+    // Send periodic pings to keep alive
+    setInterval(() => { if (ws.readyState === 1) ws.send('ping'); }, 30000);
+  };
+
+  ws.onmessage = (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      if (msg.type === 'graph_update' && msg.nodes && msg.edges) {
+        handleGraphUpdate(msg.nodes, msg.edges);
+      }
+    } catch {}
+  };
+
+  ws.onclose = () => {
+    console.log('[WS] Disconnected, reconnecting in 3s...');
+    setTimeout(connectWebSocket, 3000);
+  };
+
+  ws.onerror = () => { ws.close(); };
+}
+
+function handleGraphUpdate(newNodes, newEdges) {
+  if (!graphData || !simulation) return;
+
+  // Dedupe against existing nodes
+  const existingIds = new Set(graphData.nodes.map(n => n.id));
+  const freshNodes = newNodes.filter(n => !existingIds.has(n.id));
+  const existingEdges = new Set(graphData.edges.map(e => {
+    const s = typeof e.source === 'object' ? e.source.id : e.source;
+    const t = typeof e.target === 'object' ? e.target.id : e.target;
+    return s + '->' + t;
+  }));
+  const freshEdges = newEdges.filter(e => !existingEdges.has(e.source + '->' + e.target));
+
+  if (!freshNodes.length && !freshEdges.length) return;
+
+  // Add to data
+  graphData.nodes.push(...freshNodes);
+  graphData.edges.push(...freshEdges);
+
+  // Add new nodes to SVG with pulse animation
+  const g = svgEl.select('.nodes');
+  const newCircles = g.selectAll('.fresh-node').data(freshNodes, d => d.id).enter()
+    .append('circle')
+    .attr('class', 'fresh-node')
+    .attr('r', 20)
+    .attr('fill', d => tc(d.type))
+    .attr('filter', 'url(#glow)')
+    .attr('cursor', 'pointer')
+    .on('mouseover', showTooltip)
+    .on('mousemove', moveTooltip)
+    .on('mouseout', hideTooltip);
+
+  // Animate: start large, shrink to normal
+  newCircles.transition()
+    .duration(600)
+    .ease(d3.easeBackOut)
+    .attr('r', d => d.type === 'Concept' ? 4 : d.type === 'Technology' ? 5 : 3.5);
+
+  // Add new links to SVG
+  const gLinkSel = svgEl.select('.links');
+  gLinkSel.selectAll('.fresh-link').data(freshEdges, d => {
+    const s = typeof d.source === 'object' ? d.source.id : d.source;
+    const t = typeof d.target === 'object' ? d.target.id : d.target;
+    return s + '->' + t;
+  }).enter()
+    .append('line')
+    .attr('class', 'fresh-link')
+    .attr('stroke', 'var(--accent2)')
+    .attr('stroke-width', 1)
+    .transition().duration(1000)
+    .attr('stroke', 'rgba(255,255,255,0.06)')
+    .attr('stroke-width', 0.5);
+
+  // Re-bind D3 data references
+  gLinks = svgEl.select('.links').selectAll('line');
+  gNodes = svgEl.select('.nodes').selectAll('circle');
+
+  // Restart simulation with new data
+  simulation.nodes(graphData.nodes);
+  simulation.force('link').links(graphData.edges);
+  simulation.alpha(0.3).restart();
+
+  // Update stats
+  document.getElementById('vis-nodes').textContent = graphData.nodes.length;
+  document.getElementById('vis-edges').textContent = graphData.edges.length;
+
+  console.log(`[WS] Graph updated: +${freshNodes.length} nodes, +${freshEdges.length} edges`);
+}
+
+// ═══════════════════════════════════════
 //  INIT
 // ═══════════════════════════════════════
 loadStats();
 initForceGraph();
+connectWebSocket();
 setInterval(loadStats, 60000);
 
 // Enter key handlers
 document.getElementById('query-input').addEventListener('keydown', e => { if(e.key==='Enter') doQuery(); });
 document.getElementById('search-input').addEventListener('keydown', e => { if(e.key==='Enter') doSearch(); });
 document.getElementById('ingest-url-input').addEventListener('keydown', e => { if(e.key==='Enter') doIngestURL(); });
+document.getElementById('path-from').addEventListener('keydown', e => { if(e.key==='Enter') document.getElementById('path-to').focus(); });
+document.getElementById('path-to').addEventListener('keydown', e => { if(e.key==='Enter') doFindPath(); });
 </script>
 </body>
 </html>

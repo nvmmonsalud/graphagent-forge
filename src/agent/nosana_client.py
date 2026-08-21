@@ -1,8 +1,10 @@
 """Nosana GPU compute client — decentralized inference workloads."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import struct
 from typing import Any
 
 import httpx
@@ -18,6 +20,7 @@ class NosanaClient:
     def __init__(self):
         self.api_key = os.getenv("NOSANA_API_KEY", "")
         self.headers = {}
+        self.last_embedding_method = "uninitialized"
         if self.api_key:
             self.headers["Authorization"] = f"Bearer {self.api_key}"
 
@@ -77,6 +80,44 @@ class NosanaClient:
             model=model,
             input_data=json.dumps({"texts": texts}),
         )
+
+    async def get_embedding(self, text: str) -> list[float]:
+        """Generate a 384-dim embedding vector for the given text.
+
+        Submits an embedding job to Nosana if an API key is configured and the
+        service is reachable.  Falls back to a deterministic hash-based
+        pseudo-embedding so that downstream vector indexes always work.
+        """
+        if self.api_key:
+
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.post(
+                        f"{NOSANA_API}/embeddings",
+                        json={"input": text},
+                        headers=self.headers,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    embedding = data.get("embedding", [])
+                    if isinstance(embedding, list) and len(embedding) == 384:
+                        self.last_embedding_method = "nosana"
+                        return embedding
+                    log.warning("Nosana returned unexpected embedding shape, using fallback")
+            except Exception as e:
+                log.warning("Nosana embedding failed (%s), using hash fallback", e)
+
+        # Deterministic 384-dim pseudo-embedding from SHA-256
+        digest = hashlib.sha256(text.encode("utf-8")).digest()
+        # Unpack 32 bytes as 8 x 4-byte little-endian floats, tile to 384
+        base = list(struct.unpack("<8f", digest))
+        # Repeat the pattern to reach 384 dimensions (48 * 8 = 384)
+        # Normalize to a finite, bounded vector suitable for Neo4j cosine indexes.
+        import math
+        magnitude = math.sqrt(sum(x * x for x in base)) or 1.0
+        normalized = [x / magnitude for x in base]
+        self.last_embedding_method = "local_hash_fallback"
+        return (normalized * 48)[:384]
 
     async def _local_fallback(self, model: str, input_data: str) -> dict[str, Any]:
         """Local fallback — skip GPU, return placeholder."""

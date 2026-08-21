@@ -27,6 +27,11 @@ class SearchRequest(BaseModel):
     query: str = Field(..., description="Search term")
 
 
+class PathRequest(BaseModel):
+    from_label: str = Field(..., description="Source entity label")
+    to_label: str = Field(..., description="Target entity label")
+
+
 # ------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------
@@ -94,5 +99,33 @@ async def graph_search(req: SearchRequest, request: Request):
     agent = request.app.state.agent
     try:
         return await agent.search_graph(req.query)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/graph/verify")
+async def graph_verify(request: Request):
+    """Run graph-integrity verification inside a Daytona sandbox.
+
+    Fetches the latest graph data from Neo4j, validates every edge's
+    source/target exist as node IDs, and computes quality metrics.
+    """
+    neo4j = request.app.state.neo4j
+    agent = request.app.state.agent
+    try:
+        graph_data = await neo4j.get_all_graph_data(limit=None)
+        verification = await agent.daytona.verify_graph(graph_data)
+        return verification
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/graph/path")
+async def graph_path(req: PathRequest, request: Request):
+    """Find shortest path between two entities."""
+    agent = request.app.state.agent
+    try:
+        path = await agent.find_path(req.from_label, req.to_label)
+        return {"path": path}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

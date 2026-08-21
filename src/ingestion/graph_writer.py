@@ -1,6 +1,7 @@
 """Graph writer — orchestrates ingestion into Neo4j."""
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any
 
@@ -22,8 +23,26 @@ async def ingest_to_graph(
     # Step 1: Extract entities and relationships via Kimi
     graph_data = await extract_entities(content, model=model)
 
+    # Prefix IDs with a doc hash to prevent cross-document collisions
+    doc_hash = hashlib.md5(source_doc.encode()).hexdigest()[:8]
+
     nodes = graph_data.get("nodes", [])
     edges = graph_data.get("edges", [])
+
+    # Prefix node IDs with doc hash
+    id_map = {}
+    for node in nodes:
+        old_id = node.get("id", "")
+        new_id = f"{doc_hash}_{old_id}"
+        id_map[old_id] = new_id
+        node["id"] = new_id
+
+    # Remap edge source/target references
+    for edge in edges:
+        if edge.get("source") in id_map:
+            edge["source"] = id_map[edge["source"]]
+        if edge.get("target") in id_map:
+            edge["target"] = id_map[edge["target"]]
 
     if not nodes:
         return {
