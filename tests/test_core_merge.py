@@ -269,3 +269,34 @@ async def test_auto_merge_not_invoked_when_env_unset() -> None:
 
     neo4j.find_duplicate_groups.assert_not_awaited()
     assert "merged_entities" not in out
+
+
+# ------------------------------------------------------------------
+# Progress reporting in _post_ingest (job-queue contract)
+# ------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_post_ingest_reports_progress_stages_and_tolerates_raising_callback() -> None:
+    agent, neo4j, nosana, manager = _make_agent()
+    _stub_post_ingest_collaborators(agent, neo4j)
+    import os
+    assert os.getenv("AUTO_MERGE") != "exact"
+
+    stages: list[str] = []
+
+    async def recorder(stage: str) -> None:
+        stages.append(stage)
+
+    out = await agent._post_ingest(
+        {"success": True}, source_doc="d", content="c", progress=recorder
+    )
+    assert stages == ["embedding", "broadcasting", "verifying"]
+    assert out["success"] is True
+
+    async def raising_recorder(stage: str) -> None:
+        raise RuntimeError("progress callback exploded")
+
+    # A broken progress callback must never fail the ingest.
+    out2 = await agent._post_ingest(
+        {"success": True}, source_doc="d", content="c", progress=raising_recorder
+    )
+    assert out2["success"] is True

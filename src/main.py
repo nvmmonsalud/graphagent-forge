@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import FileResponse  # noqa: E402
 
 from src.agent.core import GraphAgent  # noqa: E402
+from src.agent.jobs import JobManager  # noqa: E402
 from src.api.routes import router  # noqa: E402
 from src.graph.neo4j_client import Neo4jClient  # noqa: E402
 
@@ -110,9 +111,21 @@ async def lifespan(app: FastAPI):
     app.state.agent = GraphAgent(neo4j)
     app.state.ws_manager = ws_manager
 
+    # Background ingest queue. In-memory and per-process: jobs are lost on
+    # restart, and every job_update is pushed over the same /ws/graph socket.
+    jobs = JobManager(broadcast=ws_manager.broadcast)
+    jobs.start()
+    app.state.jobs = jobs
+
     try:
         yield
     finally:
+        # Drain jobs FIRST: in-flight work still holds the Neo4j driver and the
+        # shared httpx clients, so this has to finish before they are closed.
+        try:
+            await app.state.jobs.shutdown()
+        except Exception:
+            log.exception("Error while shutting down the ingest job queue")
         # Close whenever a driver object was actually created — `connect()` can
         # build the driver and then fail connectivity verification.
         if getattr(neo4j, "driver", None) is not None:
@@ -194,5 +207,7 @@ if __name__ == "__main__":
         "src.main:app",
         host=os.getenv("APP_HOST", "0.0.0.0"),
         port=int(os.getenv("APP_PORT", "8000")),
+        # Dev convenience: a reload restarts the process, so any in-flight
+        # ingest job in the in-memory queue is lost (it never reports back).
         reload=True,
     )

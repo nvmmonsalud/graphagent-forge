@@ -13,6 +13,8 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
+from src.agent.jobs import JobQueueFull
+
 log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["graphagent"])
@@ -174,27 +176,99 @@ async def health(request: Request):
     }
 
 
-@router.post("/ingest/url", dependencies=INGEST_DEP)
-async def ingest_url(req: IngestURLRequest, request: Request):
-    """Ingest a URL into the knowledge graph."""
+@router.post("/ingest/url", status_code=202, dependencies=INGEST_DEP)
+async def ingest_url(req: IngestURLRequest, request: Request, wait: bool = Query(default=False)):
+    """Submit a URL ingest job. Returns 202 with a job id, or the ingest
+    result synchronously (200) when `wait=true`.
+    """
     agent = request.app.state.agent
+    jobs = request.app.state.jobs
+    # HttpUrl is a pydantic object — the agent expects a plain string.
+    url = str(req.url)
+
+    async def run(progress):
+        return await agent.ingest_url(url, progress=progress)
+
     try:
-        # HttpUrl is a pydantic object — the agent expects a plain string.
-        return await agent.ingest_url(str(req.url))
+        record = jobs.submit("url", {"url": url}, run)
+    except JobQueueFull:
+        raise HTTPException(status_code=429, detail="job queue full") from None
     except Exception:
-        log.exception("Failed to ingest URL")
+        log.exception("Failed to submit ingest job")
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
+    if not wait:
+        content = {"job_id": record["id"], "status": record["status"]}
+        return JSONResponse(status_code=202, content=content)
 
-@router.post("/ingest/text", dependencies=INGEST_DEP)
-async def ingest_text(req: IngestTextRequest, request: Request):
-    """Ingest raw text into the knowledge graph."""
-    agent = request.app.state.agent
     try:
-        return await agent.ingest_text(req.text, req.source)
+        final = await jobs.wait(record["id"])
     except Exception:
-        log.exception("Failed to ingest text from source %r", req.source)
+        log.exception("Failed waiting for ingest job")
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+    if final["status"] != "succeeded":
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR)
+    return JSONResponse(status_code=200, content=final["result"])
+
+
+@router.post("/ingest/text", status_code=202, dependencies=INGEST_DEP)
+async def ingest_text(req: IngestTextRequest, request: Request, wait: bool = Query(default=False)):
+    """Submit a text ingest job. Returns 202 with a job id, or the ingest
+    result synchronously (200) when `wait=true`.
+    """
+    agent = request.app.state.agent
+    jobs = request.app.state.jobs
+    text = req.text
+    source = req.source
+
+    async def run(progress):
+        return await agent.ingest_text(text, source, progress=progress)
+
+    try:
+        # The raw text must NOT go into the job's public params — only a
+        # length hint, so job listings stay small and don't leak content.
+        record = jobs.submit("text", {"source": source, "text_chars": len(text)}, run)
+    except JobQueueFull:
+        raise HTTPException(status_code=429, detail="job queue full") from None
+    except Exception:
+        log.exception("Failed to submit ingest job")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+
+    if not wait:
+        content = {"job_id": record["id"], "status": record["status"]}
+        return JSONResponse(status_code=202, content=content)
+
+    try:
+        final = await jobs.wait(record["id"])
+    except Exception:
+        log.exception("Failed waiting for ingest job")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+    if final["status"] != "succeeded":
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR)
+    return JSONResponse(status_code=200, content=final["result"])
+
+
+# ------------------------------------------------------------------
+# Job queue — read endpoints
+#
+# Deliberately NO dependencies: in-memory only (nothing to gate on Neo4j
+# availability), must keep working in degraded mode, and must not consume
+# the shared per-IP rate bucket that ingest/ask polling would otherwise
+# starve. Unauthenticated like every other GET read in this file.
+# ------------------------------------------------------------------
+@router.get("/jobs")
+async def list_jobs(request: Request, limit: int = Query(default=20, ge=1, le=100)):
+    """List submitted jobs, newest first."""
+    return {"jobs": request.app.state.jobs.list(limit=limit)}
+
+
+@router.get("/jobs/{job_id}")
+async def get_job(job_id: str, request: Request):
+    """Fetch a single job's status/result by id."""
+    record = request.app.state.jobs.get(job_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return record
 
 
 @router.post("/ask", dependencies=ASK_DEP)

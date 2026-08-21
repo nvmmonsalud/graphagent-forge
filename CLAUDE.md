@@ -37,6 +37,14 @@ vector search via `db.index.vector.queryNodes` (only if a real Nosana embedding 
 
 HTTP endpoints live in `src/api/routes.py` (mounted at `/api`); they pull `agent`/`neo4j` off `request.app.state`. Beyond the core routes there are: `GET /sources`, `DELETE /sources?source_doc=`, `POST /graph/clear`, `GET /graph/data?source_doc=`, `GET /graph/export?format=json|csv`, `GET /graph/duplicates?limit=`, `POST /graph/merge`. Security middleware/deps: optional `X-API-Key` auth on mutating routes (only when env `API_KEY` is set), in-memory per-IP rate limiting (10/min, shared across `/ingest/*` and `/ask`, per-process), CORS origins from `ALLOWED_ORIGINS`, 500s log server-side (`log.exception`) and return only `"internal error"` to clients.
 
+### Ingest job queue
+
+Ingests run through a submit-then-track queue (`src/agent/jobs.py`, `JobManager` on `app.state.jobs`, created and `start()`ed in the lifespan hook right after `ws_manager`). A route calls `jobs.submit(kind, params, run)` and returns the queued job record immediately; 2 workers pull from an `asyncio.Queue` and execute the injected async `run(progress_cb)`, which reports stages back. Every transition (queued → running → each stage → terminal) is broadcast over `/ws/graph` as `{"type": "job_update", "job": {...}}`; clients can also poll `GET /api/jobs/{id}` or pass `?wait=true` on submit as a synchronous escape hatch. `INGEST_JOB_TIMEOUT` (default 600s) caps a single job.
+
+Status semantics matter: **`failed` means the job crashed — unhandled exception, timeout, or shutdown, nothing else.** A business failure (bad URL, missing `KIMI_API_KEY`, 0 entities) is a *`succeeded`* job whose `result.success` is false. `error` is only ever one of three literals — `"internal error"`, `"timed out"`, `"server shutdown"`; raw exception text is logged via `log.exception` and must never reach the record. `jobs.py` stays generic: it imports neither `src.main` nor `src.agent.core` (the broadcast sink is injected), and treats `params`/`result` as opaque dicts.
+
+The registry is in-memory and per-process — jobs vanish on restart, and the dev server's `reload=True` kills anything in flight. `shutdown()` runs first in the lifespan `finally` (before the Neo4j driver and shared httpx clients close) so in-flight jobs can drain; whatever is still queued/running is failed with `"server shutdown"` and its waiters unblocked. Finished jobs beyond `history_limit` (100) are evicted oldest-first; `submit` raises `JobQueueFull` once queued+running hits `max_active` (20).
+
 ### Graceful-degradation pattern
 
 Every external sponsor service has a local fallback, so the app runs with zero configured keys:

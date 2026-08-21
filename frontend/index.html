@@ -931,7 +931,7 @@ async function apiFetch(url, opts) {
 
 function errorMessage(e) {
   if (e && e.status === 401) return 'API key required';
-  if (e && e.status === 429) return 'Rate limited — try again in a minute';
+  if (e && e.status === 429) return e.detail ? String(e.detail) : 'Rate limited — try again in a minute';
   if (e && e.status === 503) return 'Graph database unavailable';
   if (e && e.status === 422) return (e.detail ? String(e.detail) : 'Invalid request');
   return (e && (e.detail || e.message)) || 'Something went wrong';
@@ -996,6 +996,8 @@ let pathActive = false;
 let currentSourceFilter = null;
 let currentZoomK = 1;
 let duplicateGroups = [];
+let activeIngestJob = null;
+let jobPollInterval = null;
 
 function truncateLabel(s) {
   s = String(s ?? '');
@@ -1278,8 +1280,59 @@ function animNum(id, target) {
 }
 
 // ═══════════════════════════════════════
-//  INGEST
+//  INGEST (submit-then-track jobs)
 // ═══════════════════════════════════════
+function stopJobPoll() {
+  if (jobPollInterval) { clearInterval(jobPollInterval); jobPollInterval = null; }
+}
+
+function startJobPoll(id) {
+  stopJobPoll();
+  jobPollInterval = setInterval(async () => {
+    try {
+      const job = await apiFetch(API + '/jobs/' + encodeURIComponent(id));
+      renderIngestJob(job);
+    } catch {
+      stopJobPoll();
+    }
+  }, 3000);
+}
+
+function renderIngestJob(job) {
+  if (!activeIngestJob || !job || job.id !== activeIngestJob.id) return;
+  const result = document.getElementById('ingest-result');
+  result.style.display = 'block';
+
+  if (job.status === 'queued') {
+    result.innerHTML = `<div class="result-box"><span class="loader"></span> Queued…</div>`;
+    return;
+  }
+  if (job.status === 'running') {
+    result.innerHTML = `<div class="result-box"><span class="loader"></span> Running — ${esc(job.stage || 'starting')}</div>`;
+    return;
+  }
+  if (job.status === 'failed') {
+    result.innerHTML = `<div class="result-box error">❌ ${esc(job.error || 'Failed')}</div>`;
+    stopJobPoll();
+    activeIngestJob = null;
+    return;
+  }
+  if (job.status === 'succeeded') {
+    if (job.result?.success) {
+      const titleHtml = activeIngestJob.kind === 'url'
+        ? ` — <span style="color:var(--muted)">${esc(job.result.extraction?.title || activeIngestJob.label)}</span>`
+        : '';
+      result.innerHTML = `<div class="result-box success"><strong>✅ Ingested</strong>${titleHtml}<br><span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(job.result.nodes)}</span> <span style="color:var(--muted)">nodes</span> · <span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(job.result.edges)}</span> <span style="color:var(--muted)">edges</span></div>`;
+      loadStats(); loadSources();
+      if (!ws || ws.readyState !== 1) initForceGraph(currentSourceFilter);
+    } else {
+      result.innerHTML = `<div class="result-box error">❌ ${esc(job.result?.error || 'Failed')}</div>`;
+    }
+    stopJobPoll();
+    activeIngestJob = null;
+  }
+}
+
 async function doIngestURL() {
   const btn = document.getElementById('btn-ingest-url');
   const result = document.getElementById('ingest-result');
@@ -1287,16 +1340,13 @@ async function doIngestURL() {
   if (!url) return;
   btn.disabled=true; btn.innerHTML='<span class="loader"></span>Ingesting...';
   result.style.display='block';
-  result.innerHTML='<div class="result-box"><span class="loader"></span> Extracting entities...</div>';
+  result.innerHTML='<div class="result-box"><span class="loader"></span> Submitting...</div>';
+  stopJobPoll();
   try {
     const d = await apiFetch(API+'/ingest/url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
-    if (d.success) {
-      result.innerHTML=`<div class="result-box success"><strong>✅ Ingested</strong> — <span style="color:var(--muted)">${esc(d.extraction?.title||url)}</span><br><span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(d.nodes)}</span> <span style="color:var(--muted)">nodes</span> · <span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(d.edges)}</span> <span style="color:var(--muted)">edges</span></div>`;
-      loadStats(); loadSources();
-      if (!ws || ws.readyState !== 1) initForceGraph(currentSourceFilter);
-    } else {
-      result.innerHTML=`<div class="result-box error">❌ ${esc(d.error||'Failed')}</div>`;
-    }
+    activeIngestJob = { id: d.job_id, kind: 'url', label: url };
+    renderIngestJob({ id: d.job_id, status: 'queued' });
+    if (!ws || ws.readyState !== 1) startJobPoll(d.job_id);
   } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${esc(errorMessage(e))}</div>`; }
   btn.disabled=false; btn.innerHTML='🚀 Ingest URL';
 }
@@ -1309,16 +1359,13 @@ async function doIngestText() {
   if (!text) return;
   btn.disabled=true; btn.innerHTML='<span class="loader"></span>Ingesting...';
   result.style.display='block';
-  result.innerHTML='<div class="result-box"><span class="loader"></span> Extracting entities...</div>';
+  result.innerHTML='<div class="result-box"><span class="loader"></span> Submitting...</div>';
+  stopJobPoll();
   try {
     const d = await apiFetch(API+'/ingest/text',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,source})});
-    if (d.success) {
-      result.innerHTML=`<div class="result-box success"><strong>✅ Ingested</strong><br><span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(d.nodes)}</span> <span style="color:var(--muted)">nodes</span> · <span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(d.edges)}</span> <span style="color:var(--muted)">edges</span></div>`;
-      loadStats(); loadSources();
-      if (!ws || ws.readyState !== 1) initForceGraph(currentSourceFilter);
-    } else {
-      result.innerHTML=`<div class="result-box error">❌ ${esc(d.error||'Failed')}</div>`;
-    }
+    activeIngestJob = { id: d.job_id, kind: 'text', label: source };
+    renderIngestJob({ id: d.job_id, status: 'queued' });
+    if (!ws || ws.readyState !== 1) startJobPoll(d.job_id);
   } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${esc(errorMessage(e))}</div>`; }
   btn.disabled=false; btn.innerHTML='🚀 Ingest Text';
 }
@@ -1474,6 +1521,8 @@ function connectWebSocket() {
         handleGraphMerge(msg);
         loadSources();
         loadDuplicates();
+      } else if (msg.type === 'job_update' && msg.job) {
+        renderIngestJob(msg.job);
       }
     } catch {}
   };

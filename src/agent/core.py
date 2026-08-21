@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from src.agent.daytona_exec import DaytonaExecutor
@@ -14,6 +15,9 @@ from src.ingestion.extractor import extract_from_text, extract_from_url
 from src.ingestion.graph_writer import ingest_to_graph
 
 log = logging.getLogger(__name__)
+
+#: Optional async callback invoked with a stage name as ingestion progresses.
+ProgressCb = Callable[[str], Awaitable[None]]
 
 
 class GraphAgent:
@@ -72,16 +76,27 @@ class GraphAgent:
         except Exception as exc:
             log.warning("Failed to broadcast graph update: %s", exc)
 
-    async def ingest_url(self, url: str) -> dict[str, Any]:
+    async def _report(self, progress: ProgressCb | None, stage: str) -> None:
+        """Notify an optional progress callback; a broken callback never fails an ingest."""
+        if progress is None:
+            return
+        try:
+            await progress(stage)
+        except Exception as exc:
+            log.warning("Progress callback failed for stage %s: %s", stage, exc)
+
+    async def ingest_url(self, url: str, progress: ProgressCb | None = None) -> dict[str, Any]:
         """Ingest a URL: extract → graph → store."""
         log.info("Ingesting URL: %s", url)
 
         # Extract content
+        await self._report(progress, "fetching")
         extraction = await extract_from_url(url)
         if extraction.get("error"):
             return {"success": False, "error": extraction["error"]}
 
         # Write to graph
+        await self._report(progress, "extracting")
         async with self._ingest_semaphore:
             result = await ingest_to_graph(
                 self.neo4j,
@@ -99,12 +114,16 @@ class GraphAgent:
             result,
             source_doc=extraction.get("title") or url,
             content=extraction["content"],
+            progress=progress,
         )
 
-    async def ingest_text(self, text: str, source: str = "manual") -> dict[str, Any]:
+    async def ingest_text(
+        self, text: str, source: str = "manual", progress: ProgressCb | None = None
+    ) -> dict[str, Any]:
         """Ingest raw text: extract → graph → store."""
         extraction = extract_from_text(text, source)
 
+        await self._report(progress, "extracting")
         async with self._ingest_semaphore:
             result = await ingest_to_graph(
                 self.neo4j,
@@ -116,9 +135,16 @@ class GraphAgent:
             result,
             source_doc=source,
             content=extraction["content"],
+            progress=progress,
         )
 
-    async def _post_ingest(self, result: dict, source_doc: str, content: str) -> dict:
+    async def _post_ingest(
+        self,
+        result: dict,
+        source_doc: str,
+        content: str,
+        progress: ProgressCb | None = None,
+    ) -> dict:
         """Shared ingest tail: embed entities → broadcast → verify.
 
         Mutates and returns `result` so callers keep whatever extraction
@@ -132,6 +158,7 @@ class GraphAgent:
             return result
 
         # F2: per-entity embeddings so the vector index holds distinct vectors
+        await self._report(progress, "embedding")
         try:
             stored = await self._embed_source_nodes(source_doc)
             result["embedding_stored"] = stored > 0
@@ -145,6 +172,7 @@ class GraphAgent:
         # membership through the source_docs union, so the source-scoped reads
         # below still return it.
         if os.getenv("AUTO_MERGE", "").lower() == "exact":
+            await self._report(progress, "merging")
             try:
                 groups = await self.neo4j.find_duplicate_groups(limit=50, source_doc=source_doc)
                 merged = []
@@ -159,9 +187,11 @@ class GraphAgent:
                 log.warning("Auto-merge failed: %s", exc)
 
         # Broadcast live graph update via WebSocket
+        await self._report(progress, "broadcasting")
         await self._broadcast_new_nodes(source_doc)
 
         # F1: verify integrity of just this document's subgraph in a sandbox
+        await self._report(progress, "verifying")
         graph_data = await self.neo4j.get_graph_data_by_source(source_doc)
         result["verification"] = await self.daytona.verify_graph(graph_data)
 
