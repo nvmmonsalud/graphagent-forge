@@ -186,14 +186,9 @@ FIT_GRAPH_JS = """
   svgNode.__zoom = t;
   currentZoomK = k;
 
-  // Zooming the <g> scales stroke widths with it. The links are authored at
-  // 0.5px / 6% opacity, so at the k<1 this fit needs they thin to a fraction of
-  // a pixel and the connections — the whole point of the panel — vanish.
-  // non-scaling-stroke keeps them at their authored width, i.e. exactly how the
-  // page draws them at k=1; it restores the unfitted appearance, not a new one.
-  g.querySelectorAll('.links line').forEach(el => {
-    el.setAttribute('vector-effect', 'non-scaling-stroke');
-  });
+  // Edge stroke width at low zoom is handled by the page's own CSS
+  // (#force-graph .links line { vector-effect: non-scaling-stroke }), so the
+  // capture inherits it rather than injecting a property the app lacks.
   // Mirror the page's own zoom handler: labels live below 1.2.
   if (typeof gLabels !== 'undefined' && gLabels) {
     gLabels.attr('opacity', k > 1.2 ? 1 : 0);

@@ -213,6 +213,11 @@ body {
   margin-top: 1.5rem;
 }
 
+/* Zooming scales stroke widths along with the geometry, so at low zoom the
+   0.5px edges thin toward invisibility and the graph reads as unconnected
+   dots. Pin them to their authored width at every zoom level. */
+#force-graph .links line { vector-effect: non-scaling-stroke; }
+
 #force-graph {
   width: 100%;
   height: 100%;
@@ -751,6 +756,77 @@ body {
 }
 .reveal.visible { opacity: 1; transform: translateY(0); }
 
+/* ═══════ QUERY HISTORY ═══════ */
+.history-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  margin-bottom: 0.6rem;
+}
+.history-header-title {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+}
+.history-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.6rem 0;
+  border-bottom: 1px solid var(--border);
+}
+.history-row:last-child { border-bottom: none; }
+.history-row.restored { opacity: 0.6; }
+.history-row-main {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  flex: 1 1 260px;
+}
+.history-saved-dot { color: var(--accent2); flex-shrink: 0; }
+.history-question {
+  font-size: 0.84rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.history-status {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border-radius: 5px;
+  padding: 0.15rem 0.4rem;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.history-status.answered { color: var(--accent2); border-color: rgba(0,229,200,0.3); }
+.history-status.no_context { color: var(--muted); }
+.history-status.llm_unavailable { color: var(--warn); border-color: rgba(253,203,110,0.3); }
+.history-row-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-size: 0.68rem;
+  color: var(--muted);
+  font-family: 'JetBrains Mono', monospace;
+  flex-shrink: 0;
+}
+.history-restored-badge {
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0.1rem 0.35rem;
+}
+.history-row-actions { display: flex; gap: 0.4rem; flex-shrink: 0; }
+
 /* ═══════ GLOW LINE ═══════ */
 .glow-line {
   height: 1px;
@@ -1261,6 +1337,7 @@ footer a { color: var(--accent2); text-decoration: none; }
       <button class="btn" id="btn-query" onclick="doQuery()">🧠 Ask</button>
     </div>
     <div id="query-result" style="display:none"></div>
+    <div id="query-history" style="display:none;margin-top:1.4rem"></div>
   </div>
 </section>
 
@@ -2229,6 +2306,9 @@ async function doQuery() {
     }
   } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${esc(errorMessage(e))}</div>`; }
   btn.disabled=false; btn.innerHTML='🧠 Ask';
+  // History is a nice-to-have mirror of what just happened above — a failure
+  // here (offline, server hiccup) must never disturb the answer rendering.
+  try { loadQueryHistory().catch(() => {}); } catch {}
 }
 
 // ═══════════════════════════════════════
@@ -2419,7 +2499,7 @@ function handleGraphUpdate(newNodes, newEdges) {
   newCircles.transition()
     .duration(600)
     .ease(d3.easeBackOut)
-    .attr('r', d => d.type === 'Concept' ? 4 : d.type === 'Technology' ? 5 : 3.5);
+    .attr('r', nodeRadius);
 
   // Add new labels
   const gLabelSel = svgEl.select('.labels');
@@ -2516,7 +2596,7 @@ function handleGraphMerge(msg) {
       .attr('cursor', 'pointer');
     wireNodeInteractions(nodeEnter);
     gNodes = nodeEnter.merge(nodeSel)
-      .attr('r', d => d.type === 'Concept' ? 4 : d.type === 'Technology' ? 5 : 3.5)
+      .attr('r', nodeRadius)
       .attr('fill', d => tc(d.type));
 
     const labelSel = svgEl.select('.labels').selectAll('text').data(graphData.nodes, d => d.id);
@@ -3136,6 +3216,198 @@ loadSources();
 loadDuplicates();
 connectWebSocket();
 setInterval(() => { if (!document.hidden) loadStats(); }, 60000);
+
+// ═══════════════════════════════════════
+//  QUERY HISTORY (server list + localStorage mirror)
+// ═══════════════════════════════════════
+// Server memory is authoritative and is lost on restart; the browser keeps
+// a capped local mirror so history still shows something afterwards.
+const HISTORY_STORAGE_KEY = 'gaf.history.v1';
+const HISTORY_STORAGE_CAP = 50;
+let queryHistoryEntries = [];
+
+function readHistoryLocal() {
+  try {
+    const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch { return []; }
+}
+
+function writeHistoryLocal(entries) {
+  try {
+    localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify((entries || []).slice(0, HISTORY_STORAGE_CAP)));
+  } catch {}
+}
+
+function historyStatusLabel(status) {
+  if (status === 'answered') return 'Answered';
+  if (status === 'no_context') return 'No context';
+  if (status === 'llm_unavailable') return 'LLM unavailable';
+  return 'Unknown';
+}
+
+function historyStatusClass(status) {
+  return (status === 'answered' || status === 'no_context' || status === 'llm_unavailable') ? status : 'unknown';
+}
+
+function historyContextCount(entry) {
+  const c = entry && entry.context_nodes;
+  if (Array.isArray(c)) return c.length;
+  return typeof c === 'number' ? c : 0;
+}
+
+function truncateHistoryQuestion(q) {
+  const s = String(q ?? '');
+  return s.length > 90 ? s.slice(0, 87) + '…' : s;
+}
+
+function renderHistoryPanel(bodyHtml) {
+  return `<div class="history-header">
+      <span class="history-header-title">Recent queries</span>
+      <button type="button" class="mini-btn" data-action="clear-local">Clear local</button>
+    </div>
+    <div class="history-list">${bodyHtml}</div>`;
+}
+
+function renderHistoryRow(entry, i) {
+  const restored = !!(entry && entry.__restored);
+  const statusClass = historyStatusClass(entry && entry.status);
+  const statusLabel = historyStatusLabel(entry && entry.status);
+  const titleAttr = restored
+    ? ' title="Restored from a previous browser session — the server no longer has this entry, so save and delete aren\'t available."'
+    : '';
+  const actionsHtml = restored
+    ? `<button type="button" class="mini-btn" data-action="rerun" data-entry="${esc(i)}">↻ Re-run</button>`
+    : `<button type="button" class="mini-btn" data-action="rerun" data-entry="${esc(i)}">↻ Re-run</button>
+       <button type="button" class="mini-btn" data-action="save" data-entry="${esc(i)}">${entry && entry.saved ? '☆ Unsave' : '★ Save'}</button>
+       <button type="button" class="mini-btn danger" data-action="delete" data-entry="${esc(i)}">Delete</button>`;
+  return `<div class="history-row${restored ? ' restored' : ''}"${titleAttr}>
+    <div class="history-row-main">
+      <span class="history-saved-dot">${entry && entry.saved ? '●' : '○'}</span>
+      <span class="history-question">${esc(truncateHistoryQuestion(entry && entry.question))}</span>
+      <span class="history-status ${esc(statusClass)}">${esc(statusLabel)}</span>
+    </div>
+    <div class="history-row-meta">
+      <span>${esc(historyContextCount(entry))} nodes</span>
+      <span>${esc((entry && entry.duration_ms) ?? 0)} ms</span>
+      ${restored ? '<span class="history-restored-badge">restored</span>' : ''}
+    </div>
+    <div class="history-row-actions">${actionsHtml}</div>
+  </div>`;
+}
+
+const HISTORY_EMPTY_HTML = '<div class="result-box notice">No answers yet. Server history resets when the server restarts; this browser keeps a local copy.</div>';
+
+async function loadQueryHistory() {
+  const panel = document.getElementById('query-history');
+  if (!panel) return;
+  panel.style.display = 'block';
+  if (!panel.dataset.loaded) {
+    panel.innerHTML = renderHistoryPanel(skeletonLines(3, ['74%', '58%', '66%']));
+  }
+  let localEntries = [];
+  try { localEntries = readHistoryLocal(); } catch { localEntries = []; }
+  try {
+    const d = await apiFetch(API + '/history?limit=20');
+    const serverEntries = (d && d.entries) || [];
+    const serverIds = new Set(serverEntries.map(e => e && e.id));
+    const localOnly = localEntries.filter(e => e && e.id !== undefined && e.id !== null && !serverIds.has(e.id));
+    const merged = serverEntries.concat(localOnly.map(e => Object.assign({}, e, { __restored: true })));
+    queryHistoryEntries = merged;
+    panel.dataset.loaded = '1';
+    panel.innerHTML = renderHistoryPanel(
+      merged.length ? merged.map((entry, i) => renderHistoryRow(entry, i)).join('') : HISTORY_EMPTY_HTML
+    );
+    writeHistoryLocal(serverEntries.concat(localOnly));
+  } catch (e) {
+    panel.dataset.loaded = '1';
+    queryHistoryEntries = localEntries.map(en => Object.assign({}, en, { __restored: true }));
+    const listHtml = queryHistoryEntries.length
+      ? queryHistoryEntries.map((entry, i) => renderHistoryRow(entry, i)).join('')
+      : HISTORY_EMPTY_HTML;
+    panel.innerHTML = renderHistoryPanel(
+      listHtml + `<div class="result-box error" style="margin-top:0.6rem">❌ ${esc(errorMessage(e))}</div>`
+    );
+  }
+}
+
+// Event delegation — survives re-renders of #query-history innerHTML.
+// Entries are referenced BY INDEX (data-entry) — ids are never serialized
+// into the HTML beyond what apiFetch needs at call time.
+document.getElementById('query-history')?.addEventListener('click', async (evt) => {
+  const btn = evt.target.closest('[data-action]');
+  if (!btn || btn.disabled) return;
+  const action = btn.dataset.action;
+
+  if (action === 'clear-local') {
+    const ok = await confirmDialog({
+      title: 'Clear local history?',
+      body: "This empties this browser's local copy of query history. Entries still on the server are left alone.",
+      confirmLabel: 'Clear local'
+    });
+    if (!ok) return;
+    try { localStorage.removeItem(HISTORY_STORAGE_KEY); } catch {}
+    loadQueryHistory();
+    return;
+  }
+
+  const idx = parseInt(btn.dataset.entry, 10);
+  const entry = queryHistoryEntries[idx];
+  if (!entry) return;
+
+  if (action === 'rerun') {
+    const input = document.getElementById('query-input');
+    if (input) input.value = entry.question || '';
+    await withButtonBusy(btn, 'Re-running...', () => doQuery());
+    return;
+  }
+
+  if (entry.__restored) return; // the server never heard of this id
+
+  if (action === 'delete') {
+    const ok = await confirmDialog({
+      title: 'Delete this history entry?',
+      body: 'This question and answer will be permanently removed from history.',
+      confirmLabel: 'Delete',
+      danger: true
+    });
+    if (!ok) return;
+    try {
+      await withButtonBusy(btn, 'Deleting...', async () => {
+        await apiFetch(API + '/history/' + encodeURIComponent(entry.id), { method: 'DELETE' });
+        await loadQueryHistory();
+        toast('History entry deleted.', 'success');
+      });
+    } catch (e) {
+      toast('Failed to delete: ' + errorMessage(e), 'error');
+    }
+    return;
+  }
+
+  if (action === 'save') {
+    const method = entry.saved ? 'DELETE' : 'POST';
+    try {
+      await withButtonBusy(btn, entry.saved ? 'Unsaving...' : 'Saving...', async () => {
+        await apiFetch(API + '/history/' + encodeURIComponent(entry.id) + '/save', { method });
+        await loadQueryHistory();
+        toast(entry.saved ? 'Unsaved.' : 'Saved.', 'success');
+      });
+    } catch (e) {
+      if (e && e.status === 409) {
+        toast('Saved limit reached — unsave one first.', 'error');
+      } else {
+        toast('Failed to update: ' + errorMessage(e), 'error');
+      }
+    }
+    return;
+  }
+});
+
+// Self-boot: populate the panel (and its localStorage mirror) on page load
+// so restored entries from a previous session are visible immediately.
+loadQueryHistory().catch(() => {});
 
 // Enter key handlers
 document.getElementById('query-input').addEventListener('keydown', e => { if(e.key==='Enter') doQuery(); });
