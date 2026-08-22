@@ -1617,6 +1617,33 @@ function tc(t) { return TYPE_COLORS[t] || '#6b6b80'; }
 // ═══════════════════════════════════════
 //  D3 FORCE GRAPH — THE SHOWSTOPPER
 // ═══════════════════════════════════════
+
+// Edge stroke, in one place. Six paths draw links — the initial render, the
+// baseline/legend state, hover highlighting, path highlighting, the WebSocket
+// append and the post-merge redraw — and each used to carry its own literal, so
+// changing one silently left five behind (the same shape as the node-radius bug
+// where live-ingest and post-merge nodes kept an old hardcoded rule).
+//
+// These were 6% and 2%. White at 6% alpha over the #0c0c14 panel composites to
+// rgb(27,27,34) — a 1.14:1 contrast ratio, i.e. rendered, but reading as scattered
+// unconnected dots. 22% was picked by eye against the 56-node seed fixture: 30% was
+// barely distinguishable from it, so this is the restrained end of legible. DIM is
+// the recessive state for legend-filtered and off-path edges and also carries
+// .attr('opacity', 0.3), so it sits far below its nominal 5%.
+const EDGE_STROKE = 'rgba(255,255,255,0.22)';
+const EDGE_STROKE_DIM = 'rgba(255,255,255,0.05)';
+
+// forceCenter translates the centroid only — it pulls on no individual node. With
+// forceManyBody(-80) pushing and nothing pulling back, disconnected components
+// spread without bound and leave the panel: measured on the 56-node seed fixture,
+// only 23 of 56 nodes landed inside the 1098x498 panel. A weak per-node pull toward
+// the centre bounds that spread.
+//
+// 0.07 is the lowest value that seats all 56 with room for the glow (0.05 left one
+// clipped); it also has to stay low enough that the three seed components read as
+// separate clusters rather than one mass, which 0.09 was already starting to lose.
+const GRAPH_CENTER_STRENGTH = 0.07;
+
 let simulation, svgEl, gLinks, gNodes, gLabels, graphData;
 let graphMeta = { truncated: false, total_nodes: 0, total_edges: 0, limit: null };
 let droppedEdgeCount = 0;
@@ -1694,7 +1721,7 @@ function applyBaselineVisualState() {
   if (pathActive) { highlightPath(); return; }
   gNodes.attr('opacity', nodeBaseOpacity);
   gLinks
-    .attr('stroke', d => edgeBaseVisible(d) ? 'rgba(255,255,255,0.06)' : 'rgba(255,255,255,0.02)')
+    .attr('stroke', d => edgeBaseVisible(d) ? EDGE_STROKE : EDGE_STROKE_DIM)
     .attr('stroke-width', d => edgeBaseVisible(d) ? 0.5 : 0.3)
     .attr('opacity', d => edgeBaseVisible(d) ? 1 : 0.3);
 }
@@ -1879,7 +1906,7 @@ function renderGraph(data, emptyReason, emptyDetail) {
     // Links
     gLinks = g.append('g').attr('class','links')
       .selectAll('line').data(graphData.edges).enter().append('line')
-      .attr('stroke','rgba(255,255,255,0.06)').attr('stroke-width', 0.5);
+      .attr('stroke', EDGE_STROKE).attr('stroke-width', 0.5);
     gLinks.append('title').text(d => d.type || 'RELATES_TO');
 
     // Nodes
@@ -1904,6 +1931,8 @@ function renderGraph(data, emptyReason, emptyDetail) {
       .force('link', d3.forceLink(graphData.edges).id(d => d.id).distance(60).strength(0.3))
       .force('charge', d3.forceManyBody().strength(-80))
       .force('center', d3.forceCenter(width/2, height/2))
+      .force('x', d3.forceX(width/2).strength(GRAPH_CENTER_STRENGTH))
+      .force('y', d3.forceY(height/2).strength(GRAPH_CENTER_STRENGTH))
       .force('collision', d3.forceCollide().radius(8))
       .on('tick', () => {
         gLinks.attr('x1',d=>d.source.x).attr('y1',d=>d.source.y)
@@ -1975,7 +2004,7 @@ function showTooltip(event, d) {
   gNodes.attr('opacity', n => neighbors.has(n.id) ? 1 : 0.1);
   gLinks.attr('stroke', l => {
     const [sId, tId] = edgeEndpointIds(l);
-    return (sId===d.id||tId===d.id) ? tc(d.type) : 'rgba(255,255,255,0.02)';
+    return (sId===d.id||tId===d.id) ? tc(d.type) : EDGE_STROKE_DIM;
   }).attr('stroke-width', l => {
     const [sId, tId] = edgeEndpointIds(l);
     return (sId===d.id||tId===d.id) ? 1.5 : 0.3;
@@ -2013,6 +2042,10 @@ function handleGraphResize() {
   const height = container.clientHeight;
   svgEl.attr('width', width).attr('height', height);
   simulation.force('center', d3.forceCenter(width/2, height/2));
+  // Re-target the centring pull too, or it keeps hauling nodes toward where the
+  // centre used to be.
+  simulation.force('x').x(width/2);
+  simulation.force('y').y(height/2);
   simulation.alpha(0.2).restart();
 }
 
@@ -2384,7 +2417,7 @@ function highlightPath() {
   // Dim everything, then highlight path nodes and edges
   gNodes.attr('opacity', d => currentPathNodeIds.has(d.id) ? 1 : 0.1);
   gLinks
-    .attr('stroke', d => currentPathEdgeKeys.has(edgeKey(d)) ? 'var(--accent3)' : 'rgba(255,255,255,0.02)')
+    .attr('stroke', d => currentPathEdgeKeys.has(edgeKey(d)) ? 'var(--accent3)' : EDGE_STROKE_DIM)
     .attr('stroke-width', d => currentPathEdgeKeys.has(edgeKey(d)) ? 2.5 : 0.3)
     .attr('opacity', 1);
 }
@@ -2519,7 +2552,7 @@ function handleGraphUpdate(newNodes, newEdges) {
     .attr('stroke-width', 1);
   newLines.append('title').text(d => d.type || 'RELATES_TO');
   newLines.transition().duration(1000)
-    .attr('stroke', 'rgba(255,255,255,0.06)')
+    .attr('stroke', EDGE_STROKE)
     .attr('stroke-width', 0.5);
 
   // Re-bind D3 data references
@@ -2610,7 +2643,7 @@ function handleGraphMerge(msg) {
     const linkSel = svgEl.select('.links').selectAll('line').data(graphData.edges, edgeKey);
     linkSel.exit().remove();
     const linkEnter = linkSel.enter().append('line')
-      .attr('stroke', 'rgba(255,255,255,0.06)')
+      .attr('stroke', EDGE_STROKE)
       .attr('stroke-width', 0.5);
     linkEnter.append('title').text(d => d.type || 'RELATES_TO');
     gLinks = linkEnter.merge(linkSel);
