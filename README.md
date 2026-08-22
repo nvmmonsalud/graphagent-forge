@@ -2,6 +2,8 @@
 
 > Turn scattered information into connected intelligence.
 
+[![CI](https://github.com/nvmmonsalud/graphagent-forge/actions/workflows/ci.yml/badge.svg)](https://github.com/nvmmonsalud/graphagent-forge/actions/workflows/ci.yml)
+
 GraphAgent Forge is an autonomous AI agent that ingests unstructured data,
 builds knowledge graphs, and reasons over them using GraphRAG. Built for the
 Daytona HackSprint Tokyo (Sept 12, 2026).
@@ -36,6 +38,29 @@ Daytona HackSprint Tokyo (Sept 12, 2026).
 | **Daytona** | Isolated agent execution sandboxes | Isolated sandbox execution of the graph-integrity check — a Daytona sandbox when `DAYTONA_API_KEY` is set, a local subprocess otherwise. The verify response reports which path ran (`method`) and the measured wall time (`duration_ms`, plus `boot_ms` for sandbox creation) |
 | **Nosana** | Decentralized GPU compute | GPU embeddings via a configurable `NOSANA_EMBEDDING_URL`, with a deterministic 384-dim hash fallback so the app runs keyless. Semantic (tier-2) duplicate detection turns itself on only when real embeddings exist |
 
+## 👀 See it running
+
+![GraphAgent Forge hero view with live entity/edge/document counters](assets/ui/hero.png)
+*The landing view — particle field, live counters for entities, relationships and source documents.*
+
+![Knowledge graph force layout with legend and side panels](assets/ui/graph.png)
+*The full Knowledge Graph section: a force-directed layout with every node in frame, plus the Sources, Graph tools, Duplicates and Analytics panels alongside it.*
+
+![Analytics panel with connected components, ranked entities and type histograms](assets/ui/analytics.png)
+*Graph analytics: connected-component breakdown, entities ranked by degree/PageRank/betweenness, and entity- and relationship-type histograms.*
+
+![Two tier-1 exact-duplicate groups with provenance and merge controls](assets/ui/duplicates.png)
+*Suggest-only duplicate detection — exact-label groups shown with per-node provenance, merged only on explicit confirmation.*
+
+![Graph-integrity verification result showing node and edge counts with zero orphan edges](assets/ui/verify.png)
+*Graph-integrity verification, run in the local sandbox — structural checks like orphan-edge detection, independent of any LLM.*
+
+![GraphRAG answer view with no LLM key configured, showing the five retrieved entities](assets/ui/query.png)
+*Ask a question with zero API keys configured: retrieval, ranking and graph context all run — only the final written answer needs an LLM, and GraphRAG still shows exactly what it found.*
+
+![A five-hop path traced between two entities with relationship types labeled](assets/ui/path.png)
+*Path finding between two entities, with the relationship type at each hop along the way.*
+
 ## 🚀 Quick Start
 
 ```bash
@@ -57,6 +82,9 @@ open http://localhost:8000
 # Optional: seed a demo graph (3 sample documents) instead of ingesting live
 python -m scripts.seed_graph
 ```
+
+The web UI's force graph is rendered with D3, served locally from `/vendor`
+(`frontend/vendor/d3.v7.min.js`) — no CDN access needed for the graph to render.
 
 Or with Docker (bundles Neo4j):
 
@@ -89,7 +117,8 @@ graphagent-forge/
 │   │   ├── core.py          # Main agent loop (ingest/ask orchestration, progress stages)
 │   │   ├── jobs.py          # Async ingest job queue (JobManager, submit/wait/list)
 │   │   ├── daytona_exec.py  # Daytona sandbox execution (local subprocess fallback)
-│   │   └── nosana_client.py # Nosana GPU embeddings (hash fallback)
+│   │   ├── nosana_client.py # Nosana GPU embeddings (hash fallback)
+│   │   └── history.py       # In-memory query/answer history store
 │   ├── graph/
 │   │   ├── neo4j_client.py  # Neo4j connection, schema & queries
 │   │   ├── graphrag.py      # GraphRAG query engine
@@ -103,13 +132,18 @@ graphagent-forge/
 │       └── routes.py        # FastAPI endpoints (/api/*)
 ├── frontend/
 │   ├── index.html           # Primary web UI (D3 graph, served at /)
-│   └── app.py               # Optional Streamlit dashboard
+│   ├── app.py               # Optional Streamlit dashboard
+│   └── vendor/
+│       └── d3.v7.min.js     # D3, served locally — no CDN needed to render the graph
 ├── scripts/
-│   └── seed_graph.py        # Loads seed/graph.json into Neo4j for demos
+│   ├── seed_graph.py        # Loads seed/graph.json into Neo4j for demos
+│   └── capture_ui.py        # Playwright script that captures assets/ui/*.png from a live server
 ├── seed/
 │   └── graph.json           # Sample multi-document graph fixture
+├── assets/
+│   └── ui/                  # UI capture PNGs referenced from README.md
 ├── tests/                   # Offline unit/route tests + Neo4j integration tests
-├── .github/                 # CI workflow + PR template
+├── .github/                 # CI workflow (ruff + offline pytest)
 ├── .env.example             # Environment template
 ├── .dockerignore            # Docker build context excludes
 ├── requirements.txt         # Runtime dependencies
@@ -152,6 +186,20 @@ stream over `WS /ws/graph`. Optional hardening via env: `API_KEY`
 (X-API-Key auth on mutating routes), `ALLOWED_ORIGINS` (CORS). Ingest and
 ask share one rate-limit bucket per IP, `RATE_LIMIT_MAX` requests (default
 10) per 60s.
+
+`GET /graph/analytics?top=` returns two tiers in one response: a Cypher tier
+(`totals`, `node_types`, `edge_types`, `top_degree`) that's always available,
+and a `structure` tier (connected components, PageRank, betweenness, average
+clustering) computed in the Daytona sandbox or its local fallback. When the
+structural run can't happen, `structure` degrades in place to `{"ok": false,
+"error": ...}` with no metric keys rather than failing the whole request —
+the same precedent `tier2_reason` sets on `/graph/duplicates`.
+
+The query-history panel is backed by `GET /history?limit=`, `POST
+/history/{id}/save`, `DELETE /history/{id}/save`, and `DELETE /history/{id}`.
+The store is in-memory on the server (answered questions, not the graph
+itself) and reset by a restart; the frontend keeps a capped localStorage
+mirror so the panel still shows something afterwards, per browser.
 
 ## 🎯 Judging Criteria Alignment
 
