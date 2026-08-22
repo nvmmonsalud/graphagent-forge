@@ -179,6 +179,12 @@ async def test_graph_data_invariant_holds_under_truncation(neo4j) -> None:
     assert len(nodes) == 30
     assert len(edges) == 40
 
+    # `total_nodes` counts the whole graph, not just this fixture, so it can only
+    # be checked against what the database already held. Anchoring to a baseline
+    # keeps the assertion exact — a bare `>= 30` would still pass if the count
+    # were double-reported or picked up the truncated page size by mistake.
+    baseline_nodes = (await neo4j.get_all_graph_data(limit=1))["total_nodes"]
+
     try:
         write_result = await neo4j.write_graph({"nodes": nodes, "edges": edges},
                                                  source_doc=source_doc)
@@ -193,8 +199,11 @@ async def test_graph_data_invariant_holds_under_truncation(neo4j) -> None:
             assert edge["target"] in returned_ids
 
         assert data["truncated"] is True
-        assert data["total_nodes"] == 30
+        assert data["total_nodes"] == baseline_nodes + 30
         assert data["limit"] == 5
         assert len(data["nodes"]) == 5
+        # The point of `total_nodes`: it reports the real total, not the size of
+        # the page that was returned. Without this, `truncated` means nothing.
+        assert data["total_nodes"] > len(data["nodes"])
     finally:
         await neo4j.delete_source(source_doc)
