@@ -17,6 +17,7 @@ load_dotenv()
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import FileResponse  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 from src.agent.core import GraphAgent  # noqa: E402
 from src.agent.jobs import JobManager  # noqa: E402
@@ -43,6 +44,7 @@ log = logging.getLogger(__name__)
 # Resolve assets against the repo root, not the process CWD.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_INDEX = REPO_ROOT / "frontend" / "index.html"
+FRONTEND_VENDOR = REPO_ROOT / "frontend" / "vendor"
 
 
 # ------------------------------------------------------------------
@@ -169,6 +171,15 @@ app.include_router(router, prefix="/api")
 # Flattens FastAPI's list-of-dicts 422 body into a plain string so the
 # frontend's String(detail) never renders "[object Object]".
 install_exception_handlers(app)
+
+# Vendored third-party browser assets (D3). Served locally so the graph
+# renders on a network that blocks public CDNs — the visualization is the
+# product. Mounted defensively: StaticFiles raises at construction if the
+# directory is missing, and a partial checkout must not take the app down.
+if FRONTEND_VENDOR.is_dir():
+    app.mount("/vendor", StaticFiles(directory=FRONTEND_VENDOR), name="vendor")
+else:
+    log.warning("Vendored asset directory missing: %s", FRONTEND_VENDOR)
 
 
 # ------------------------------------------------------------------
