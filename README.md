@@ -137,7 +137,7 @@ graphagent-forge/
 │       └── d3.v7.min.js     # D3, served locally — no CDN needed to render the graph
 ├── scripts/
 │   ├── seed_graph.py        # Loads seed/graph.json into Neo4j for demos
-│   └── capture_ui.py        # Playwright script that captures assets/ui/*.png from a live server
+│   └── capture_ui.py        # Playwright + Pillow script that captures assets/ui/*.png from a live server
 ├── seed/
 │   └── graph.json           # Sample multi-document graph fixture
 ├── assets/
