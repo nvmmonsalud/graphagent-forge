@@ -12,18 +12,14 @@ interface (unlike tests/test_seed_script.py, which does need that and
 documents the interface it assumes). Only the fixture's on-disk contract
 (C5) and the documented CLI flags (C4) are assumed here.
 
-ASSUMED FORMAT for seed/README.md (documented ambiguity — the file does not
-exist yet at the time this test was written): two lines of the form
-
-    Pre-merge pair: `<Label A>` -> `<Label B>`
-    Post-merge pair: `<Label C>` -> `<Label D>`
-
-naming two entity labels that already resolve a path via `find_path` before
-any merge happens (general connectivity sanity-check), and two entity labels
-that do NOT resolve a path until after the cross-document duplicate group is
-merged (the dedup payoff: merging joins two previously-disconnected
-sub-graphs through the new canonical node). If seed/README.md ships in a
-different format, update PRE_MERGE_RE / POST_MERGE_RE below.
+seed/README.md's "Path finding" section names its two demo pairs as prose
+blockquotes of the form "From `<Label A>` → To `<Label B>`" — the first
+occurrence is the pair that already resolves in the fresh, pre-merge graph
+(a path entirely inside one document); the second is the pair that only
+resolves after the "Nosana" cross-document duplicate group is merged (the
+whole point of the demo's best beat: an explicit merge visibly welds two
+previously-disconnected document-islands together). FROM_TO_RE below parses
+both from that shape; if seed/README.md's wording changes, update it.
 """
 from __future__ import annotations
 
@@ -46,8 +42,7 @@ NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USER = os.getenv("NEO4J_USER")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 
-PRE_MERGE_RE = re.compile(r"Pre-merge pair:\s*`([^`]+)`\s*(?:->|→|and)\s*`([^`]+)`", re.I)
-POST_MERGE_RE = re.compile(r"Post-merge pair:\s*`([^`]+)`\s*(?:->|→|and)\s*`([^`]+)`", re.I)
+FROM_TO_RE = re.compile(r"From\s+`([^`]+)`\s*(?:->|→)\s*To\s+`([^`]+)`", re.I)
 
 pytestmark = [
     pytest.mark.integration,
@@ -83,19 +78,14 @@ def readme_pairs() -> tuple[tuple[str, str], tuple[str, str]]:
         pytest.fail(f"{README_PATH} does not exist — C4/C5 docs have not landed yet")
     text = README_PATH.read_text(encoding="utf-8")
 
-    pre = PRE_MERGE_RE.search(text)
-    post = POST_MERGE_RE.search(text)
-    assert pre, (
-        "seed/README.md has no 'Pre-merge pair: `A` -> `B`' line matching the "
-        "format this test assumes (see module docstring) — update the fixture "
-        "README or PRE_MERGE_RE"
+    pairs = FROM_TO_RE.findall(text)
+    assert len(pairs) >= 2, (
+        f"expected at least 2 'From `A` \N{RIGHTWARDS ARROW} To `B`' blockquotes in "
+        f"seed/README.md's Path finding section (see module docstring), found "
+        f"{len(pairs)}"
     )
-    assert post, (
-        "seed/README.md has no 'Post-merge pair: `C` -> `D`' line matching the "
-        "format this test assumes (see module docstring) — update the fixture "
-        "README or POST_MERGE_RE"
-    )
-    return (pre.group(1), pre.group(2)), (post.group(1), post.group(2))
+    pre_pair, post_pair = pairs[0], pairs[1]
+    return pre_pair, post_pair
 
 
 @pytest.fixture
