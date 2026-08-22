@@ -404,11 +404,30 @@ async def get_job(job_id: str, request: Request):
 async def ask(req: AskRequest, request: Request):
     """Ask a question — GraphRAG retrieves from graph + reasons with Kimi."""
     agent = request.app.state.agent
+    started = time.perf_counter()
     try:
-        return await agent.ask(req.question)
+        result = await agent.ask(req.question)
     except Exception:
         log.exception("Failed to answer question")
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+
+    # Recording lives in the route, not in GraphAgent.ask: it keeps
+    # src/agent/history.py free of any agent coupling, the same way the job
+    # queue keeps its broadcast sink injected.
+    # Best-effort: a history failure must never fail an answer. `getattr`
+    # because an app assembled without the lifespan hook (bare-app tests, an
+    # embedder mounting just the router) has no `state.history` at all.
+    store = getattr(request.app.state, "history", None)
+    if store is not None:
+        try:
+            store.record(
+                question=req.question,
+                response=result,
+                duration_ms=int(round((time.perf_counter() - started) * 1000)),
+            )
+        except Exception as exc:
+            log.warning("Recording query history failed: %s", exc)
+    return result
 
 
 @router.get("/graph/stats", dependencies=GRAPH_DEP)
@@ -490,6 +509,24 @@ async def graph_duplicates(request: Request, limit: int = Query(default=20, ge=1
         return await agent.find_duplicates(limit=limit)
     except Exception:
         log.exception("Failed to find duplicates")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+
+
+@router.get("/graph/analytics", dependencies=GRAPH_DEP)
+async def graph_analytics(request: Request, top: int = Query(default=10, ge=1, le=50)):
+    """Graph analytics: type histograms, degree ranking and structural metrics.
+
+    `totals`/`node_types`/`edge_types`/`top_degree` come from plain Cypher and
+    are always present. `structure` carries the sandboxed structural metrics
+    and degrades in place — `{"ok": false, "error": ...}` with no metric keys
+    when the run could not happen (same precedent as `tier2_reason` on
+    `/graph/duplicates`), never a 500.
+    """
+    agent = request.app.state.agent
+    try:
+        return await agent.get_analytics(top=top)
+    except Exception:
+        log.exception("Failed to compute graph analytics")
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 
@@ -653,3 +690,71 @@ def install_exception_handlers(app) -> None:
             status_code=422,
             content={"detail": _format_validation_errors(exc)},
         )
+
+
+# ------------------------------------------------------------------
+# Query history — the answered-question log backing the history panel
+#
+# Reads carry NO dependencies, for the same three reasons the job-queue
+# reads don't: the store is in-memory (nothing to gate on Neo4j
+# availability), it must keep working in degraded mode, and it must not
+# consume the shared per-IP rate bucket that /ask and /ingest/* draw from —
+# a history panel polling itself out of an answer would be absurd.
+#
+# The mutating routes take `require_api_key` ONLY: no rate limit (they are
+# pure in-memory bookkeeping) and no `require_graph` (the store outlives a
+# Neo4j outage). Keyless deployments see a no-op, but the "mutating routes
+# are auth-gated whenever API_KEY is set" invariant holds unbroken.
+#
+# There is deliberately NO re-run endpoint. Re-running a question is the
+# frontend refilling the input and POSTing /ask again, which correctly spends
+# a rate-limit slot; a server-side re-run would be a back door around the
+# 10/min brake on the single most expensive route in this file.
+# ------------------------------------------------------------------
+HISTORY_DEP = [Depends(require_api_key)]
+
+
+@router.get("/history")
+async def list_history(request: Request, limit: int = Query(default=20, ge=1, le=100)):
+    """List answered questions, newest first, with store-wide counts."""
+    store = request.app.state.history
+    counts = store.counts()
+    return {
+        "entries": store.list(limit=limit),
+        "total": counts["total"],
+        "saved_count": counts["saved_count"],
+    }
+
+
+@router.post("/history/{entry_id}/save", dependencies=HISTORY_DEP)
+async def save_history_entry(entry_id: str, request: Request):
+    """Pin an entry so history eviction can never drop it."""
+    store = request.app.state.history
+    entry = store.set_saved(entry_id, True)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="history entry not found")
+    # `set_saved` refuses past the saved cap by returning the entry unchanged.
+    # Surfacing that as 409 is what makes the refusal impossible to miss on the
+    # client — a silent no-op would look like a successful save.
+    if not entry["saved"]:
+        raise HTTPException(status_code=409, detail="saved limit reached")
+    return entry
+
+
+@router.delete("/history/{entry_id}/save", dependencies=HISTORY_DEP)
+async def unsave_history_entry(entry_id: str, request: Request):
+    """Unpin an entry, returning it to the normal eviction window."""
+    store = request.app.state.history
+    entry = store.set_saved(entry_id, False)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="history entry not found")
+    return entry
+
+
+@router.delete("/history/{entry_id}", dependencies=HISTORY_DEP)
+async def delete_history_entry(entry_id: str, request: Request):
+    """Drop a single entry from the history store."""
+    store = request.app.state.history
+    if not store.delete(entry_id):
+        raise HTTPException(status_code=404, detail="history entry not found")
+    return {"deleted": entry_id}

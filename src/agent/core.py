@@ -330,6 +330,57 @@ class GraphAgent:
                    for p in sim["pairs"]]
         return {"groups": groups, "tier2_reason": sim.get("reason")}
 
+    async def get_analytics(self, top: int = 10) -> dict[str, Any]:
+        """Graph analytics: an always-available Cypher tier plus a structural tier.
+
+        The Cypher tier (type histograms, top degree, isolated count) is plain
+        Cypher — no GDS, no APOC — so `totals`/`node_types`/`edge_types`/
+        `top_degree` are always present. The structural tier (components,
+        PageRank, betweenness, clustering) runs in the Daytona sandbox (or its
+        local fallback) and keeps that runner's two-shape envelope: on failure
+        `structure` is `{"ok": False, "error": ..., ...}` with no metric keys,
+        mirroring how `/graph/duplicates` degrades via `tier2_reason`.
+        """
+        cypher = await self.neo4j.get_analytics(top=top)
+        # Uncapped, like /graph/verify: structural metrics on a truncated graph
+        # would report components that are artifacts of the cap.
+        graph_data = await self.neo4j.get_all_graph_data(limit=None)
+        structure = await self.daytona.analyze_graph(graph_data)
+
+        nodes = graph_data.get("total_nodes", len(graph_data.get("nodes", [])))
+        edges = graph_data.get("total_edges", len(graph_data.get("edges", [])))
+        density = round(2 * edges / (nodes * (nodes - 1)), 5) if nodes > 1 else 0.0
+
+        if structure.get("ok"):
+            shaped = {
+                "ok": True,
+                "method": structure.get("method"),
+                "duration_ms": structure.get("duration_ms"),
+                "components": structure.get("components"),
+                # The script emits a generous top-N; trim to what was asked.
+                "top_pagerank": (structure.get("top_pagerank") or [])[:top],
+                "top_betweenness": (structure.get("top_betweenness") or [])[:top],
+                "avg_clustering": structure.get("avg_clustering"),
+                "betweenness_reason": structure.get("betweenness_reason"),
+            }
+            if structure.get("skipped"):
+                shaped["skipped"] = True
+                shaped["reason"] = structure.get("reason")
+            structure = shaped
+
+        return {
+            "totals": {
+                "nodes": nodes,
+                "edges": edges,
+                "density": density,
+                "isolated_nodes": cypher["isolated_nodes"],
+            },
+            "node_types": cypher["node_types"],
+            "edge_types": cypher["edge_types"],
+            "top_degree": cypher["top_degree"],
+            "structure": structure,
+        }
+
     async def ask(self, question: str) -> dict[str, Any]:
         """Answer a question using GraphRAG."""
         return await self.graphrag.query(question)

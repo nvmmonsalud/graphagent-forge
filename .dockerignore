@@ -1,6 +1,7 @@
 .venv
 .git
 tests
+assets
 __pycache__
 *.pyc
 .env
