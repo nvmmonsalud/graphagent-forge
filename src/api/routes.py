@@ -21,6 +21,7 @@ from fastapi import (
     Response,
     UploadFile,
 )
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
@@ -90,7 +91,10 @@ async def require_api_key(
 #: effective limit is (workers x RATE_LIMIT_MAX). It is a cheap abuse brake for
 #: the expensive LLM routes, not a security control; use a shared store
 #: (Redis) if this ever needs to be exact.
-RATE_LIMIT_MAX = 10
+#: Read once AT IMPORT TIME on purpose: a per-request getenv() would make
+#: the limit depend on the shell env at call time, which is both a
+#: surprise in tests and a per-request syscall on every hot route.
+RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "10"))
 RATE_LIMIT_WINDOW = 60.0
 _MAX_TRACKED_CLIENTS = 4096
 _rate_buckets: dict[str, deque] = {}
@@ -422,13 +426,17 @@ async def graph_stats(request: Request):
 async def graph_data(
     request: Request,
     source_doc: str | None = Query(default=None, max_length=500),
+    # Node cap for the all-sources view. Ignored on the per-source branch,
+    # which is already bounded by the document and must stay uncapped to keep
+    # its boundary-node guarantee.
+    limit: int = Query(default=500, ge=1, le=5000),
 ):
     """Get graph data (nodes + edges) for visualization, optionally per source."""
     neo4j = request.app.state.neo4j
     try:
         if source_doc:
             return await neo4j.get_graph_data_by_source(source_doc)
-        return await neo4j.get_all_graph_data()
+        return await neo4j.get_all_graph_data(limit=limit)
     except Exception:
         log.exception("Failed to read graph data (source_doc=%r)", source_doc)
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
@@ -604,3 +612,44 @@ async def graph_export(
         content={"nodes": nodes, "edges": edges},
         headers={"Content-Disposition": "attachment; filename=graph-export.json"},
     )
+
+
+# ------------------------------------------------------------------
+# Exception handlers
+# ------------------------------------------------------------------
+#: How many field errors to surface. Enough to be useful, few enough that a
+#: toast/inline banner stays readable.
+_MAX_VALIDATION_ERRORS = 3
+
+
+def _format_validation_errors(exc: RequestValidationError) -> str:
+    """Flatten pydantic's list-of-dicts into one human-readable line.
+
+    FastAPI's default 422 body is `{"detail": [{"loc": [...], "msg": ...}, ...]}`
+    and the frontend renders `String(e.detail)` — which stringifies a list of
+    dicts to "[object Object]". Only `loc` and `msg` are kept: pydantic's
+    `input`/`url` fields echo the submitted value straight back at the client.
+    """
+    parts: list[str] = []
+    for err in exc.errors()[:_MAX_VALIDATION_ERRORS]:
+        loc = ".".join(str(part) for part in err.get("loc", ()) if part is not None)
+        msg = str(err.get("msg") or "invalid value")
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    return "; ".join(parts) or "invalid request"
+
+
+def install_exception_handlers(app) -> None:
+    """Register app-wide exception handlers on `app`.
+
+    Lives here rather than in `src/main.py` so the handler is reachable from a
+    bare `FastAPI()` + this router (how the route tests build their app);
+    `src/main.py` calls it right after `include_router`.
+    """
+
+    @app.exception_handler(RequestValidationError)
+    async def _handle_validation_error(request: Request, exc: RequestValidationError):
+        # Status stays 422 — only the shape of `detail` changes (list -> str).
+        return JSONResponse(
+            status_code=422,
+            content={"detail": _format_validation_errors(exc)},
+        )

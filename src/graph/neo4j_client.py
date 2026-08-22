@@ -383,17 +383,33 @@ class Neo4jClient:
             return path
 
     async def get_all_graph_data(self, limit: int | None = 500) -> dict:
-        """Get graph data for visualization or full integrity checks."""
+        """Get graph data for visualization or full integrity checks.
+
+        HARD INVARIANT: every id appearing in `edges[].source|target` is also
+        present in `nodes[].id`. Capping nodes and edges independently breaks
+        that — the D3 view calls `forceLink().id(d => d.id)` after clearing the
+        SVG, so one dangling endpoint blanks the graph until a page reload. The
+        edge query is therefore constrained to the node ids actually returned.
+
+        Truncating EDGES is safe (it only orphans nodes, which D3 renders
+        fine), so the edge cap is deliberately generous.
+
+        Totals are counted with the identical MATCH patterns, uncapped, so the
+        visualisation badge can never disagree with /graph/stats.
+        """
         safe_limit = max(1, min(int(limit), 5000)) if limit is not None else None
+        # Neo4j takes LIMIT as a literal, so clamp-then-interpolate (as above).
         node_limit = f"LIMIT {safe_limit}" if safe_limit is not None else ""
-        edge_limit = f"LIMIT {safe_limit * 2}" if safe_limit is not None else ""
+        edge_limit = f"LIMIT {safe_limit * 10}" if safe_limit is not None else ""
         nodes_query = f"""
         MATCH (n:Entity)
-        RETURN {_NODE_FIELDS}
+        WITH n ORDER BY n.updated_at DESC, n.id ASC
         {node_limit}
+        RETURN {_NODE_FIELDS}
         """
         edges_query = f"""
         MATCH (a:Entity)-[r]->(b:Entity)
+        WHERE a.id IN $ids AND b.id IN $ids
         RETURN a.id AS source, b.id AS target, coalesce(r.type, type(r)) AS type
         {edge_limit}
         """
@@ -401,10 +417,29 @@ class Neo4jClient:
             nodes_result = await session.run(nodes_query)
             nodes = [dict(record) async for record in nodes_result]
 
-            edges_result = await session.run(edges_query)
+            ids = [n["id"] for n in nodes]
+            edges_result = await session.run(edges_query, ids=ids)
             edges = [dict(record) async for record in edges_result]
 
-        return {"nodes": nodes, "edges": edges}
+            node_total_result = await session.run(
+                "MATCH (n:Entity) RETURN count(n) AS total"
+            )
+            node_total = await node_total_result.single()
+            edge_total_result = await session.run(
+                "MATCH (a:Entity)-[r]->(b:Entity) RETURN count(r) AS total"
+            )
+            edge_total = await edge_total_result.single()
+
+        total_nodes = node_total["total"] if node_total else len(nodes)
+        total_edges = edge_total["total"] if edge_total else len(edges)
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "truncated": total_nodes > len(nodes) or total_edges > len(edges),
+            "total_nodes": total_nodes,
+            "total_edges": total_edges,
+            "limit": safe_limit,
+        }
 
     async def get_nodes_by_source(self, source_doc: str, limit: int = 200) -> list[dict]:
         """List entities that came from a single source document."""
@@ -446,7 +481,16 @@ class Neo4jClient:
             edges_result = await session.run(edges_query, source_doc=source_doc)
             edges = [dict(record) async for record in edges_result]
 
-        return {"nodes": nodes, "edges": edges}
+        # Uncapped by construction — the keys mirror get_all_graph_data() so
+        # callers can read one shape regardless of which path produced it.
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "truncated": False,
+            "total_nodes": len(nodes),
+            "total_edges": len(edges),
+            "limit": None,
+        }
 
     async def get_sources(self) -> list[dict]:
         """List ingested source documents with their entity counts."""
