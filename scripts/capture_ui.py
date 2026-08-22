@@ -218,8 +218,25 @@ SHOTS = [
         "locator": "section.hero",
     },
     {
+        # The Analytics card sits inside this section and rests un-run, so
+        # without triggering it the capture shows grey skeleton bars.
         "key": "graph",
         "locator": "#graph .section-inner",
+        "click": "#btn-analytics",
+        "wait_js": (
+            "analytics rendered",
+            "!!document.querySelector('#analytics-list .an-strip')",
+        ),
+        "wait_settled": "#analytics-list",
+    },
+    {
+        "key": "analytics",
+        "locator": "#analytics-card",
+        "wait_js": (
+            "analytics rendered",
+            "!!document.querySelector('#analytics-list .an-strip')",
+        ),
+        "wait_settled": "#analytics-list",
     },
     {
         "key": "duplicates",
