@@ -337,6 +337,63 @@ class Neo4jClient:
                 "entity_types": record["entity_types"],
             }
 
+    async def get_analytics(self, top: int = 10) -> dict:
+        """Aggregate graph analytics that plain Cypher can always answer.
+
+        Deliberately GDS/APOC-free: neither plugin is installed locally, and
+        the deploy target (Aura) ships APOC Core but no GDS. Degree here is
+        the undirected degree — a knowledge-graph edge's stored direction is
+        only the order the LLM asserted the triple in.
+
+        Structural metrics that Cypher can't express (components, PageRank,
+        betweenness, clustering) are computed in Python by
+        `DaytonaExecutor.analyze_graph`; this tier is the one that can never
+        be unavailable while the graph responds at all.
+        """
+        # Neo4j takes LIMIT as a literal, so clamp-then-interpolate (as above).
+        safe_top = max(1, min(int(top), 50))
+        node_types_query = """
+        MATCH (n:Entity)
+        RETURN n.type AS type, count(*) AS count
+        ORDER BY count DESC, type ASC
+        """
+        edge_types_query = """
+        MATCH (:Entity)-[r]->(:Entity)
+        RETURN coalesce(r.type, type(r)) AS type, count(*) AS count
+        ORDER BY count DESC, type ASC
+        """
+        top_degree_query = f"""
+        MATCH (n:Entity)
+        WITH n, COUNT {{ (n)--() }} AS degree
+        RETURN n.id AS id, n.label AS label, n.type AS type, degree
+        ORDER BY degree DESC, n.id ASC
+        LIMIT {safe_top}
+        """
+        isolated_query = """
+        MATCH (n:Entity)
+        WHERE COUNT { (n)--() } = 0
+        RETURN count(n) AS isolated
+        """
+        async with self.driver.session() as session:
+            node_types_result = await session.run(node_types_query)
+            node_types = [dict(record) async for record in node_types_result]
+
+            edge_types_result = await session.run(edge_types_query)
+            edge_types = [dict(record) async for record in edge_types_result]
+
+            top_degree_result = await session.run(top_degree_query)
+            top_degree = [dict(record) async for record in top_degree_result]
+
+            isolated_result = await session.run(isolated_query)
+            isolated_record = await isolated_result.single()
+
+        return {
+            "node_types": node_types,
+            "edge_types": edge_types,
+            "top_degree": top_degree,
+            "isolated_nodes": isolated_record["isolated"] if isolated_record else 0,
+        }
+
     async def find_path(self, from_label: str, to_label: str) -> list[dict]:
         """Find shortest path between two entities using Cypher shortestPath.
 

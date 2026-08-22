@@ -20,6 +20,7 @@ from fastapi.responses import FileResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 from src.agent.core import GraphAgent  # noqa: E402
+from src.agent.history import QueryHistory  # noqa: E402
 from src.agent.jobs import JobManager  # noqa: E402
 from src.api.routes import install_exception_handlers, router  # noqa: E402
 from src.graph.neo4j_client import Neo4jClient  # noqa: E402
@@ -118,6 +119,11 @@ async def lifespan(app: FastAPI):
     jobs = JobManager(broadcast=ws_manager.broadcast)
     jobs.start()
     app.state.jobs = jobs
+
+    # Answer history. Same contract as the job registry: in-memory, per-process,
+    # lost on restart. Purely synchronous — no I/O, so nothing to start or drain
+    # (hence no shutdown hook for it in the `finally` below).
+    app.state.history = QueryHistory()
 
     try:
         yield
