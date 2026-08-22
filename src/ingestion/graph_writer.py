@@ -11,6 +11,64 @@ from src.ingestion.entity_parser import extract_entities
 log = logging.getLogger(__name__)
 
 
+def prefix_and_validate(graph_data: dict, source_doc: str) -> tuple[dict, int]:
+    """Apply the md5 doc-id prefix and drop edges referencing undeclared ids.
+
+    Node ids become ``<md5(source_doc)[:8]>_<raw id>`` so two documents that
+    happen to reuse the same local id never collide, and edge endpoints are
+    remapped to match. Any edge still pointing at an id that was never declared
+    as a node (an LLM hallucination, or a fixture typo) is dropped.
+
+    `graph_data` is mutated in place and returned alongside the dropped count,
+    so both the live ingest path and the offline seeder share one definition of
+    "what a document's ids look like".
+
+    Returns ``(graph_data, dropped_edges)``.
+    """
+    doc_hash = hashlib.md5(source_doc.encode()).hexdigest()[:8]
+
+    nodes = graph_data.get("nodes", [])
+    edges = graph_data.get("edges", [])
+    if not isinstance(nodes, list):
+        nodes = []
+    if not isinstance(edges, list):
+        edges = []
+
+    # Prefix node IDs with doc hash
+    id_map = {}
+    for node in nodes:
+        old_id = node.get("id", "")
+        new_id = f"{doc_hash}_{old_id}"
+        id_map[old_id] = new_id
+        node["id"] = new_id
+
+    # Remap edge source/target references
+    for edge in edges:
+        if edge.get("source") in id_map:
+            edge["source"] = id_map[edge["source"]]
+        if edge.get("target") in id_map:
+            edge["target"] = id_map[edge["target"]]
+
+    # Drop hallucinated edges pointing at ids that were never declared as nodes
+    known_ids = set(id_map.values())
+    valid_edges = [
+        edge
+        for edge in edges
+        if edge.get("source") in known_ids and edge.get("target") in known_ids
+    ]
+    dropped_edges = len(edges) - len(valid_edges)
+    if dropped_edges:
+        log.warning(
+            "Dropped %d edge(s) referencing unknown entities in '%s'",
+            dropped_edges,
+            source_doc,
+        )
+
+    graph_data["nodes"] = nodes
+    graph_data["edges"] = valid_edges
+    return graph_data, dropped_edges
+
+
 async def ingest_to_graph(
     neo4j: Neo4jClient,
     content: str,
@@ -42,47 +100,12 @@ async def ingest_to_graph(
             "edges": 0,
         }
 
-    # Prefix IDs with a doc hash to prevent cross-document collisions
-    doc_hash = hashlib.md5(source_doc.encode()).hexdigest()[:8]
-
-    nodes = graph_data.get("nodes", [])
-    edges = graph_data.get("edges", [])
-    if not isinstance(nodes, list):
-        nodes = []
-    if not isinstance(edges, list):
-        edges = []
-
-    # Prefix node IDs with doc hash
-    id_map = {}
-    for node in nodes:
-        old_id = node.get("id", "")
-        new_id = f"{doc_hash}_{old_id}"
-        id_map[old_id] = new_id
-        node["id"] = new_id
-
-    # Remap edge source/target references
-    for edge in edges:
-        if edge.get("source") in id_map:
-            edge["source"] = id_map[edge["source"]]
-        if edge.get("target") in id_map:
-            edge["target"] = id_map[edge["target"]]
-
-    # Drop hallucinated edges pointing at ids the LLM never declared as nodes
-    known_ids = set(id_map.values())
-    valid_edges = [
-        edge
-        for edge in edges
-        if edge.get("source") in known_ids and edge.get("target") in known_ids
-    ]
-    dropped_edges = len(edges) - len(valid_edges)
-    if dropped_edges:
-        log.warning(
-            "Dropped %d edge(s) referencing unknown entities in '%s'",
-            dropped_edges,
-            source_doc,
-        )
-    graph_data["nodes"] = nodes
-    graph_data["edges"] = valid_edges
+    # Prefix IDs with a doc hash to prevent cross-document collisions, and drop
+    # edges the LLM invented endpoints for. Shared with `scripts.seed_graph` so
+    # seeded ids are byte-identical to a live ingest of the same document.
+    graph_data, dropped_edges = prefix_and_validate(graph_data, source_doc)
+    nodes = graph_data["nodes"]
+    valid_edges = graph_data["edges"]
 
     if not nodes:
         return {
