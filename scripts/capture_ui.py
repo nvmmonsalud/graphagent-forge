@@ -32,11 +32,13 @@ script runs. Playwright's ``animations="disabled"`` only freezes CSS animations 
 it does not touch ``requestAnimationFrame`` loops — so the D3 simulation is
 additionally waited to ``alpha() < 0.005`` and then explicitly stopped.
 
-Once stopped, the graph is fitted to its panel (see ``FIT_GRAPH_JS``): the seed
-fixture is three disconnected components that repel each other off-canvas, so the
-app's default view clips roughly half the nodes. The fit applies the same zoom
-transform a user would reach for with the page's existing zoom control, and the
-run aborts rather than emitting a capture with any node still outside the frame.
+Once stopped, the graph is fitted to its panel (see ``FIT_GRAPH_JS``). The app's
+default view now holds all 56 seed nodes on its own — ``GRAPH_CENTER_STRENGTH``
+bounds how far the three disconnected components drift — so the fit is framing
+rather than rescue: it zooms the layout up to fill the panel instead of leaving it
+adrift in the middle. It applies the same transform a user would reach for with
+the page's existing zoom control, and the run aborts rather than emitting a
+capture with any node outside the frame.
 
 Measured over two consecutive runs, ``graph``, ``duplicates``, ``query`` and
 ``path`` came out **pixel-identical**. Two captures carry a little residual
@@ -65,6 +67,7 @@ run never leaves a truncated file behind.
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import sys
 from pathlib import Path
@@ -81,10 +84,25 @@ except ImportError:
     )
     sys.exit(2)
 
+# Pillow is required for the same reason playwright is: without the palette pass
+# below, a raw capture of the graph panel lands around 700 KB and the whole set
+# near 2 MB, which blows the caps tests/test_readme_assets.py enforces. Emitting
+# images that fail the repo's own guard is worse than refusing to run, so this
+# fails fast with an install line rather than degrading.
+try:
+    from PIL import Image
+except ImportError:
+    print("Pillow not installed: pip install Pillow", file=sys.stderr)
+    sys.exit(2)
+
 EXIT_OK = 0
 EXIT_BAD_ARGS = 1
 EXIT_NO_PLAYWRIGHT = 2
 EXIT_PRECONDITION = 3
+
+#: Per-image ceiling, kept below the cap in tests/test_readme_assets.py so the
+#: script reports a problem before CI does.
+MAX_IMAGE_BYTES = 400 * 1024
 
 #: Nodes in seed/graph.json. Both the hero counter and the graph badge are waited
 #: on against this, which doubles as proof the 800ms animNum tween has settled.
@@ -143,11 +161,12 @@ REVEAL_ALL_JS = "document.querySelectorAll('.reveal').forEach(e => e.classList.a
 
 #: Fit the settled force graph to its viewport.
 #:
-#: The seed fixture is three disconnected components. `forceManyBody(-80)` pushes
-#: them apart and `forceCenter` only pins the *centroid*, so the islands drift
-#: off-canvas: measured on the 56-node fixture, only 23 nodes land inside the
-#: 1098x498 panel and the rest are clipped. The page's own zoom control fixes this
-#: interactively; this is the same transform applied programmatically.
+#: The seed fixture is three disconnected components that `forceManyBody(-80)`
+#: pushes apart. The page's `forceX`/`forceY` pull keeps them inside the 1098x498
+#: panel (before it, only 23 of 56 nodes landed in frame), but a settled layout
+#: still occupies roughly 416x434 of that panel, so it reads small and
+#: off-balance. Scaling it up to fill the frame is what this does — the same
+#: transform the page's own zoom control applies interactively.
 #:
 #: Reachability: `svgEl`, `gLabels` and `currentZoomK` are top-level `let`s, i.e.
 #: global-lexical bindings that a bare identifier resolves. `zoomBehavior` and the
@@ -333,6 +352,24 @@ def prepare_page(page, base_url: str, timeout: int) -> dict:
     return fit
 
 
+def quantize(data: bytes) -> bytes:
+    """Shrink a screenshot to a 256-colour palette PNG.
+
+    The UI is flat dark surfaces, a handful of accent colours and text — well
+    under 256 distinct colours everywhere except the hero's particle gradients
+    and the graph's glow filter, where the loss is imperceptible at these sizes.
+    Typically a 4-5x saving, which is the difference between the capture set
+    fitting the README budget and not.
+    """
+    with Image.open(io.BytesIO(data)) as img:
+        palette = img.convert("RGB").quantize(colors=256, method=Image.Quantize.MEDIANCUT)
+        buf = io.BytesIO()
+        palette.save(buf, format="PNG", optimize=True)
+    shrunk = buf.getvalue()
+    # A capture that somehow compresses worse keeps the original.
+    return shrunk if len(shrunk) < len(data) else data
+
+
 def capture(page, shot: dict, out_dir: Path, timeout: int) -> Path:
     """Run one shot's pre-actions and write `<out_dir>/<key>.png` atomically."""
     key = shot["key"]
@@ -370,7 +407,7 @@ def capture(page, shot: dict, out_dir: Path, timeout: int) -> Path:
     # truncated PNG that a later agent would embed.
     final = out_dir / f"{key}.png"
     staging = out_dir / f".{key}.png.part"
-    staging.write_bytes(data)
+    staging.write_bytes(quantize(data))
     os.replace(staging, final)
     return final
 
@@ -453,9 +490,24 @@ def main(argv: list[str] | None = None) -> int:
             f"graph fit: scale {fit['k']:.3f} · all {fit['total']} nodes inside "
             f"{fit['width']}x{fit['height']}"
         )
+    oversize = []
     for path in written:
-        print(f"{path}  ({path.stat().st_size / 1024:.0f} KB)")
+        size = path.stat().st_size
+        flag = ""
+        if size > MAX_IMAGE_BYTES:
+            oversize.append(path.name)
+            flag = "  ← OVER BUDGET"
+        print(f"{path}  ({size / 1024:.0f} KB){flag}")
     print(f"{len(written)} capture(s) written to {out_dir}")
+    if oversize:
+        # Say so here rather than letting tests/test_readme_assets.py be the
+        # first thing that mentions it, several minutes later in CI.
+        print(
+            f"{len(oversize)} capture(s) over the {MAX_IMAGE_BYTES // 1024} KB "
+            f"per-image budget: {', '.join(oversize)}",
+            file=sys.stderr,
+        )
+        return EXIT_PRECONDITION
     return EXIT_OK
 
 
