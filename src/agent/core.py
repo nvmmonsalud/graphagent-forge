@@ -12,6 +12,7 @@ from src.agent.nosana_client import NosanaClient
 from src.graph.graphrag import GraphRAGEngine
 from src.graph.neo4j_client import Neo4jClient
 from src.ingestion.extractor import extract_from_text, extract_from_url
+from src.ingestion.file_extractor import extract_from_file
 from src.ingestion.graph_writer import ingest_to_graph
 
 log = logging.getLogger(__name__)
@@ -134,6 +135,49 @@ class GraphAgent:
         return await self._post_ingest(
             result,
             source_doc=source,
+            content=extraction["content"],
+            progress=progress,
+        )
+
+    async def ingest_file(
+        self,
+        data: bytes,
+        filename: str,
+        content_type: str | None = None,
+        source: str | None = None,
+        progress: ProgressCb | None = None,
+    ) -> dict[str, Any]:
+        """Ingest an uploaded file: parse → extract → graph → store.
+
+        Mirrors `ingest_text` with a `"parsing"` prologue: the uploaded bytes are
+        parsed into plain text first (and rejected here on any parse failure), and
+        only then does the shared extract → graph → `_post_ingest` tail run.
+        """
+        await self._report(progress, "parsing")
+        extraction = await extract_from_file(data, filename, content_type, label=source)
+        if extraction.get("error"):
+            return {"success": False, "error": extraction["error"]}
+
+        source_doc = source or extraction.get("filename") or filename
+
+        await self._report(progress, "extracting")
+        async with self._ingest_semaphore:
+            result = await ingest_to_graph(
+                self.neo4j,
+                extraction["content"],
+                source_doc=source_doc,
+            )
+
+        result["extraction"] = {
+            "title": extraction.get("title", ""),
+            "domain": extraction.get("domain", ""),
+            "char_count": extraction.get("char_count", 0),
+            "pages": extraction.get("pages"),
+        }
+
+        return await self._post_ingest(
+            result,
+            source_doc=source_doc,
             content=extraction["content"],
             progress=progress,
         )

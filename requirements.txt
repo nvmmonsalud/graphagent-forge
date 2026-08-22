@@ -18,3 +18,9 @@ httpx>=0.28.0
 
 # Ingestion
 beautifulsoup4>=4.12.0
+pypdf>=5.1.0
+# Multipart form parsing — a REAL runtime dependency of the
+# POST /api/ingest/file UploadFile route (FastAPI raises at import time
+# without it). Removed once in f84c441 as an unused transitive; do not
+# drop it again in a dead-dependency sweep.
+python-multipart>=0.0.18

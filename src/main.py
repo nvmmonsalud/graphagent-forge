@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse  # noqa: E402
 
 from src.agent.core import GraphAgent  # noqa: E402
 from src.agent.jobs import JobManager  # noqa: E402
-from src.api.routes import router  # noqa: E402
+from src.api.routes import install_exception_handlers, router  # noqa: E402
 from src.graph.neo4j_client import Neo4jClient  # noqa: E402
 
 
@@ -166,6 +166,9 @@ app.add_middleware(
 )
 
 app.include_router(router, prefix="/api")
+# Flattens FastAPI's list-of-dicts 422 body into a plain string so the
+# frontend's String(detail) never renders "[object Object]".
+install_exception_handlers(app)
 
 
 # ------------------------------------------------------------------
@@ -207,7 +210,8 @@ if __name__ == "__main__":
         "src.main:app",
         host=os.getenv("APP_HOST", "0.0.0.0"),
         port=int(os.getenv("APP_PORT", "8000")),
-        # Dev convenience: a reload restarts the process, so any in-flight
+        # Off by default: a reload restarts the process, so any in-flight
         # ingest job in the in-memory queue is lost (it never reports back).
-        reload=True,
+        # Opt in with DEV_RELOAD=1 while editing code.
+        reload=os.getenv("DEV_RELOAD", "0") == "1",
     )

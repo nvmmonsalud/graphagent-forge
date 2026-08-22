@@ -9,11 +9,24 @@ import secrets
 import time
 from collections import deque
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 from src.agent.jobs import JobQueueFull
+from src.ingestion.file_extractor import MAX_UPLOAD_BYTES, check_upload_shape, safe_filename
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +35,26 @@ router = APIRouter(tags=["graphagent"])
 #: Generic 500 detail. Exception text is logged, never returned — raw errors
 #: leak bolt URIs, credentials and upstream API metadata to the client.
 INTERNAL_ERROR = "internal error"
+
+# `File`/`Form` make FastAPI evaluate multipart support at ROUTE-DEFINITION
+# time (i.e. at `import src.api.routes`) — if python-multipart isn't
+# installed, registering the route below would raise on import and take the
+# whole app down with it, the opposite of this project's graceful-degradation
+# pattern (and this repo has already lost python-multipart to a dead-dep
+# sweep once). So probe for it explicitly and only register /ingest/file when
+# it's present; everything else keeps working, that one route 404s instead.
+try:
+    import python_multipart  # noqa: F401  (>=0.0.12 module name)
+
+    HAS_MULTIPART = True
+except ImportError:
+    try:
+        import multipart  # noqa: F401  (older releases)
+
+        HAS_MULTIPART = True
+    except ImportError:
+        HAS_MULTIPART = False
+        log.warning("python-multipart not installed — /ingest/file disabled")
 
 
 # ------------------------------------------------------------------
@@ -58,7 +91,10 @@ async def require_api_key(
 #: effective limit is (workers x RATE_LIMIT_MAX). It is a cheap abuse brake for
 #: the expensive LLM routes, not a security control; use a shared store
 #: (Redis) if this ever needs to be exact.
-RATE_LIMIT_MAX = 10
+#: Read once AT IMPORT TIME on purpose: a per-request getenv() would make
+#: the limit depend on the shell env at call time, which is both a
+#: surprise in tests and a per-request syscall on every hot route.
+RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "10"))
 RATE_LIMIT_WINDOW = 60.0
 _MAX_TRACKED_CLIENTS = 4096
 _rate_buckets: dict[str, deque] = {}
@@ -248,6 +284,99 @@ async def ingest_text(req: IngestTextRequest, request: Request, wait: bool = Que
     return JSONResponse(status_code=200, content=final["result"])
 
 
+async def _read_upload_capped(file: UploadFile) -> bytes | None:
+    """Read an upload up to MAX_UPLOAD_BYTES; never materialize more.
+
+    Honest limit: by the time this handler runs, Starlette has already
+    buffered the entire multipart body (spooling to a temp file past 1MB) —
+    so this cap bounds our in-process bytes and the job's payload, not the
+    network transfer itself. A reverse-proxy body limit is the real front
+    door against an oversized upload saturating the connection.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(65_536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+if HAS_MULTIPART:
+
+    @router.post("/ingest/file", status_code=202, dependencies=INGEST_DEP)
+    async def ingest_file(
+        request: Request,
+        file: UploadFile = File(...),  # noqa: B008 (FastAPI DI pattern; UploadFile isn't a ruff-recognized immutable type)
+        source: str | None = Form(default=None, max_length=300),
+        wait: bool = Query(default=False),
+    ):
+        """Submit a file ingest job. Returns 202 with a job id, or the ingest
+        result synchronously (200) when `wait=true`.
+        """
+        agent = request.app.state.agent
+        jobs = request.app.state.jobs
+
+        # Validation before reading bytes — reject cheaply on filename/type
+        # before paying for the (capped) body read.
+        name = safe_filename(file.filename or "")
+        if name is None:
+            # 422: same meaning pydantic body-validation failures already use
+            # in this file — a malformed/missing filename, not a content issue.
+            raise HTTPException(status_code=422, detail="invalid filename")
+        declared = (file.content_type or "").split(";", 1)[0].strip().lower() or None
+        type_error = check_upload_shape(name, declared)
+        if type_error:
+            # 415: purpose-built "unsupported media type" — the frontend maps
+            # this status to a friendly "we can't read that file type" message.
+            raise HTTPException(status_code=415, detail=type_error)
+        data = await _read_upload_capped(file)
+        if data is None:
+            # 413: oversize payload.
+            raise HTTPException(status_code=413, detail="file too large (max 3 MB)")
+        if not data:
+            raise HTTPException(status_code=422, detail="empty file")
+        source = (source or "").strip() or None
+
+        # The UploadFile is closed once the response is sent — long before a
+        # queued job's worker runs — so `run` must close over the bytes
+        # already read (`data`), never `file` itself.
+        async def run(progress):
+            return await agent.ingest_file(
+                data, name, content_type=declared, source=source, progress=progress
+            )
+
+        try:
+            # Job params carry only filename/content_type/size_bytes — never
+            # the bytes themselves, since the record is public via GET
+            # /api/jobs.
+            record = jobs.submit(
+                "file", {"filename": name, "content_type": declared, "size_bytes": len(data)}, run
+            )
+        except JobQueueFull:
+            raise HTTPException(status_code=429, detail="job queue full") from None
+        except Exception:
+            log.exception("Failed to submit ingest job")
+            raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+
+        if not wait:
+            content = {"job_id": record["id"], "status": record["status"]}
+            return JSONResponse(status_code=202, content=content)
+
+        try:
+            final = await jobs.wait(record["id"])
+        except Exception:
+            log.exception("Failed waiting for ingest job")
+            raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+        if final["status"] != "succeeded":
+            raise HTTPException(status_code=500, detail=INTERNAL_ERROR)
+        return JSONResponse(status_code=200, content=final["result"])
+
+
 # ------------------------------------------------------------------
 # Job queue — read endpoints
 #
@@ -297,13 +426,17 @@ async def graph_stats(request: Request):
 async def graph_data(
     request: Request,
     source_doc: str | None = Query(default=None, max_length=500),
+    # Node cap for the all-sources view. Ignored on the per-source branch,
+    # which is already bounded by the document and must stay uncapped to keep
+    # its boundary-node guarantee.
+    limit: int = Query(default=500, ge=1, le=5000),
 ):
     """Get graph data (nodes + edges) for visualization, optionally per source."""
     neo4j = request.app.state.neo4j
     try:
         if source_doc:
             return await neo4j.get_graph_data_by_source(source_doc)
-        return await neo4j.get_all_graph_data()
+        return await neo4j.get_all_graph_data(limit=limit)
     except Exception:
         log.exception("Failed to read graph data (source_doc=%r)", source_doc)
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
@@ -479,3 +612,44 @@ async def graph_export(
         content={"nodes": nodes, "edges": edges},
         headers={"Content-Disposition": "attachment; filename=graph-export.json"},
     )
+
+
+# ------------------------------------------------------------------
+# Exception handlers
+# ------------------------------------------------------------------
+#: How many field errors to surface. Enough to be useful, few enough that a
+#: toast/inline banner stays readable.
+_MAX_VALIDATION_ERRORS = 3
+
+
+def _format_validation_errors(exc: RequestValidationError) -> str:
+    """Flatten pydantic's list-of-dicts into one human-readable line.
+
+    FastAPI's default 422 body is `{"detail": [{"loc": [...], "msg": ...}, ...]}`
+    and the frontend renders `String(e.detail)` — which stringifies a list of
+    dicts to "[object Object]". Only `loc` and `msg` are kept: pydantic's
+    `input`/`url` fields echo the submitted value straight back at the client.
+    """
+    parts: list[str] = []
+    for err in exc.errors()[:_MAX_VALIDATION_ERRORS]:
+        loc = ".".join(str(part) for part in err.get("loc", ()) if part is not None)
+        msg = str(err.get("msg") or "invalid value")
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    return "; ".join(parts) or "invalid request"
+
+
+def install_exception_handlers(app) -> None:
+    """Register app-wide exception handlers on `app`.
+
+    Lives here rather than in `src/main.py` so the handler is reachable from a
+    bare `FastAPI()` + this router (how the route tests build their app);
+    `src/main.py` calls it right after `include_router`.
+    """
+
+    @app.exception_handler(RequestValidationError)
+    async def _handle_validation_error(request: Request, exc: RequestValidationError):
+        # Status stays 422 — only the shape of `detail` changes (list -> str).
+        return JSONResponse(
+            status_code=422,
+            content={"detail": _format_validation_errors(exc)},
+        )

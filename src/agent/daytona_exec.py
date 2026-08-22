@@ -5,9 +5,31 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any, ClassVar
 
 log = logging.getLogger(__name__)
+
+# Client-facing error vocabulary for verify_graph's "could not run" shape.
+# Mirrors the job queue's fixed-literal rule: raw exception text is logged
+# server-side and must never reach a client.
+VERIFY_ERROR_UNAVAILABLE = "verification unavailable"
+VERIFY_ERROR_TIMEOUT = "verification timed out"
+
+
+def _elapsed_ms(started: float) -> int:
+    """Milliseconds since a time.perf_counter() reading."""
+    return int(round((time.perf_counter() - started) * 1000))
+
+
+def _verify_error_literal(exc: BaseException | None) -> str:
+    """Map an execution failure onto the two-literal client vocabulary."""
+    while exc is not None:
+        if isinstance(exc, TimeoutError):
+            return VERIFY_ERROR_TIMEOUT
+        exc = exc.__cause__
+    return VERIFY_ERROR_UNAVAILABLE
+
 
 # Daytona SDK import (graceful fallback if not installed)
 try:
@@ -213,9 +235,21 @@ print(json.dumps(result))
         """Run graph-integrity validation inside a Daytona sandbox.
 
         Creates an ephemeral sandbox, executes a Python validation script,
-        then tears the sandbox down.  Returns a dict with validation results
-        plus metadata about how the check was run.
+        then tears the sandbox down.
+
+        Returns exactly one of two shapes:
+
+        * ran   — ``{"ok": True, "valid": bool, ..., "method": ..., "duration_ms": int}``
+          plus ``boot_ms``/``sandbox_id`` on the Daytona path.
+        * failed — ``{"ok": False, "error": <literal>, "method": ..., "duration_ms": int}``
+
+        The failure shape carries **no** ``valid`` key: its absence is the
+        machine-readable "the check could not run" signal, so an execution
+        failure can never be mistaken for a graph-integrity verdict.  ``error``
+        is one of two literals; the real exception goes to the log only.
         """
+        started = time.perf_counter()
+        method = "daytona" if self.client else "local"
         graph_json = json.dumps(graph_data)
 
         sandbox_id: str | None = None
@@ -229,29 +263,50 @@ print(json.dumps(result))
                 )
                 if result["success"]:
                     parsed = json.loads(result["output"].strip().splitlines()[-1])
+                    parsed["ok"] = True
                     parsed["method"] = "local"
+                    parsed["duration_ms"] = _elapsed_ms(started)
                     return parsed
-                return {"valid": False, "error": result.get("error", "unknown"), "method": "local"}
+
+                raw_error = result.get("error") or "unknown"
+                log.error("Local graph verification failed: %s", raw_error)
+                return {
+                    "ok": False,
+                    "error": (
+                        VERIFY_ERROR_TIMEOUT
+                        if "timed out" in str(raw_error).lower()
+                        else VERIFY_ERROR_UNAVAILABLE
+                    ),
+                    "method": "local",
+                    "duration_ms": _elapsed_ms(started),
+                }
 
             # --- Daytona path ---
             # The SDK ships the script as a file, so embedding the graph is safe.
             script = self._VERIFY_SCRIPT.replace(
                 "__GRAPH_LOAD__", f"json.loads({json.dumps(graph_json)})"
             )
-            last_error = None
+            last_error: BaseException | None = None
             for attempt in range(2):
                 try:
+                    boot_started = time.perf_counter()
                     sandbox = await self.client.create()
+                    boot_ms = _elapsed_ms(boot_started)
                     sandbox_id = sandbox.id
                     response = await sandbox.process.code_run(script)
                     raw = response.result.strip().splitlines()[-1]
                     parsed = json.loads(raw)
+                    parsed["ok"] = True
                     parsed["method"] = "daytona"
                     parsed["sandbox_id"] = sandbox_id
+                    parsed["boot_ms"] = boot_ms
+                    parsed["duration_ms"] = _elapsed_ms(started)
                     return parsed
                 except Exception as exc:
                     last_error = exc
-                    log.warning("Verification attempt %d failed: %s", attempt + 1, exc)
+                    log.warning(
+                        "Verification attempt %d failed: %s", attempt + 1, exc, exc_info=True
+                    )
                     if sandbox_id:
                         try:
                             sandbox = await self.client.get(sandbox_id)
@@ -259,14 +314,22 @@ print(json.dumps(result))
                         except Exception:
                             pass
                         sandbox_id = None
-            raise RuntimeError(f"Daytona verification failed after retries: {last_error}")
+
+            log.error("Daytona verification failed after retries", exc_info=last_error)
+            return {
+                "ok": False,
+                "error": _verify_error_literal(last_error),
+                "method": "daytona",
+                "duration_ms": _elapsed_ms(started),
+            }
 
         except Exception as e:
-            log.error("Graph verification failed: %s", e)
+            log.exception("Graph verification failed")
             return {
-                "valid": False,
-                "error": str(e),
-                "method": "daytona" if self.client else "local",
+                "ok": False,
+                "error": _verify_error_literal(e),
+                "method": method,
+                "duration_ms": _elapsed_ms(started),
             }
 
         finally:

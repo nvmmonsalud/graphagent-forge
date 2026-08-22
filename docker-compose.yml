@@ -17,6 +17,10 @@ services:
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
       API_KEY: ${API_KEY:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      AUTO_MERGE: ${AUTO_MERGE:-}
+      INGEST_JOB_TIMEOUT: ${INGEST_JOB_TIMEOUT:-600}
+      RATE_LIMIT_MAX: ${RATE_LIMIT_MAX:-10}
+      DEV_RELOAD: ${DEV_RELOAD:-0}
     depends_on:
       neo4j:
         condition: service_healthy

@@ -14,6 +14,11 @@ DEFAULT_KIMI_MODEL = os.getenv("KIMI_MODEL", "kimi-k2.7-code-highspeed")
 DEFAULT_KIMI_BASE_URL = "https://api.moonshot.ai/v1"
 MISSING_KEY_ERROR = "KIMI_API_KEY not configured"
 
+# Every `answer_query` string that is a failure notice rather than a real answer
+# starts with this prefix.  Callers (GraphRAGEngine.query) classify on it instead
+# of on the message text, so the return type stays a plain `str`.
+LLM_UNAVAILABLE_PREFIX = "Cannot answer:"
+
 _kimi_client: AsyncOpenAI | None = None
 
 
@@ -104,7 +109,7 @@ async def answer_query(question: str, context: str, model: str | None = None) ->
     """Answer a question using graph context (GraphRAG style)."""
     if not _api_key():
         log.warning("answer_query called without KIMI_API_KEY configured")
-        return f"Cannot answer: {MISSING_KEY_ERROR}."
+        return f"{LLM_UNAVAILABLE_PREFIX} {MISSING_KEY_ERROR}."
 
     client = get_kimi_client()
 
@@ -131,6 +136,6 @@ async def answer_query(question: str, context: str, model: str | None = None) ->
         )
     except Exception as e:
         log.error("Kimi answer_query request failed: %s", e)
-        return f"Cannot answer: LLM request failed ({type(e).__name__})."
+        return f"{LLM_UNAVAILABLE_PREFIX} LLM request failed ({type(e).__name__})."
 
     return response.choices[0].message.content or "No response generated."

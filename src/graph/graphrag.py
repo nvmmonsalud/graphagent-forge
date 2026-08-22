@@ -6,7 +6,7 @@ import logging
 
 from src.agent.nosana_client import NosanaClient
 from src.graph.neo4j_client import Neo4jClient
-from src.ingestion.entity_parser import answer_query
+from src.ingestion.entity_parser import LLM_UNAVAILABLE_PREFIX, answer_query
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +59,7 @@ class GraphRAGEngine:
                 "context_nodes": [],
                 "sources": [],
                 "source_docs": [],
+                "status": "no_context",
             }
 
         # Step 2: Get neighborhood context for top candidates, fetched in parallel
@@ -92,6 +93,14 @@ class GraphRAGEngine:
             "context_nodes": labels,
             "sources": candidates[:5],
             "source_docs": source_docs,
+            # `answer_query` returns a plain string; a failure notice is flagged by
+            # its fixed prefix so an "LLM unavailable" message is never presented
+            # as a real answer.
+            "status": (
+                "llm_unavailable"
+                if answer.startswith(LLM_UNAVAILABLE_PREFIX)
+                else "answered"
+            ),
         }
 
     def _extract_search_terms(self, question: str) -> list[str]:

@@ -53,7 +53,7 @@ with tab_ingest:
     st.header("📥 Ingest Data")
     st.write("Feed URLs or text into the knowledge graph. Kimi AI extracts entities and relationships, Neo4j stores the graph.")
 
-    ingest_mode = st.radio("Mode", ["URL", "Text"], horizontal=True)
+    ingest_mode = st.radio("Mode", ["URL", "Text", "File"], horizontal=True)
 
     if ingest_mode == "URL":
         url = st.text_input("URL to ingest", placeholder="https://example.com/article")
@@ -81,7 +81,7 @@ with tab_ingest:
             else:
                 st.warning("Enter a URL first!")
 
-    else:
+    elif ingest_mode == "Text":
         text = st.text_area(
             "Text to ingest",
             height=200,
@@ -108,6 +108,32 @@ with tab_ingest:
                         st.error(f"API error: {e}")
             else:
                 st.warning("Enter some text first!")
+
+    else:
+        up = st.file_uploader("File to ingest", type=["pdf", "txt", "md"])
+        source = st.text_input("Source label (optional)", value="")
+        if st.button("🚀 Ingest File", type="primary"):
+            if up:
+                with st.spinner("Parsing file, extracting entities, building graph..."):
+                    try:
+                        up_type = up.type or "application/octet-stream"
+                        result = httpx.post(
+                            f"{API_BASE}/ingest/file?wait=true",
+                            files={"file": (up.name, up.getvalue(), up_type)},
+                            data={"source": source} if source else None,
+                            timeout=120,
+                        ).json()
+
+                        if result.get("success"):
+                            st.success(
+                                f"✅ Ingested! {result['nodes']} nodes, {result['edges']} edges"
+                            )
+                        else:
+                            st.error(result.get("error", "Ingestion failed"))
+                    except Exception as e:
+                        st.error(f"API error: {e}")
+            else:
+                st.warning("Choose a file first!")
 
 
 # ------------------------------------------------------------------
