@@ -71,11 +71,15 @@ class Neo4jClient:
         Idempotent (nodes lose `source_doc` as they are migrated, so a re-run
         matches nothing) and batched. MUST run as an auto-commit query:
         `CALL {} IN TRANSACTIONS` is rejected inside an explicit transaction.
+
+        The `(n)` variable scope clause is required, not optional style: without
+        it, `CALL { WITH n ... }` is only a deprecation warning today (Neo4j
+        5.26), but the implicit-import form is slated for removal in a future
+        major and this query would start failing outright rather than warning.
         """
         query = f"""
         MATCH (n:Entity) WHERE n.source_doc IS NOT NULL
-        CALL {{
-          WITH n
+        CALL (n) {{
           SET n.source_docs = coalesce(n.source_docs, []) + n.source_doc
           REMOVE n.source_doc
         }} IN TRANSACTIONS OF {_MIGRATE_BATCH} ROWS
