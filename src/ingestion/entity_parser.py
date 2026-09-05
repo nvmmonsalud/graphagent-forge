@@ -19,6 +19,20 @@ MISSING_KEY_ERROR = "KIMI_API_KEY not configured"
 # of on the message text, so the return type stays a plain `str`.
 LLM_UNAVAILABLE_PREFIX = "Cannot answer:"
 
+# Moonshot's current Kimi models (k2.6 / k2.7-code / k2.7-code-highspeed / k3)
+# are reasoning models with two hard constraints, both verified against the
+# live API:
+#   * `temperature` must be exactly 1 (any other value is a 400
+#     "invalid temperature: only 1 is allowed for this model"), so we never
+#     send the parameter and let the provider default apply;
+#   * thinking cannot be disabled, and the reasoning tokens COUNT AGAINST
+#     `max_tokens`.  A 4k budget was routinely eaten by ~3.5k reasoning tokens,
+#     leaving a truncated (unparseable) JSON body.  Budgets below are sized so
+#     the visible output survives a long think.
+EXTRACT_MAX_TOKENS = int(os.getenv("KIMI_EXTRACT_MAX_TOKENS", "16384"))
+ANSWER_MAX_TOKENS = int(os.getenv("KIMI_ANSWER_MAX_TOKENS", "4096"))
+TRUNCATED_ERROR = "LLM output truncated: raise KIMI_EXTRACT_MAX_TOKENS"
+
 _kimi_client: AsyncOpenAI | None = None
 
 
@@ -89,18 +103,25 @@ Rules:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Extract knowledge graph from:\n\n{text}"},
             ],
-            # Structured JSON extraction must be near-deterministic.
-            temperature=0.2,
-            max_tokens=4096,
-            timeout=60,
+            max_tokens=EXTRACT_MAX_TOKENS,
+            timeout=120,
             response_format={"type": "json_object"},
         )
     except Exception as e:
         log.error("Kimi extract_entities request failed: %s", e)
         return {"nodes": [], "edges": [], "error": f"LLM request failed: {type(e).__name__}"}
 
+    choice = response.choices[0]
+    if choice.finish_reason == "length":
+        # Reasoning + output overran the budget; the JSON is cut mid-stream and
+        # would fail to parse anyway — report the real cause instead.
+        log.error(
+            "Kimi extract_entities hit max_tokens=%s (finish_reason=length)", EXTRACT_MAX_TOKENS
+        )
+        return {"nodes": [], "edges": [], "error": TRUNCATED_ERROR}
+
     try:
-        return json.loads(response.choices[0].message.content or "{}")
+        return json.loads(choice.message.content or "{}")
     except json.JSONDecodeError as e:
         return {"nodes": [], "edges": [], "error": f"Failed to parse LLM JSON output: {e}"}
 
@@ -130,12 +151,20 @@ async def answer_query(question: str, context: str, model: str | None = None) ->
                     "content": f"Knowledge Graph Context:\n{context}\n\nQuestion: {question}",
                 },
             ],
-            temperature=0.6,
-            max_tokens=1024,
-            timeout=60,
+            max_tokens=ANSWER_MAX_TOKENS,
+            timeout=120,
         )
     except Exception as e:
         log.error("Kimi answer_query request failed: %s", e)
         return f"{LLM_UNAVAILABLE_PREFIX} LLM request failed ({type(e).__name__})."
 
-    return response.choices[0].message.content or "No response generated."
+    choice = response.choices[0]
+    content = choice.message.content or ""
+    if not content:
+        # Typically finish_reason == "length" with the whole budget spent on
+        # reasoning.  An empty string is not an answer; classify it as
+        # unavailable so GraphRAG reports `llm_unavailable`, not `answered`.
+        reason = choice.finish_reason
+        log.error("Kimi answer_query returned no content (finish_reason=%s)", reason)
+        return f"{LLM_UNAVAILABLE_PREFIX} LLM returned no content (finish_reason={reason})."
+    return content
