@@ -14,6 +14,8 @@
 - [ ] **Run without `DEV_RELOAD`** (leave it unset, i.e. don't run with `DEV_RELOAD=1`). Uvicorn's `--reload` restarts the whole process on any file change, which silently kills whatever ingest job is in flight — deadly mid-demo. `DEV_RELOAD=1` is for editing code, not presenting.
 - [ ] **Raise `RATE_LIMIT_MAX`** if you're going to rehearse the demo and then present it back-to-back. The 10-requests/60s bucket is *shared* across every `/ingest/*` call **and** every `/ask` call, per IP, per process — a rehearsal run can leave you rate-limited (`429`) five minutes later when it actually matters. Set `RATE_LIMIT_MAX=50` or higher in `.env` for demo day.
 - [ ] **Confirm the connection badge reads `live`** (bottom-left of the graph panel) before you start talking — if it says `reconnecting`, the WebSocket hasn't connected and node updates won't animate in.
+- [ ] **Budget a full minute per live ingest.** Kimi's current models are reasoning models: a ~3k-character page took 55–60s of extraction end to end in rehearsal. Submit the URL early in the talk (it returns a job id instantly) and keep talking; don't stand there waiting for it.
+- [ ] **Don't paste a Wikipedia URL from a cloud/datacenter box.** Wikimedia's bot policy 403s the fetch from datacenter egress even with a browser User-Agent; from a laptop on normal wifi it's fine. Safe rehearsed example: `https://www.python.org/about/` (47 nodes / 49 edges).
 - [ ] Have `KIMI_API_KEY` configured if you want the "Ask" beat to produce a real written answer — everything else on the page (graph, sources, duplicates, verify, export, path finder) works with zero keys configured.
 
 ## LIVE DEMO
