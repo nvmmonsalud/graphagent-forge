@@ -14,8 +14,14 @@ from src.api.routes import router
 
 
 @pytest.fixture(autouse=True)
-def _reset_rate_limiter():
-    """The rate limiter's bucket dict is module-level global state."""
+def _reset_rate_limiter(monkeypatch):
+    """The rate limiter's bucket dict is module-level global state.
+
+    RATE_LIMIT_MAX is read from the env once at import time, so a developer
+    shell (or demo .env) with RATE_LIMIT_MAX raised would silently change
+    what the 10-request tests below observe — pin it to the documented default.
+    """
+    monkeypatch.setattr(routes_module, "RATE_LIMIT_MAX", 10)
     routes_module._rate_buckets.clear()
     yield
     routes_module._rate_buckets.clear()
