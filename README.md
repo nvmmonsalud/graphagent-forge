@@ -55,8 +55,8 @@ Daytona HackSprint Tokyo (Sept 12, 2026).
 ![Graph-integrity verification result showing node and edge counts with zero orphan edges](assets/ui/verify.png)
 *Graph-integrity verification, run in the local sandbox — structural checks like orphan-edge detection, independent of any LLM.*
 
-![GraphRAG answer view with no LLM key configured, showing the five retrieved entities](assets/ui/query.png)
-*Ask a question with zero API keys configured: retrieval, ranking and graph context all run — only the final written answer needs an LLM, and GraphRAG still shows exactly what it found.*
+![GraphRAG answer grounded in the graph, with the retrieved entities and provenance below it](assets/ui/query.png)
+*Ask a question with a Kimi key configured: GraphRAG retrieves and ranks entities, fetches their graph neighbourhood, and Kimi writes an answer grounded only in that context — with the retrieved entities and source provenance shown beneath it. Keyless, the same view still runs retrieval and shows what it found, with a notice in place of the written answer.*
 
 ![A five-hop path traced between two entities with relationship types labeled](assets/ui/path.png)
 *Path finding between two entities, with the relationship type at each hop along the way.*
