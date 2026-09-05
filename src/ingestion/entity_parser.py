@@ -89,10 +89,15 @@ Rules:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Extract knowledge graph from:\n\n{text}"},
             ],
-            # Structured JSON extraction must be near-deterministic.
-            temperature=0.2,
-            max_tokens=4096,
-            timeout=60,
+            # No explicit temperature: the current Kimi models (k2.6, k2.7-code,
+            # k2.7-code-highspeed, k3) reject any value except their own default
+            # with a 400 ("only 1 is allowed for this model"), so pinning 0.2
+            # here broke every extraction against the documented default model.
+            # 4096 was calibrated for a terser model generation: a 16K-char
+            # document's extraction hit the cap mid-string and failed JSON
+            # parsing (the current k2.7 models also spend output on reasoning).
+            max_tokens=16384,
+            timeout=120,
             response_format={"type": "json_object"},
         )
     except Exception as e:
@@ -130,7 +135,7 @@ async def answer_query(question: str, context: str, model: str | None = None) ->
                     "content": f"Knowledge Graph Context:\n{context}\n\nQuestion: {question}",
                 },
             ],
-            temperature=0.6,
+            # No explicit temperature — same 400 as extract_entities above.
             max_tokens=1024,
             timeout=60,
         )
