@@ -143,7 +143,10 @@ async def answer_query(question: str, context: str, model: str | None = None) ->
                     "content": (
                         "You are a precise research assistant. Answer questions using ONLY "
                         "the provided knowledge graph context. Cite specific entities and "
-                        "relationships. If the context doesn't contain enough info, say so."
+                        "relationships. If the context doesn't contain enough info, say so. "
+                        # The frontend escapes the answer and renders it as plain text, so
+                        # markdown syntax would appear literally (**bold**, `code`).
+                        "Write plain prose without markdown formatting."
                     ),
                 },
                 {
