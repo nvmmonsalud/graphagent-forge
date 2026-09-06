@@ -16,6 +16,7 @@
 - [ ] **Confirm the connection badge reads `live`** (bottom-left of the graph panel) before you start talking — if it says `reconnecting`, the WebSocket hasn't connected and node updates won't animate in.
 - [ ] **Budget a full minute per live ingest.** Kimi's current models are reasoning models: a ~3k-character page took 55–60s of extraction end to end in rehearsal. Submit the URL early in the talk (it returns a job id instantly) and keep talking; don't stand there waiting for it.
 - [ ] **Don't paste a Wikipedia URL from a cloud/datacenter box.** Wikimedia's bot policy 403s the fetch from datacenter egress even with a browser User-Agent; from a laptop on normal wifi it's fine. Safe rehearsed example: `https://www.python.org/about/` (47 nodes / 49 edges).
+- [ ] **Know what a Kimi outage looks like, because one happened in rehearsal.** Moonshot's engine went into overload mid-run — one ingest failed with `LLM request failed: InternalServerError`, then requests returned 429 "engine is currently overloaded" — and recovered on its own about five minutes later. The app never crashes on this: the job lands as a clean failure with that error text, and clicking ingest again is the whole recovery. If it persists, skip Step 1 and run the demo on the seeded graph — every other beat works without a single successful LLM call.
 - [ ] Have `KIMI_API_KEY` configured if you want the "Ask" beat to produce a real written answer — everything else on the page (graph, sources, duplicates, verify, export, path finder) works with zero keys configured.
 
 ## LIVE DEMO
@@ -46,7 +47,8 @@ Pick 3–4 of these based on time — each is a real, working panel, not a mocku
 - **📄 File/PDF upload** ("02 — Ingest", From File): drag in a PDF, .txt, or .md — parsed in memory, magic-byte checked against its declared type, never written to disk
 - **🛡️ Verify graph integrity**: runs an actual integrity check in a Daytona sandbox (or a local subprocess when no `DAYTONA_API_KEY` is set) and reports which path ran plus the measured time it took — not a hardcoded number
 - **⬇ Export**: one click to JSON or CSV of the whole graph
-- **🧬 Duplicates / 🔀 Merge**: "Scan for duplicates" surfaces entities that likely refer to the same thing (exact-label matches always; semantic matches too, once real embeddings are configured) — merge them with one click and watch the graph update live
+- **🧬 Duplicates / 🔀 Merge — the strongest 30 seconds in the demo if you ingested live.** "Scan for duplicates" surfaces entities that likely refer to the same thing (exact-label matches always; semantic matches too, once real embeddings are configured). Here's the story to tell: if Step 1 ingested `https://neo4j.com/blog/genai/what-is-knowledge-graph/`, the article's own "Neo4j" entity has already joined the seed graph's existing neo4j duplicate group — three members, from three different documents, found automatically. Merge it and the article's island welds itself into the seeded graph, live, no reload. In rehearsal the largest connected component jumped from a third of the graph to 90 of 126 nodes on that one click
+- **📊 Analytics**: connected components, degree/PageRank/betweenness rankings, type histograms — computed in the Daytona sandbox (or its local fallback) in pure stdlib. Run it before and after the merge above and point at one number: the component count drops and the largest-island size jumps. That's the merge proven by arithmetic, not by squinting at dots
 - **📚 Sources panel**: every ingested document, with the ability to focus the graph on just one source or delete it
 - **05 — Path Finder** (🔍 Find Path): type two entity labels and highlight the shortest connecting path through the graph
 - **The connection badge** itself: `live` vs `reconnecting` is a real WebSocket health indicator, not decoration — point at it after a merge or a new ingest lands to show the graph updated without a page reload
@@ -72,7 +74,7 @@ Pick 3–4 of these based on time — each is a real, working panel, not a mocku
 3. **Name-drop sponsors naturally** — don't force it
 4. **End with vision** — what could this become?
 5. **Practice the full run** — timing is everything, and the job-queue stages take real seconds each
-6. **Have a backup plan**: seed the graph beforehand (`python -m scripts.seed_graph`). Every panel except the written LLM answer — graph view, sources, verify, export, duplicates/merge, path finder — works with zero API keys configured, so a slow or missing `KIMI_API_KEY` never blanks the demo.
+6. **Have a backup plan**: seed the graph beforehand (`python -m scripts.seed_graph`). Every panel except the written LLM answer — graph view, sources, verify, export, duplicates/merge, analytics, path finder — works with zero API keys configured, so a slow or missing `KIMI_API_KEY` never blanks the demo. The same plan covers a Kimi-side outage: if Moonshot reports itself overloaded (it did once in rehearsal, for ~5 minutes), retry the ingest once, then fall back to the seeded graph and keep going — the merge + analytics beat still lands because the seed fixture ships with its own planted duplicates.
 
 ## 🔗 URLs to Have Ready
 - Web UI: http://localhost:8000
