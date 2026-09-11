@@ -177,7 +177,8 @@ run before it's failed with `"timed out"`).
 Query: `POST /ask`, `POST /graph/search`, `POST /graph/path`. Graph data:
 `GET /graph/data[?source_doc=][&limit=]` (node cap 1–5000, default 500, on
 the all-sources view only — a per-source read is never truncated), `GET
-/graph/stats`, `GET /graph/verify`, `GET /graph/export?format=json|csv`.
+/graph/stats`, `GET /graph/verify`, `POST /graph/verify/fanout`,
+`GET /graph/export?format=json|csv`.
 Source management: `GET /sources`, `DELETE /sources?source_doc=`, `POST
 /graph/clear`. Duplicate entities across sources are surfaced by `GET
 /graph/duplicates` and merged via `POST /graph/merge` (suggest-only; set
@@ -194,6 +195,19 @@ clustering) computed in the Daytona sandbox or its local fallback. When the
 structural run can't happen, `structure` degrades in place to `{"ok": false,
 "error": ...}` with no metric keys rather than failing the whole request —
 the same precedent `tier2_reason` sets on `/graph/duplicates`.
+
+`POST /graph/verify/fanout[?limit=1-16]` audits every source's sub-graph in
+its **own** Daytona sandbox, all launched together: N sources spawn N sandboxes
+concurrently (bounded by `FANOUT_MAX_CONCURRENCY`, default 6), so the run's
+wall clock is bounded by the slowest single audit instead of their sum. It
+reads the per-source payloads from Neo4j, hands them to the executor's
+`verify_graph_fanout` with an injected broadcast sink, and streams each
+sandbox's lifecycle over `WS /ws/graph` as `{"type": "fanout_update", "phase":
+"started"|"done", ...}` so the audit is watchable while it runs. The response
+reports measured `wall_ms`, `serial_ms`, `speedup`, `sandbox_count` and boot-time
+stats; each entry in `sources` carries its own verdict, so one source failing
+never fails the batch, and a run in which nothing produced a verdict returns
+`{"ok": false, "error": ...}` with no `sources` key at all.
 
 The query-history panel is backed by `GET /history?limit=`, `POST
 /history/{id}/save`, `DELETE /history/{id}/save`, and `DELETE /history/{id}`.

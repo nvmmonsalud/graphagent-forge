@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any, ClassVar
 
 log = logging.getLogger(__name__)
@@ -28,6 +29,20 @@ ANALYTICS_ERROR_TIMEOUT = "analytics timed out"
 DEFAULT_MAX_BETWEENNESS_NODES = 400
 _MIN_BETWEENNESS_NODES = 1
 _MAX_BETWEENNESS_NODES = 5000
+
+# --- Parallel fan-out verification -----------------------------------------
+# One sandbox per source document, all created and run concurrently. The point
+# of the feature is that wall-clock is bounded by the SLOWEST single
+# verification instead of the sum of all of them, so both numbers are measured
+# at run time and reported side by side — never asserted or hardcoded.
+FANOUT_ERROR_UNAVAILABLE = "fan-out verification unavailable"
+
+# Concurrency cap. Keeps a demo-sized graph from asking Daytona for more
+# sandboxes than the account is meant to hold at once; read once at
+# construction like the betweenness budget.
+DEFAULT_FANOUT_CONCURRENCY = 6
+_MIN_FANOUT_CONCURRENCY = 1
+_MAX_FANOUT_CONCURRENCY = 32
 
 
 def _elapsed_ms(started: float) -> int:
@@ -85,6 +100,21 @@ class DaytonaExecutor:
             budget = DEFAULT_MAX_BETWEENNESS_NODES
         self.betweenness_max = max(
             _MIN_BETWEENNESS_NODES, min(budget, _MAX_BETWEENNESS_NODES)
+        )
+
+        raw_fanout = os.getenv("FANOUT_MAX_CONCURRENCY", "")
+        try:
+            fanout_budget = (
+                int(raw_fanout) if raw_fanout.strip() else DEFAULT_FANOUT_CONCURRENCY
+            )
+        except ValueError:
+            log.warning(
+                "Invalid FANOUT_MAX_CONCURRENCY=%r — using %d",
+                raw_fanout, DEFAULT_FANOUT_CONCURRENCY,
+            )
+            fanout_budget = DEFAULT_FANOUT_CONCURRENCY
+        self.fanout_max_concurrency = max(
+            _MIN_FANOUT_CONCURRENCY, min(fanout_budget, _MAX_FANOUT_CONCURRENCY)
         )
 
     # Map language names to actual shell commands
@@ -657,3 +687,129 @@ print(json.dumps(result))
             err_timeout=ANALYTICS_ERROR_TIMEOUT,
             label="analytics",
         )
+
+    # ------------------------------------------------------------------
+    # Parallel fan-out verification — one sandbox per source
+    # ------------------------------------------------------------------
+
+    async def verify_graph_fanout(
+        self,
+        graphs: dict[str, dict[str, Any]],
+        *,
+        on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        max_concurrency: int | None = None,
+    ) -> dict[str, Any]:
+        """Verify each source's sub-graph in its own sandbox, all at once.
+
+        `graphs` maps ``source_doc -> graph payload`` (the same dict
+        `verify_graph` accepts). Every entry gets its own ephemeral sandbox;
+        the calls are launched together and bounded by a semaphore, so a
+        fan-out over N sources costs roughly ONE verification of wall-clock
+        instead of N — which is the entire point of the feature.
+
+        `on_event`, when supplied, is awaited with small progress dicts:
+        ``{"phase": "started", "source": ...}`` as an item launches and
+        ``{"phase": "done", "source": ..., "result": {...}}`` when it lands.
+        The sink is **injected, never imported** — the same rule the job queue
+        follows — so this module stays free of any transport. A sink that
+        raises is logged and ignored: telemetry must never fail the work.
+
+        Returns exactly one of two shapes:
+
+        * ran    — ``{"ok": True, "sources": [...], "wall_ms", "serial_ms",
+          "speedup", "sandbox_count", "source_count", "concurrency",
+          "boot_ms", "method"}``. Each ``sources`` item carries its own verdict
+          (``valid``/``node_count``/... on success, ``error`` on failure), so a
+          single source failing never sinks the batch.
+        * failed — ``{"ok": False, "error": FANOUT_ERROR_UNAVAILABLE,
+          "method", "wall_ms"}`` with **no** ``sources`` key: its absence is the
+          machine-readable "nothing ran" signal.
+
+        An empty `graphs` is a valid, well-defined result (zero sources), not a
+        failure. `wall_ms` and `serial_ms` are measured with
+        ``time.perf_counter()`` at call time — never hardcoded or assumed.
+        """
+        source_count = len(graphs)
+        requested = (
+            max_concurrency if max_concurrency is not None else self.fanout_max_concurrency
+        )
+        concurrency = max(
+            _MIN_FANOUT_CONCURRENCY, min(int(requested), _MAX_FANOUT_CONCURRENCY)
+        )
+        method = "daytona" if self.client else "local"
+
+        started = time.perf_counter()
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _emit(payload: dict[str, Any]) -> None:
+            if on_event is None:
+                return
+            try:
+                await on_event(payload)
+            except Exception as exc:  # telemetry is never load-bearing
+                log.warning("Fan-out event sink failed: %s", exc)
+
+        async def _one(source: str, graph_data: dict[str, Any]) -> dict[str, Any]:
+            async with semaphore:
+                await _emit({"phase": "started", "source": source})
+                result = await self.verify_graph(graph_data)
+            item: dict[str, Any] = {"source": source}
+            item.update(result)
+            await _emit({"phase": "done", "source": source, "result": item})
+            return item
+
+        outcomes = await asyncio.gather(
+            *(_one(src, data) for src, data in graphs.items()),
+            return_exceptions=True,
+        )
+
+        items: list[dict[str, Any]] = []
+        for (source, _data), outcome in zip(graphs.items(), outcomes, strict=True):
+            if isinstance(outcome, BaseException):
+                # Escaped verify_graph's own envelope, so normalize it here
+                # rather than letting a raw exception reach a client.
+                log.error("Fan-out verification of %r crashed", source, exc_info=outcome)
+                items.append({
+                    "source": source,
+                    "ok": False,
+                    "error": FANOUT_ERROR_UNAVAILABLE,
+                    "method": method,
+                    "duration_ms": _elapsed_ms(started),
+                })
+            else:
+                items.append(outcome)
+
+        wall_ms = _elapsed_ms(started)
+        ran = [item for item in items if item.get("ok")]
+
+        if source_count and not ran:
+            # Nothing produced a verdict: report the run itself as failed, with
+            # no `sources` key, so it can never be read as a clean audit.
+            return {
+                "ok": False,
+                "error": FANOUT_ERROR_UNAVAILABLE,
+                "method": method,
+                "wall_ms": wall_ms,
+            }
+
+        serial_ms = sum(int(item.get("duration_ms") or 0) for item in ran)
+        boots = [
+            int(item["boot_ms"]) for item in ran if isinstance(item.get("boot_ms"), int)
+        ]
+        return {
+            "ok": True,
+            "sources": items,
+            "source_count": source_count,
+            "sandbox_count": sum(1 for item in ran if item.get("method") == "daytona"),
+            "wall_ms": wall_ms,
+            "serial_ms": serial_ms,
+            "speedup": round(serial_ms / wall_ms, 2) if wall_ms > 0 and serial_ms else 0.0,
+            "concurrency": concurrency,
+            "boot_ms": {
+                "count": len(boots),
+                "min": min(boots),
+                "max": max(boots),
+                "avg": round(sum(boots) / len(boots)),
+            } if boots else None,
+            "method": method,
+        }

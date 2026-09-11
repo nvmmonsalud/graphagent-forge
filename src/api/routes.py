@@ -1,6 +1,7 @@
 """API routes — REST endpoints for the frontend."""
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import logging
@@ -486,6 +487,46 @@ async def graph_verify(request: Request):
         return await agent.daytona.verify_graph(graph_data)
     except Exception:
         log.exception("Graph verification failed")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+
+
+@router.post("/graph/verify/fanout", dependencies=GRAPH_DEP)
+async def graph_verify_fanout(request: Request, limit: int = Query(default=6, ge=1, le=16)):
+    """Audit every source's sub-graph in its OWN Daytona sandbox, concurrently.
+
+    Reads the graph per source from Neo4j, then hands the payloads to the
+    executor's parallel fan-out: N sources spawn N sandboxes launched
+    together, so the audit costs roughly one verification of wall-clock
+    instead of N. Every sandbox's lifecycle is broadcast over `/ws/graph` as a
+    `fanout_update` message, so the run is watchable while it happens rather
+    than being a spinner.
+
+    Read-only, so it sits behind GRAPH_DEP exactly like `/graph/verify`. The
+    per-source failure story is the executor's: one source failing yields an
+    item with `ok: false` and never a 500.
+    """
+    neo4j = request.app.state.neo4j
+    agent = request.app.state.agent
+    manager = getattr(request.app.state, "ws_manager", None)
+
+    async def _on_event(event: dict) -> None:
+        # Injected sink, mirroring the job queue: broadcast failures must never
+        # fail the audit, and this module stays free of transport imports.
+        if manager is not None:
+            await manager.broadcast({"type": "fanout_update", **event})
+
+    try:
+        sources = await neo4j.get_sources()
+        # get_sources() orders by node_count DESC, so the cap keeps the biggest
+        # sub-graphs. The limit is a credit budget, not a correctness bound.
+        ordered = [rec["source_doc"] for rec in sources[:limit] if rec.get("source_doc")]
+        payloads = await asyncio.gather(
+            *(neo4j.get_graph_data_by_source(source_doc) for source_doc in ordered)
+        )
+        graphs = dict(zip(ordered, payloads, strict=True))
+        return await agent.daytona.verify_graph_fanout(graphs, on_event=_on_event)
+    except Exception:
+        log.exception("Fan-out verification failed")
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 

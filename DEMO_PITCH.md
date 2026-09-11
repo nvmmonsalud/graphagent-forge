@@ -17,7 +17,9 @@
 - [ ] **Budget a full minute per live ingest.** Kimi's current models are reasoning models: a ~3k-character page took 55–60s of extraction end to end in rehearsal. Submit the URL early in the talk (it returns a job id instantly) and keep talking; don't stand there waiting for it.
 - [ ] **Don't paste a Wikipedia URL from a cloud/datacenter box.** Wikimedia's bot policy 403s the fetch from datacenter egress even with a browser User-Agent; from a laptop on normal wifi it's fine. Safe rehearsed example: `https://www.python.org/about/` (47 nodes / 49 edges).
 - [ ] **Know what a Kimi outage looks like, because one happened in rehearsal.** Moonshot's engine went into overload mid-run — one ingest failed with `LLM request failed: InternalServerError`, then requests returned 429 "engine is currently overloaded" — and recovered on its own about five minutes later. The app never crashes on this: the job lands as a clean failure with that error text, and clicking ingest again is the whole recovery. If it persists, skip Step 1 and run the demo on the seeded graph — every other beat works without a single successful LLM call.
-- [ ] Have `KIMI_API_KEY` configured if you want the "Ask" beat to produce a real written answer — everything else on the page (graph, sources, duplicates, verify, export, path finder) works with zero keys configured.
+- [ ] Have `KIMI_API_KEY` configured if you want the "Ask" beat to produce a real written answer — everything else on the page (graph, sources, duplicates, verify, export, path finder, fan-out) works with zero keys configured.
+- [ ] **Bring up Neo4j locally and check it**: `docker compose up -d neo4j` (Docker Desktop must already be running), then confirm `NEO4J_URI=bolt://localhost:7687` / `NEO4J_USER=neo4j` / `NEO4J_PASSWORD=graphagent-dev` in `.env`. `GET /api/health` must read `{"neo4j": true}` before you leave the house. (The Aura free instance auto-deletes after 30 days of inactivity — ours did on 2026-09-11. Local Neo4j is also the better demo answer: no venue WiFi dependency.)
+- [ ] **Confirm the fan-out actually reaches Daytona**: click **🧵 Fan out verification** once and check the summary line reports `method` = `daytona`. If it reads `local`, the key is missing or out of credit and you've lost the sandbox beat — everything else still works.
 
 ## LIVE DEMO
 
@@ -53,6 +55,23 @@ Pick 3–4 of these based on time — each is a real, working panel, not a mocku
 - **05 — Path Finder** (🔍 Find Path): type two entity labels and highlight the shortest connecting path through the graph
 - **The connection badge** itself: `live` vs `reconnecting` is a real WebSocket health indicator, not decoration — point at it after a merge or a new ingest lands to show the graph updated without a page reload
 
+**Step 5 — 🧵 The sandbox fan-out audit (25s) — the Daytona beat**
+- Scroll to "Sandbox fan-out audit" and hit **🧵 Fan out verification**
+- Rows appear one per source while their sandboxes are still booting (`booting…`), then each fills in as it lands — every row is a real `fanout_update` message over `/ws/graph`, not an animation. Point at the connection badge: still `live`
+- Each row carries its own measured `boot_ms`, wall time and sandbox id; nothing on that panel is hardcoded
+- The line to say: *"Every source gets its own sandbox and they all run at once. One audit is bounded by the slowest sandbox, not by the sum — so ten audits cost about the same wall clock as one, where doing them one at a time would take thirteen seconds."*
+- Measured on this machine against Daytona Cloud on 2026-09-11:
+
+| Sandboxes | Wall clock | One at a time | Ratio |
+|---|---|---|---|
+| 1 | 1.95s | 1.27s | 0.65× |
+| 3 | 1.76s | 3.72s | 2.11× |
+| 6 | 1.97s | 7.65s | 3.89× |
+| 10 | 1.88s | 13.13s | 6.99× |
+
+- Wall clock stays flat because the batch is bounded by its slowest member. Sandbox boot measured **464–639ms** from Tokyo over that run — use our number, not the marketing one
+- Fallback story if Daytona is unreachable: each row reports `could not run` and the audit degrades to the local subprocess path — the panel never blanks
+
 ## Sponsor Integration (15s)
 > "Here's how we used every sponsor's technology — and the graceful-degradation story is the real engineering flex: every one of these has a working local fallback, so the whole app boots and demos with zero keys configured."
 - **Kimi AI**: entity extraction + reasoning (`kimi-k2.7-code-highspeed` by default, configurable via `KIMI_MODEL`) — no fallback, but fails with a structured error, never a crash
@@ -79,4 +98,5 @@ Pick 3–4 of these based on time — each is a real, working panel, not a mocku
 ## 🔗 URLs to Have Ready
 - Web UI: http://localhost:8000
 - GitHub: https://github.com/nvmmonsalud/graphagent-forge
-- Neo4j Aura console: https://console.neo4j.io
+- Neo4j (local, via Docker): http://localhost:7474 — user `neo4j`, password `graphagent-dev`
+- Daytona dashboard: https://app.daytona.io

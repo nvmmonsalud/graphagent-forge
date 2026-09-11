@@ -940,6 +940,45 @@ footer a { color: var(--accent2); text-decoration: none; }
 }
 .verify-key { color: var(--muted); }
 
+/* ═══════ FAN-OUT AUDIT (one sandbox per source) ═══════ */
+.fan-list { display: flex; flex-direction: column; gap: 0.5rem; }
+.fan-row {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.6rem 0.7rem;
+  background: rgba(255,255,255,0.015);
+}
+.fan-row.pending { opacity: 0.55; }
+.fan-row.ok { border-color: rgba(0,229,200,0.28); }
+.fan-row.bad { border-color: rgba(255,107,107,0.35); }
+.fan-row-head { display: flex; align-items: baseline; justify-content: space-between; gap: 0.8rem; }
+.fan-src { font-size: 0.82rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fan-verdict {
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.fan-verdict.ok { color: var(--accent2); }
+.fan-verdict.bad { color: var(--accent3); }
+.fan-track {
+  display: flex;
+  height: 6px;
+  margin-top: 0.5rem;
+  border-radius: 3px;
+  overflow: hidden;
+  background: rgba(255,255,255,0.05);
+}
+.fan-boot { background: var(--accent); }
+.fan-run { background: var(--muted); opacity: 0.65; }
+.fan-meta {
+  margin-top: 0.45rem;
+  font-size: 0.7rem;
+  color: var(--muted);
+  font-family: 'JetBrains Mono', monospace;
+}
+
 /* ═══════ DUPLICATES ═══════ */
 .dup-group {
   border: 1px solid var(--border);
@@ -1255,6 +1294,14 @@ footer a { color: var(--accent2); text-decoration: none; }
             <a class="btn" style="margin-top:0" href="/api/graph/export?format=csv" target="_blank" rel="noopener">⬇ CSV</a>
           </div>
         </div>
+      </div>
+      <div class="ingest-card" id="fanout-card" style="grid-column:1/-1">
+        <div class="icon">🧵</div>
+        <h3>Sandbox fan-out audit</h3>
+        <p>Audit every source's sub-graph in its <strong>own</strong> Daytona sandbox — all at once</p>
+        <button class="btn" id="btn-fanout" onclick="doFanout()" style="margin-top:1rem">🧵 Fan out verification</button>
+        <div id="fanout-result" style="display:none;margin-top:1rem"></div>
+        <div id="fanout-list" class="fan-list" style="margin-top:1rem;position:relative"></div>
       </div>
       <div class="ingest-card" id="duplicates-card" style="grid-column:1/-1">
         <div class="icon">🧬</div>
@@ -2482,6 +2529,15 @@ function connectWebSocket() {
         scheduleDuplicatesRefresh();
       } else if (msg.type === 'job_update' && msg.job) {
         renderIngestJob(msg.job);
+      } else if (msg.type === 'fanout_update') {
+        // Live fan-out timeline: a row appears the moment a sandbox launches
+        // and fills in when it lands, so the parallelism is watchable.
+        if (msg.phase === 'started' && msg.source) {
+          fanoutRows.set(msg.source, { phase: 'started' });
+        } else if (msg.phase === 'done' && msg.source && msg.result) {
+          fanoutRows.set(msg.source, { ...msg.result, phase: 'done' });
+        }
+        renderFanoutRows();
       }
     } catch {}
   };
@@ -2965,6 +3021,112 @@ async function doVerify() {
     result.innerHTML = `<div class="result-box error">❌ ${esc(errorMessage(e))}</div>`;
   }
   btn.disabled = false; btn.innerHTML = '🛡️ Verify graph integrity';
+}
+
+// ═══════════════════════════════════════
+//  FAN-OUT AUDIT (one Daytona sandbox per source)
+// ═══════════════════════════════════════
+// The timeline is driven by `fanout_update` WebSocket messages: a row appears
+// the moment a sandbox launches and fills in when it lands, so the fan-out is
+// watchable rather than a spinner. Bars are scaled against the run's OWN
+// measured wall-clock, so the picture can never contradict the numbers.
+let fanoutRows = new Map();   // source -> {phase, ...item}
+let fanoutWallMs = 0;
+
+function fanoutBar(bootMs, durationMs, wallMs) {
+  const total = Math.max(Number(wallMs) || 0, 1);
+  const boot = Math.max(0, Math.min(total, Number(bootMs) || 0));
+  const run = Math.max(0, Math.min(total - boot, (Number(durationMs) || 0) - boot));
+  const bootPct = boot / total * 100;
+  const runPct = run / total * 100;
+  return '<span class="fan-boot" style="width:' + esc(bootPct.toFixed(1)) + '%"></span>'
+       + '<span class="fan-run" style="width:' + esc(runPct.toFixed(1)) + '%"></span>';
+}
+
+function renderFanoutRows() {
+  const listEl = document.getElementById('fanout-list');
+  if (!listEl) return;
+  if (!fanoutRows.size) {
+    listEl.innerHTML = '<p style="color:var(--muted);font-size:0.82rem">No sources audited yet — fan out to check every document independently.</p>';
+    return;
+  }
+  listEl.dataset.loaded = '1';
+  listEl.innerHTML = [...fanoutRows.entries()].map(([source, r]) => {
+    if (r.phase !== 'done') {
+      return '<div class="fan-row pending">'
+        + '<div class="fan-row-head">'
+        + '<span class="fan-src" title="' + esc(source) + '">' + esc(source) + '</span>'
+        + '<span class="fan-verdict">booting…</span>'
+        + '</div></div>';
+    }
+    const failedRun = r.ok === false;
+    const valid = r.valid === true;
+    const cls = failedRun || !valid ? 'bad' : 'ok';
+    const word = failedRun ? 'could not run' : (valid ? 'valid' : esc(r.orphan_count ?? 0) + ' orphan edges');
+    const meta = failedRun
+      ? esc(r.error || 'no verdict')
+      : esc(r.node_count ?? 0) + ' nodes · ' + esc(r.edge_count ?? 0) + ' edges · boot '
+        + esc(r.boot_ms ?? '—') + 'ms · ' + esc(r.method || 'unknown')
+        + (r.sandbox_id ? ' · ' + esc(r.sandbox_id) : '');
+    return '<div class="fan-row ' + cls + '">'
+      + '<div class="fan-row-head">'
+      + '<span class="fan-src" title="' + esc(source) + '">' + esc(source) + '</span>'
+      + '<span class="fan-verdict ' + cls + '">' + word + '</span>'
+      + '</div>'
+      + (failedRun ? '' : '<span class="fan-track">' + fanoutBar(r.boot_ms, r.duration_ms, fanoutWallMs) + '</span>')
+      + '<div class="fan-meta">' + meta + '</div>'
+      + '</div>';
+  }).join('');
+}
+
+function renderFanoutSummary(d) {
+  const el = document.getElementById('fanout-result');
+  if (!el) return;
+  if (d.ok === false) {
+    el.innerHTML = '<div class="result-box notice">'
+      + "<strong>⚠️ Fan-out audit couldn't run</strong>"
+      + '<div style="margin-top:0.4rem">' + esc(d.error || 'No sandbox returned a result.') + '</div>'
+      + '<div style="margin-top:0.6rem">'
+      + verifyRow('method', d.method || 'unknown')
+      + verifyRow('wall_ms', d.wall_ms ?? '—')
+      + '</div></div>';
+    return;
+  }
+  const boot = d.boot_ms || {};
+  const speed = Number(d.speedup) || 0;
+  const headline = '🧵 ' + esc(d.source_count ?? 0) + ' sources audited in ' + esc(d.sandbox_count ?? 0) + ' sandboxes';
+  const timing = esc(d.wall_ms ?? '—') + 'ms wall clock vs ' + esc(d.serial_ms ?? '—') + 'ms one at a time'
+    + (speed > 1 ? ' — <span class="mono">' + esc(speed) + '× faster</span>' : '');
+  el.innerHTML = '<div class="result-box">'
+    + '<strong>' + headline + '</strong>'
+    + '<span style="color:var(--muted)"> · ' + timing + '</span>'
+    + '<div style="margin-top:0.6rem">'
+    + verifyRow('concurrency cap', d.concurrency ?? '—')
+    + (boot.count ? verifyRow('sandbox boot', boot.min + '–' + boot.max + 'ms (avg ' + boot.avg + 'ms)') : '')
+    + verifyRow('method', d.method || 'unknown')
+    + '</div></div>';
+}
+
+async function doFanout() {
+  const btn = document.getElementById('btn-fanout');
+  const listEl = document.getElementById('fanout-list');
+  const result = document.getElementById('fanout-result');
+  if (result) result.style.display = 'block';
+  fanoutRows = new Map();
+  fanoutWallMs = 0;
+  if (listEl) listEl.innerHTML = skeletonLines(4, ['78%', '60%', '70%', '48%']);
+  await withButtonBusy(btn, 'Fanning out…', async () => {
+    try {
+      const d = (await apiFetch(API + '/graph/verify/fanout', { method: 'POST' })) || {};
+      fanoutWallMs = Number(d.wall_ms) || 0;
+      fanoutRows = new Map((d.sources || []).map(item => [item.source, { ...item, phase: 'done' }]));
+      renderFanoutRows();
+      renderFanoutSummary(d);
+    } catch (e) {
+      if (listEl) listEl.innerHTML = '';
+      renderFanoutSummary({ ok: false, error: errorMessage(e) });
+    }
+  });
 }
 
 // ═══════════════════════════════════════
