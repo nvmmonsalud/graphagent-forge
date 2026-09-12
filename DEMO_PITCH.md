@@ -76,15 +76,18 @@ Pick 3–4 of these based on time — each is a real, working panel, not a mocku
 **Step 6 — 📈 The concurrency sweep (20s) — swap this in for Step 4 if time is tight**
 - Scroll to "Concurrency sweep" and hit **📈 Sweep 1 → 3 → 6 → 10**
 - One click runs the SAME audit at 1, 3, 6 and 10 sandboxes at once, one size after another, and the curve draws itself as each size lands
-- The line to say: *"Same audit, run at different widths. Ten sandboxes finished in the same wall clock as one — two and a half seconds, against fifteen point seven if I'd done them one at a time. That ratio is the whole point of the sponsor: six point three times here, and it keeps climbing with N."*
-- Measured on this machine against Daytona Cloud, 2026-09-12. One real sub-graph (47 nodes / 47 edges) replicated into every sandbox:
+- The line to say: *"Same audit, run at different widths. Ten sandboxes finished in less wall clock than one — two point three seconds, against fourteen point three if I'd done them one at a time. That ratio is the whole point of the sponsor: six point three times here, and it keeps climbing with N."*
+- Measured on this machine against Daytona Cloud, 2026-09-12 (warm run — quote this one). One real sub-graph (47 nodes / 47 edges) replicated into every sandbox:
 
 | N sandboxes | Wall clock | One at a time | Ratio |
 |---|---|---|---|
-| 1 | 2487ms | 2078ms | 0.84× |
-| 3 | 2567ms | 5591ms | 2.18× |
-| 6 | 3393ms | 11380ms | 3.35× |
-| 10 | 2497ms | 15743ms | 6.30× |
+| 1 | 2602ms | 2207ms | 0.85× |
+| 3 | 2634ms | 5730ms | 2.18× |
+| 6 | 2328ms | 9436ms | 4.05× |
+| 10 | 2266ms | 14311ms | 6.32× |
+
+- Point at the fact that the measured line does not merely stay flat, it comes down slightly: ten sandboxes in 2266ms against one in 2602ms. The one-at-a-time line is the same work done serially — 14.3 seconds
+- The chart draws itself as each size lands, driven by `sweep_update` messages on the WebSocket, so it happens while you are talking rather than appearing at the end
 
 - The panel states out loud that the payload is replicated, not ten crawled documents — say it before a judge asks, not after
 - ⚠️ **Do not sweep past 10 on this account.** Daytona refuses the extras: `Total CPU limit exceeded. Maximum allowed: 10.` A refused sandbox plots as a hollow marker and appears as `short_by` rather than being quietly averaged away, but the ratio collapses — 12 sandboxes measured 5.45s against 2.05s for 10
