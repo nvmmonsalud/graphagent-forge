@@ -178,6 +178,7 @@ Query: `POST /ask`, `POST /graph/search`, `POST /graph/path`. Graph data:
 `GET /graph/data[?source_doc=][&limit=]` (node cap 1–5000, default 500, on
 the all-sources view only — a per-source read is never truncated), `GET
 /graph/stats`, `GET /graph/verify`, `POST /graph/verify/fanout`,
+`POST /graph/verify/sweep`,
 `GET /graph/export?format=json|csv`.
 Source management: `GET /sources`, `DELETE /sources?source_doc=`, `POST
 /graph/clear`. Duplicate entities across sources are surfaced by `GET
@@ -208,6 +209,21 @@ reports measured `wall_ms`, `serial_ms`, `speedup`, `sandbox_count` and boot-tim
 stats; each entry in `sources` carries its own verdict, so one source failing
 never fails the batch, and a run in which nothing produced a verdict returns
 `{"ok": false, "error": ...}` with no `sources` key at all.
+
+`POST /graph/verify/sweep` takes the fan-out one step further: `{"sizes": [1, 3,
+6, 10]}` (default when no body is sent) runs the SAME sub-graph through 1, 3, 6
+and 10 sandboxes in turn and returns the measured pair for each size. Sizes run
+**sequentially on purpose** — every sandbox draws on the same account CPU budget,
+so overlapping them would slow both batches down and the curve would stop meaning
+anything. The payload is **replicated**, not N distinct documents, and the
+response says so (`replicated: true`, `distinct_sources: 1`, plus the payload's
+own node and edge counts) so a result can never be misread as an audit of N
+crawled sources. Each entry also carries `short_by` (`n - sandbox_count`): a
+positive value means the account refused sandboxes at its concurrent-CPU ceiling,
+which is surfaced rather than averaged away. Same two-shape envelope and fixed
+error literal as the fan-out, and the same injected broadcast sink, streaming
+`{"type": "sweep_update", "phase": "size_started"|"size_done", "n": ..., ...}`
+so the chart draws itself as each size lands.
 
 The query-history panel is backed by `GET /history?limit=`, `POST
 /history/{id}/save`, `DELETE /history/{id}/save`, and `DELETE /history/{id}`.

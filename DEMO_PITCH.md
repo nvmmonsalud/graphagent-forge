@@ -20,6 +20,7 @@
 - [ ] Have `KIMI_API_KEY` configured if you want the "Ask" beat to produce a real written answer — everything else on the page (graph, sources, duplicates, verify, export, path finder, fan-out) works with zero keys configured.
 - [ ] **Bring up Neo4j locally and check it**: `docker compose up -d neo4j` (Docker Desktop must already be running), then confirm `NEO4J_URI=bolt://localhost:7687` / `NEO4J_USER=neo4j` / `NEO4J_PASSWORD=graphagent-dev` in `.env`. `GET /api/health` must read `{"neo4j": true}` before you leave the house. (The Aura free instance auto-deletes after 30 days of inactivity — ours did on 2026-09-11. Local Neo4j is also the better demo answer: no venue WiFi dependency.)
 - [ ] **Confirm the fan-out actually reaches Daytona**: click **🧵 Fan out verification** once and check the summary line reports `method` = `daytona`. If it reads `local`, the key is missing or out of credit and you've lost the sandbox beat — everything else still works.
+- [ ] **Run the sweep once before you present.** The first batch of the day is slow (cold sandbox creation), so a rehearsal is also the warm-up. Confirm the last row reports `method` = `daytona`, `short_by` = 0, and that the measured bar is visibly flat while the one-at-a-time line climbs. `FANOUT_MAX_CONCURRENCY` must be at least as large as the biggest size you list, or a size will silently two-wave and the curve will bend the wrong way.
 
 ## LIVE DEMO
 
@@ -71,6 +72,23 @@ Pick 3–4 of these based on time — each is a real, working panel, not a mocku
 
 - Wall clock stays flat because the batch is bounded by its slowest member. Sandbox boot measured **464–639ms** from Tokyo over that run — use our number, not the marketing one
 - Fallback story if Daytona is unreachable: each row reports `could not run` and the audit degrades to the local subprocess path — the panel never blanks
+
+**Step 6 — 📈 The concurrency sweep (20s) — swap this in for Step 4 if time is tight**
+- Scroll to "Concurrency sweep" and hit **📈 Sweep 1 → 3 → 6 → 10**
+- One click runs the SAME audit at 1, 3, 6 and 10 sandboxes at once, one size after another, and the curve draws itself as each size lands
+- The line to say: *"Same audit, run at different widths. Ten sandboxes finished in the same wall clock as one — two and a half seconds, against fifteen point seven if I'd done them one at a time. That ratio is the whole point of the sponsor: six point three times here, and it keeps climbing with N."*
+- Measured on this machine against Daytona Cloud, 2026-09-12. One real sub-graph (47 nodes / 47 edges) replicated into every sandbox:
+
+| N sandboxes | Wall clock | One at a time | Ratio |
+|---|---|---|---|
+| 1 | 2487ms | 2078ms | 0.84× |
+| 3 | 2567ms | 5591ms | 2.18× |
+| 6 | 3393ms | 11380ms | 3.35× |
+| 10 | 2497ms | 15743ms | 6.30× |
+
+- The panel states out loud that the payload is replicated, not ten crawled documents — say it before a judge asks, not after
+- ⚠️ **Do not sweep past 10 on this account.** Daytona refuses the extras: `Total CPU limit exceeded. Maximum allowed: 10.` A refused sandbox plots as a hollow marker and appears as `short_by` rather than being quietly averaged away, but the ratio collapses — 12 sandboxes measured 5.45s against 2.05s for 10
+- The first call of the day runs slow (N=1 measured 4.5s cold vs 2.5s warm). Rehearse once; quote the warm table
 
 ## Sponsor Integration (15s)
 > "Here's how we used every sponsor's technology — and the graceful-degradation story is the real engineering flex: every one of these has a working local fallback, so the whole app boots and demos with zero keys configured."

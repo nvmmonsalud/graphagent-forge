@@ -1303,6 +1303,14 @@ footer a { color: var(--accent2); text-decoration: none; }
         <div id="fanout-result" style="display:none;margin-top:1rem"></div>
         <div id="fanout-list" class="fan-list" style="margin-top:1rem;position:relative"></div>
       </div>
+      <div class="ingest-card" id="sweep-card" style="grid-column:1/-1">
+        <div class="icon">📈</div>
+        <h3>Concurrency sweep</h3>
+        <p>Audit the <strong>same</strong> sub-graph N sandboxes at a time — the wall clock stays flat while one-at-a-time climbs</p>
+        <button class="btn" id="btn-sweep" onclick="doSweep()" style="margin-top:1rem">📈 Sweep 1 → 3 → 6 → 10</button>
+        <div id="sweep-result" style="display:none;margin-top:1rem"></div>
+        <div id="sweep-chart" style="margin-top:1rem"></div>
+      </div>
       <div class="ingest-card" id="duplicates-card" style="grid-column:1/-1">
         <div class="icon">🧬</div>
         <h3>Duplicates</h3>
@@ -2538,6 +2546,16 @@ function connectWebSocket() {
           fanoutRows.set(msg.source, { ...msg.result, phase: 'done' });
         }
         renderFanoutRows();
+      } else if (msg.type === 'sweep_update' && msg.n !== undefined && msg.n !== null) {
+        // The sweep's curve is built one point at a time as each size lands,
+        // in front of the audience, instead of appearing fully formed when the
+        // response finally arrives.
+        if (msg.phase === 'size_started') {
+          sweepRows.set(Number(msg.n), { n: Number(msg.n), phase: 'running' });
+        } else if (msg.phase === 'size_done' && msg.result) {
+          sweepRows.set(Number(msg.n), { ...msg.result, phase: 'done' });
+        }
+        renderSweepChart();
       }
     } catch {}
   };
@@ -3125,6 +3143,209 @@ async function doFanout() {
     } catch (e) {
       if (listEl) listEl.innerHTML = '';
       renderFanoutSummary({ ok: false, error: errorMessage(e) });
+    }
+  });
+}
+
+// ═══════════════════════════════════════
+//  CONCURRENCY SWEEP (N sandboxes at a time)
+// ═══════════════════════════════════════
+// Two MEASURED series against batch size: what each run actually took, and what
+// running the same audits one at a time summed to. Every value is read out of
+// the response — nothing is fitted, extrapolated or assumed — and a size whose
+// sandboxes were refused keeps a HOLLOW marker, so a short batch can never read
+// as a clean point on the curve.
+let sweepRows = new Map();   // n -> {phase, ...item}
+let sweepMeta = null;        // last /graph/verify/sweep payload (source + counts)
+let sweepTotalMs = 0;
+
+const SWEEP_VIEW = { w: 680, h: 300, padL: 64, padR: 22, padT: 30, padB: 44 };
+
+function sweepMs(v) {
+  return (v === null || v === undefined || v === '') ? '—' : esc(v) + 'ms';
+}
+
+// Round the axis up to a readable step. The chart is plotted in whichever unit
+// the run produced (ms), with no rescaling — the numbers on screen are the
+// numbers the sweep measured.
+function sweepYMax(rows) {
+  let raw = 0;
+  rows.forEach(r => {
+    raw = Math.max(raw, Number(r.wall_ms) || 0, Number(r.serial_ms) || 0);
+  });
+  const step = raw > 10000 ? 5000 : raw > 4000 ? 2000 : raw > 1000 ? 500 : raw > 200 ? 100 : 25;
+  return Math.max(step, Math.ceil(raw / step) * step);
+}
+
+function sweepSeries(rows, valueKey, xFor, yFor) {
+  return rows
+    .map(r => ({ r: r, v: Number(r[valueKey]) }))
+    .filter(p => Number.isFinite(p.v))
+    .map(p => ({ r: p.r, n: p.r.n, v: p.v, x: xFor(p.r.n), y: yFor(p.v) }));
+}
+
+function sweepPolyline(points) {
+  return points.map(p => p.x.toFixed(1) + ',' + p.y.toFixed(1)).join(' ');
+}
+
+function renderSweepChart() {
+  const el = document.getElementById('sweep-chart');
+  if (!el) return;
+  const all = [...sweepRows.values()].sort((a, b) => a.n - b.n);
+  const done = all.filter(r => r.phase === 'done' && r.ok !== false);
+  const running = all.filter(r => r.phase === 'running');
+  if (!done.length) {
+    el.innerHTML = running.length
+      ? '<p style="color:var(--muted);font-size:0.82rem">Sweeping ' + esc(running.map(r => r.n).join(' → '))
+        + ' — one size at a time, and the curve draws as each lands.</p>'
+      : '<p style="color:var(--muted);font-size:0.82rem">No sweep yet — run one to see N-at-a-time against one-at-a-time.</p>';
+    return;
+  }
+
+  const V = SWEEP_VIEW;
+  const plotW = V.w - V.padL - V.padR;
+  const plotH = V.h - V.padT - V.padB;
+  const ns = done.map(r => r.n);
+  const minN = Math.min.apply(null, ns);
+  const maxN = Math.max.apply(null, ns);
+  const yMax = sweepYMax(done);
+
+  const xFor = n => V.padL + (maxN === minN ? 0.5 : (n - minN) / (maxN - minN)) * plotW;
+  const yFor = v => V.padT + (1 - Math.min(1, Math.max(0, v) / yMax)) * plotH;
+
+  const wall = sweepSeries(done, 'wall_ms', xFor, yFor);
+  const serial = sweepSeries(done, 'serial_ms', xFor, yFor);
+
+  let grid = '';
+  for (let i = 0; i <= 4; i++) {
+    const y = yFor(yMax * i / 4);
+    grid += '<line x1="' + V.padL + '" y1="' + y.toFixed(1) + '" x2="' + (V.w - V.padR) + '" y2="' + y.toFixed(1)
+         + '" stroke="var(--border)" stroke-width="1" />'
+         + '<text x="' + (V.padL - 8) + '" y="' + (y + 3.5).toFixed(1) + '" text-anchor="end" fill="var(--muted)" font-size="10">'
+         + esc(Math.round(yMax * i / 4)) + '</text>';
+  }
+
+  const ticks = done.map(r =>
+    '<text x="' + xFor(r.n).toFixed(1) + '" y="' + (V.padT + plotH + 18) + '" text-anchor="middle" fill="var(--muted)" font-size="11">'
+    + esc(r.n) + '</text>').join('');
+
+  const serialLine = serial.length > 1
+    ? '<polyline points="' + sweepPolyline(serial) + '" fill="none" stroke="var(--warn)" stroke-width="2" stroke-dasharray="5 4" />'
+    : '';
+  const wallLine = wall.length > 1
+    ? '<polyline points="' + sweepPolyline(wall) + '" fill="none" stroke="var(--accent2)" stroke-width="2.5" />'
+    : '';
+
+  const serialDots = serial.map(p =>
+    '<circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) + '" r="3.5" fill="var(--warn)"><title>'
+    + esc(p.n) + ' one at a time: ' + esc(p.v) + 'ms</title></circle>').join('');
+
+  const wallDots = wall.map(p => {
+    const short = Number(p.r.short_by) || 0;
+    const note = short > 0
+      ? esc(p.n) + ' at a time: ' + esc(p.v) + 'ms — ' + esc(short) + ' sandbox(es) refused at the account ceiling'
+      : esc(p.n) + ' at a time: ' + esc(p.v) + 'ms';
+    return '<circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) + '" r="' + (short > 0 ? 5 : 4) + '" '
+      + (short > 0 ? 'fill="var(--bg)" stroke="var(--accent2)" stroke-width="2"' : 'fill="var(--accent2)"')
+      + '><title>' + note + '</title></circle>';
+  }).join('');
+
+  const legend = '<g font-size="11">'
+    + '<rect x="' + V.padL + '" y="5" width="10" height="10" fill="var(--accent2)" />'
+    + '<text x="' + (V.padL + 16) + '" y="14" fill="var(--muted)">measured wall clock</text>'
+    + '<rect x="' + (V.padL + 178) + '" y="5" width="10" height="10" fill="var(--warn)" />'
+    + '<text x="' + (V.padL + 194) + '" y="14" fill="var(--muted)">one at a time</text>'
+    + '</g>';
+
+  el.innerHTML = '<svg viewBox="0 0 ' + V.w + ' ' + V.h + '" width="100%" height="auto" role="img" '
+    + 'aria-label="Sandboxes per batch against measured wall clock">'
+    + legend + grid + ticks + serialLine + wallLine + serialDots + wallDots
+    + '<text x="' + (V.padL + plotW / 2) + '" y="' + (V.h - 6) + '" text-anchor="middle" fill="var(--muted)" font-size="11">'
+    + 'sandboxes in the batch</text>'
+    + '</svg>';
+}
+
+function renderSweepSummary(d) {
+  const el = document.getElementById('sweep-result');
+  if (!el) return;
+  el.style.display = 'block';
+  if (d.ok === false) {
+    el.innerHTML = '<div class="result-box notice">'
+      + "<strong>⚠️ The sweep couldn't run</strong>"
+      + '<div style="margin-top:0.4rem">' + esc(d.error || 'No sandbox returned a result.') + '</div>'
+      + '<div style="margin-top:0.6rem">' + verifyRow('method', d.method || 'unknown') + '</div>'
+      + '</div>';
+    return;
+  }
+
+  const rows = (d.results || []).filter(r => r.ok);
+  const last = rows.length ? rows[rows.length - 1] : null;
+  const speed = last ? Number(last.speedup) || 0 : 0;
+  const headline = last
+    ? '📈 ' + esc(last.n) + ' sandboxes at once in ' + sweepMs(last.wall_ms)
+      + ' vs ' + sweepMs(last.serial_ms) + ' one at a time'
+      + (speed > 1 ? ' — <span class="mono">' + esc(speed) + '× faster</span>' : '')
+    : '📈 Saved';
+
+  const cell = 'padding:0.3rem 0.7rem 0.3rem 0;border-bottom:1px solid var(--border);';
+  const body = rows.map(r => '<tr>'
+    + '<td class="mono" style="' + cell + '">' + esc(r.n) + '</td>'
+    + '<td class="mono" style="' + cell + '">' + esc(r.sandbox_count ?? 0)
+      + (Number(r.short_by) > 0 ? ' <span style="color:var(--warn)">−' + esc(r.short_by) + '</span>' : '') + '</td>'
+    + '<td class="mono" style="' + cell + '">' + sweepMs(r.wall_ms) + '</td>'
+    + '<td class="mono" style="' + cell + '">' + sweepMs(r.serial_ms) + '</td>'
+    + '<td class="mono" style="' + cell + '">' + (Number(r.speedup) ? esc(r.speedup) + '×' : '—') + '</td>'
+    + '</tr>').join('');
+
+  const th = 'padding:0.3rem 0.7rem 0.3rem 0;border-bottom:1px solid var(--border);color:var(--muted);'
+    + 'text-transform:uppercase;font-size:0.62rem;letter-spacing:0.08em;';
+  const provenance = sweepMeta && sweepMeta.source_doc
+    ? '<div style="margin-top:0.6rem;color:var(--muted);font-size:0.72rem">'
+      + 'One real sub-graph (<strong>' + esc(sweepMeta.payload_nodes ?? '—') + '</strong> nodes / '
+      + '<strong>' + esc(sweepMeta.payload_edges ?? '—') + '</strong> edges from '
+      + '<span class="mono">' + esc(sweepMeta.source_doc) + '</span>), replicated into every sandbox — '
+      + 'not ' + esc(rows.length ? Math.max.apply(null, rows.map(r => r.n)) : 0) + ' different documents. '
+      + 'Total sweep wall clock ' + sweepMs(sweepTotalMs) + '.</div>'
+    : '';
+
+  el.innerHTML = '<div class="result-box">'
+    + '<div>' + headline + '</div>'
+    + '<table style="margin-top:0.7rem;border-collapse:collapse;font-size:0.78rem">'
+    + '<thead><tr>'
+    + '<th style="' + th + 'text-align:left">N</th>'
+    + '<th style="' + th + 'text-align:left">sandboxes</th>'
+    + '<th style="' + th + 'text-align:left">wall clock</th>'
+    + '<th style="' + th + 'text-align:left">one at a time</th>'
+    + '<th style="' + th + 'text-align:left">ratio</th>'
+    + '</tr></thead><tbody>' + body + '</tbody></table>'
+    + provenance
+    + '<div style="margin-top:0.6rem">' + verifyRow('method', d.method || 'unknown') + '</div>'
+    + '</div>';
+}
+
+async function doSweep() {
+  const btn = document.getElementById('btn-sweep');
+  const chartEl = document.getElementById('sweep-chart');
+  const resultEl = document.getElementById('sweep-result');
+  sweepRows = new Map();
+  sweepMeta = null;
+  sweepTotalMs = 0;
+  if (resultEl) { resultEl.style.display = 'none'; resultEl.innerHTML = ''; }
+  if (chartEl) chartEl.innerHTML = skeletonLines(3, ['82%', '64%', '46%']);
+  await withButtonBusy(btn, 'Sweeping…', async () => {
+    try {
+      // No body at all: the route's default sizes are exactly the ones this
+      // button names, so the label can never drift from what runs.
+      const d = (await apiFetch(API + '/graph/verify/sweep', { method: 'POST' })) || {};
+      sweepMeta = d;
+      sweepTotalMs = Number(d.total_wall_ms) || 0;
+      sweepRows = new Map((d.results || []).map(r => [r.n, { ...r, phase: 'done' }]));
+      renderSweepChart();
+      renderSweepSummary(d);
+    } catch (e) {
+      sweepRows = new Map();
+      renderSweepChart();
+      renderSweepSummary({ ok: false, error: errorMessage(e) });
     }
   });
 }

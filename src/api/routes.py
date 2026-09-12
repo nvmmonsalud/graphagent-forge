@@ -26,6 +26,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
+from src.agent.daytona_exec import SWEEP_ERROR_UNAVAILABLE
 from src.agent.jobs import JobQueueFull
 from src.ingestion.file_extractor import MAX_UPLOAD_BYTES, check_upload_shape, safe_filename
 
@@ -197,6 +198,39 @@ class MergeRequest(BaseModel):
         if self.canonical_id is not None and self.canonical_id not in self.node_ids:
             raise ValueError("canonical_id must be one of node_ids")
         return self
+
+
+#: Sizes the demo rehearses. Also the fallback when the caller posts no body at
+#: all — `curl -X POST /api/graph/verify/sweep` with nothing attached is a
+#: reasonable thing to type minutes before going on stage.
+DEFAULT_SWEEP_SIZES = [1, 3, 6, 10]
+
+
+class SweepRequest(BaseModel):
+    """Sizes for the concurrency sweep: audit the same sub-graph N at a time.
+
+    Defaults to the shape the demo rehearses. Each entry is an independent
+    fan-out batch run one after another, so the total sandbox budget is
+    `sum(sizes)` — keep that in mind before asking for large sizes.
+    """
+
+    sizes: list[int] = Field(default=DEFAULT_SWEEP_SIZES, min_length=1, max_length=6)
+
+    @field_validator("sizes")
+    @classmethod
+    def _clean_sizes(cls, value: list[int]) -> list[int]:
+        # Same bound as the fan-out route's `limit` cap: one size can ask for at
+        # most 16 concurrent sandboxes. Dedupe and sort so the chart's x-axis is
+        # monotonic no matter what order the caller listed them in.
+        cleaned: list[int] = []
+        for size in value:
+            if size < 1 or size > 16:
+                raise ValueError("sizes entries must be 1..16")
+            if size not in cleaned:
+                cleaned.append(size)
+        if not cleaned:
+            raise ValueError("sizes must contain at least one size")
+        return sorted(cleaned)
 
 
 # ------------------------------------------------------------------
@@ -527,6 +561,68 @@ async def graph_verify_fanout(request: Request, limit: int = Query(default=6, ge
         return await agent.daytona.verify_graph_fanout(graphs, on_event=_on_event)
     except Exception:
         log.exception("Fan-out verification failed")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+
+
+@router.post("/graph/verify/sweep", dependencies=GRAPH_DEP)
+async def graph_verify_sweep(request: Request, req: SweepRequest | None = None):
+    """Audit one sub-graph N sandboxes at a time, for every N in `sizes`.
+
+    The fan-out panel proves a single batch is bounded by its slowest sandbox.
+    This route produces the curve that follows from it: as N grows the measured
+    wall clock stays roughly flat while the one-at-a-time column scales
+    linearly, so the ratio climbs with N. That is the whole demo beat.
+
+    Reads ONE real sub-graph out of Neo4j — the largest, since `get_sources()`
+    orders by node count descending — and hands the same payload to N sandboxes
+    per size. So this measures parallel throughput, and the response says so
+    (`replicated: true`, `distinct_sources: 1`, plus the payload's own node and
+    edge counts) rather than implying N crawled documents.
+
+    Read-only, so it sits behind GRAPH_DEP exactly like `/graph/verify` and
+    `/graph/verify/fanout`. The size loop lives in the executor, which owns the
+    measurement and the error vocabulary; this route picks the payload and
+    forwards the result, computing nothing itself. A sweep in which no size
+    produced a verdict comes back `ok: false` with no `results` key and never a
+    500 — same precedent as the fan-out route.
+    """
+    neo4j = request.app.state.neo4j
+    agent = request.app.state.agent
+    manager = getattr(request.app.state, "ws_manager", None)
+
+    async def _on_event(event: dict) -> None:
+        if manager is not None:
+            await manager.broadcast({"type": "sweep_update", **event})
+
+    try:
+        sources = await neo4j.get_sources()
+        ordered = [rec["source_doc"] for rec in sources if rec.get("source_doc")]
+        if not ordered:
+            # Nothing to replicate: no sources means no sub-graph to audit, and
+            # that is infrastructure news, not a verdict about the graph.
+            return {
+                "ok": False,
+                "error": SWEEP_ERROR_UNAVAILABLE,
+                "method": "unknown",
+                "wall_ms": 0,
+                "distinct_sources": 0,
+            }
+
+        source_doc = ordered[0]
+        payload = await neo4j.get_graph_data_by_source(source_doc)
+        sizes = req.sizes if req is not None else list(DEFAULT_SWEEP_SIZES)
+        result = await agent.daytona.verify_graph_sweep(
+            payload, sizes=sizes, on_event=_on_event
+        )
+        return {
+            "source_doc": source_doc,
+            "distinct_sources": 1,
+            "payload_nodes": len(payload.get("nodes") or []),
+            "payload_edges": len(payload.get("edges") or []),
+            **result,
+        }
+    except Exception:
+        log.exception("Concurrency sweep failed")
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 

@@ -37,6 +37,11 @@ _MAX_BETWEENNESS_NODES = 5000
 # at run time and reported side by side — never asserted or hardcoded.
 FANOUT_ERROR_UNAVAILABLE = "fan-out verification unavailable"
 
+# Same rule once more for the concurrency sweep, which batches fan-out runs.
+# Deliberately distinct: "the sweep produced no verdict at all" must never be
+# mistakable for "one fan-out run failed", nor for a failed integrity check.
+SWEEP_ERROR_UNAVAILABLE = "sweep unavailable"
+
 # Concurrency cap. Keeps a demo-sized graph from asking Daytona for more
 # sandboxes than the account is meant to hold at once; read once at
 # construction like the betweenness budget.
@@ -811,5 +816,102 @@ print(json.dumps(result))
                 "max": max(boots),
                 "avg": round(sum(boots) / len(boots)),
             } if boots else None,
+            "method": method,
+        }
+
+    # ------------------------------------------------------------------
+    # Concurrency sweep
+
+    async def verify_graph_sweep(
+        self,
+        graph_data: dict[str, Any],
+        *,
+        sizes: list[int],
+        on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> dict[str, Any]:
+        """Audit the SAME sub-graph in N sandboxes, once for each N in `sizes`.
+
+        `verify_graph_fanout` proves that one batch costs about one verification
+        of wall-clock. This proves the consequence: as N grows the measured wall
+        clock stays roughly flat, while running the same audits one at a time
+        scales linearly — so the ratio climbs with N.
+
+        Sizes run SEQUENTIALLY, and that is load-bearing. Every sandbox draws on
+        the same account CPU budget, so overlapping two sizes would slow both
+        down and the curve would stop meaning anything. Total wall clock is
+        therefore the sum of the per-size runs; each size reports its own
+        `wall_ms`, and that is what the chart plots.
+
+        The payload is REPLICATED, not N distinct documents — one real sub-graph
+        handed to N sandboxes. That measures parallel throughput, which is the
+        claim being made, and the envelope states it (`replicated`) so a result
+        can never be read as an audit of N different sources.
+
+        `n - sandbox_count` is reported per size as `short_by`: a positive value
+        means the account refused sandboxes at its concurrent-CPU ceiling, which
+        must surface rather than be quietly averaged away.
+
+        Returns exactly one of two shapes, matching `verify_graph_fanout`:
+
+        * ran    — ``{"ok": True, "replicated": True, "results": [...],
+          "sizes", "total_wall_ms", "method"}``, where each `results` item is
+          ``{"n", "ok", "sandbox_count", "short_by", "wall_ms", "serial_ms",
+          "speedup", "boot_ms", "method"}`` plus `error` when that size did not
+          run at all.
+        * failed — ``{"ok": False, "error": SWEEP_ERROR_UNAVAILABLE, "method",
+          "wall_ms"}`` with **no** ``results`` key, so "nothing ran" stays
+          machine-readable and can never pass for a clean sweep.
+        """
+        method = "daytona" if self.client else "local"
+
+        async def _emit(payload: dict[str, Any]) -> None:
+            if on_event is None:
+                return
+            try:
+                await on_event(payload)
+            except Exception as exc:  # telemetry is never load-bearing
+                log.warning("Sweep event sink failed: %s", exc)
+
+        started = time.perf_counter()
+        results: list[dict[str, Any]] = []
+
+        for n in sizes:
+            await _emit({"phase": "size_started", "n": n})
+            # Distinct keys, identical payload: N sandboxes, one sub-graph.
+            graphs = {f"audit-{i + 1:02d}": graph_data for i in range(n)}
+            run = await self.verify_graph_fanout(graphs, max_concurrency=n)
+            sandboxes = int(run.get("sandbox_count") or 0)
+            item: dict[str, Any] = {
+                "n": n,
+                "ok": bool(run.get("ok")),
+                "sandbox_count": sandboxes,
+                "short_by": max(0, n - sandboxes),
+                "wall_ms": run.get("wall_ms"),
+                "serial_ms": run.get("serial_ms"),
+                "speedup": run.get("speedup"),
+                "boot_ms": run.get("boot_ms"),
+                "method": run.get("method", method),
+            }
+            if not item["ok"]:
+                item["error"] = run.get("error", SWEEP_ERROR_UNAVAILABLE)
+            results.append(item)
+            await _emit({"phase": "size_done", "n": n, "result": item})
+
+        total_wall_ms = _elapsed_ms(started)
+
+        if not any(item["ok"] for item in results):
+            return {
+                "ok": False,
+                "error": SWEEP_ERROR_UNAVAILABLE,
+                "method": method,
+                "wall_ms": total_wall_ms,
+            }
+
+        return {
+            "ok": True,
+            "replicated": True,
+            "results": results,
+            "sizes": list(sizes),
+            "total_wall_ms": total_wall_ms,
             "method": method,
         }
