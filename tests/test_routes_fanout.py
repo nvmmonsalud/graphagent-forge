@@ -184,3 +184,18 @@ async def test_500_body_is_scrubbed(app, client) -> None:
     assert resp.json()["detail"] == "internal error"
     assert "hunter2" not in resp.text
     assert "bolt://" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_fanout_is_rate_limited(app, client) -> None:
+    """Fan-out spawns up to 16 sandboxes per call, so it shares the per-IP
+    bucket with /ask and ingest rather than sitting open behind GRAPH_DEP."""
+    fan_out = _wire(app)
+
+    for _ in range(routes_module.RATE_LIMIT_MAX):
+        assert (await client.post("/api/graph/verify/fanout")).status_code == 200
+    resp = await client.post("/api/graph/verify/fanout")
+
+    assert resp.status_code == 429
+    assert resp.json() == {"detail": "rate limit exceeded"}
+    assert fan_out.await_count == routes_module.RATE_LIMIT_MAX

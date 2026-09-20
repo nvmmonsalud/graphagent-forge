@@ -355,3 +355,20 @@ async def test_ingest_429_when_job_queue_full() -> None:
             gate.set()
     finally:
         await _shutdown_jobs(application.state.jobs)
+
+
+@pytest.mark.asyncio
+async def test_verify_is_rate_limited(app, client) -> None:
+    """/graph/verify boots a Daytona sandbox per call, so it shares the per-IP
+    bucket with /ask and ingest rather than sitting open behind GRAPH_DEP."""
+    app.state.neo4j.get_all_graph_data = AsyncMock(return_value={"nodes": [], "edges": []})
+    app.state.agent.daytona.verify_graph = AsyncMock(
+        return_value={"ok": True, "valid": True, "method": "local", "duration_ms": 1}
+    )
+
+    for _ in range(routes_module.RATE_LIMIT_MAX):
+        assert (await client.get("/api/graph/verify")).status_code == 200
+    resp = await client.get("/api/graph/verify")
+
+    assert resp.status_code == 429
+    assert resp.json() == {"detail": "rate limit exceeded"}

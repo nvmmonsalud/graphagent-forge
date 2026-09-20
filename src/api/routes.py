@@ -127,7 +127,11 @@ def _rate_limit_allow(client_ip: str, now: float) -> bool:
 
 
 async def rate_limit(request: Request) -> None:
-    """10 requests/minute per client IP on the expensive routes."""
+    """10 requests/minute per client IP on the expensive routes.
+
+    Shared by ingest, /ask, and the three sandbox-spawning verify routes
+    (verify, fanout, sweep) — one bucket per IP across all of them.
+    """
     client_ip = request.client.host if request.client else "unknown"
     if not _rate_limit_allow(client_ip, time.monotonic()):
         log.warning("Rate limit exceeded for %s on %s", client_ip, request.url.path)
@@ -507,7 +511,7 @@ async def graph_search(req: SearchRequest, request: Request):
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 
-@router.get("/graph/verify", dependencies=GRAPH_DEP)
+@router.get("/graph/verify", dependencies=ASK_DEP)
 async def graph_verify(request: Request):
     """Run graph-integrity verification inside a Daytona sandbox.
 
@@ -524,7 +528,7 @@ async def graph_verify(request: Request):
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 
-@router.post("/graph/verify/fanout", dependencies=GRAPH_DEP)
+@router.post("/graph/verify/fanout", dependencies=ASK_DEP)
 async def graph_verify_fanout(request: Request, limit: int = Query(default=6, ge=1, le=16)):
     """Audit every source's sub-graph in its OWN Daytona sandbox, concurrently.
 
@@ -535,7 +539,8 @@ async def graph_verify_fanout(request: Request, limit: int = Query(default=6, ge
     `fanout_update` message, so the run is watchable while it happens rather
     than being a spinner.
 
-    Read-only, so it sits behind GRAPH_DEP exactly like `/graph/verify`. The
+    Read-only but sandbox-spawning, so it sits behind ASK_DEP like
+    `/graph/verify`: per-IP rate limited, no API key. The
     per-source failure story is the executor's: one source failing yields an
     item with `ok: false` and never a 500.
     """
@@ -564,7 +569,7 @@ async def graph_verify_fanout(request: Request, limit: int = Query(default=6, ge
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 
-@router.post("/graph/verify/sweep", dependencies=GRAPH_DEP)
+@router.post("/graph/verify/sweep", dependencies=ASK_DEP)
 async def graph_verify_sweep(request: Request, req: SweepRequest | None = None):
     """Audit one sub-graph N sandboxes at a time, for every N in `sizes`.
 
@@ -579,9 +584,10 @@ async def graph_verify_sweep(request: Request, req: SweepRequest | None = None):
     (`replicated: true`, `distinct_sources: 1`, plus the payload's own node and
     edge counts) rather than implying N crawled documents.
 
-    Read-only, so it sits behind GRAPH_DEP exactly like `/graph/verify` and
-    `/graph/verify/fanout`. The size loop lives in the executor, which owns the
-    measurement and the error vocabulary; this route picks the payload and
+    Read-only but sandbox-spawning (`sum(sizes)` of them), so it sits behind
+    ASK_DEP like `/graph/verify` and `/graph/verify/fanout`. The size loop
+    lives in the executor, which owns the measurement and the error
+    vocabulary; this route picks the payload and
     forwards the result, computing nothing itself. A sweep in which no size
     produced a verdict comes back `ok: false` with no `results` key and never a
     500 — same precedent as the fan-out route.
