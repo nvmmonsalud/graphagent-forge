@@ -754,10 +754,30 @@ print(json.dumps(result))
             except Exception as exc:  # telemetry is never load-bearing
                 log.warning("Fan-out event sink failed: %s", exc)
 
+        def _crashed(source: str, item_started: float) -> dict[str, Any]:
+            return {
+                "source": source,
+                "ok": False,
+                "error": FANOUT_ERROR_UNAVAILABLE,
+                "method": method,
+                "duration_ms": _elapsed_ms(item_started),
+            }
+
         async def _one(source: str, graph_data: dict[str, Any]) -> dict[str, Any]:
             async with semaphore:
                 await _emit({"phase": "started", "source": source})
-                result = await self.verify_graph(graph_data)
+                # Clock starts once the slot is held, so an item that waited on
+                # the semaphore is not charged for its neighbours' runtime.
+                item_started = time.perf_counter()
+                try:
+                    result = await self.verify_graph(graph_data)
+                except Exception:
+                    # Escaped verify_graph's own envelope, so normalize it here
+                    # rather than letting a raw exception reach a client.
+                    log.exception("Fan-out verification of %r crashed", source)
+                    item = _crashed(source, item_started)
+                    await _emit({"phase": "done", "source": source, "result": item})
+                    return item
             item: dict[str, Any] = {"source": source}
             item.update(result)
             await _emit({"phase": "done", "source": source, "result": item})
@@ -771,16 +791,10 @@ print(json.dumps(result))
         items: list[dict[str, Any]] = []
         for (source, _data), outcome in zip(graphs.items(), outcomes, strict=True):
             if isinstance(outcome, BaseException):
-                # Escaped verify_graph's own envelope, so normalize it here
-                # rather than letting a raw exception reach a client.
-                log.error("Fan-out verification of %r crashed", source, exc_info=outcome)
-                items.append({
-                    "source": source,
-                    "ok": False,
-                    "error": FANOUT_ERROR_UNAVAILABLE,
-                    "method": method,
-                    "duration_ms": _elapsed_ms(started),
-                })
+                # Only non-Exception BaseExceptions reach here (e.g. a
+                # cancellation); still never let one leak past the envelope.
+                log.error("Fan-out verification of %r aborted", source, exc_info=outcome)
+                items.append(_crashed(source, started))
             else:
                 items.append(outcome)
 
