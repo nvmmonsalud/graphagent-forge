@@ -1,12 +1,14 @@
 """GraphAgent Forge — Main entry point."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -51,11 +53,21 @@ FRONTEND_VENDOR = REPO_ROOT / "frontend" / "vendor"
 # ------------------------------------------------------------------
 # WebSocket broadcast manager
 # ------------------------------------------------------------------
+#: Hard cap on concurrent /ws/graph sockets; extra clients are refused with 1013.
+MAX_WS_CONNECTIONS = int(os.getenv("MAX_WS_CONNECTIONS", "100"))
+#: A client that doesn't drain its socket within this many seconds is dropped,
+#: so one stalled reader can't hold up job progress or merge broadcasts.
+WS_SEND_TIMEOUT = 2.0
+
+
 class ConnectionManager:
     """Manages active WebSocket connections for live graph updates."""
 
     def __init__(self):
         self.active_connections: list[WebSocket] = []
+
+    def is_full(self) -> bool:
+        return len(self.active_connections) >= MAX_WS_CONNECTIONS
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -69,14 +81,21 @@ class ConnectionManager:
     async def broadcast(self, data: dict[str, Any]):
         """Send graph update to all connected clients."""
         message = json.dumps(data)
-        disconnected = []
-        for connection in self.active_connections:
+        connections = list(self.active_connections)
+
+        async def _send(connection: WebSocket) -> bool:
             try:
-                await connection.send_text(message)
+                await asyncio.wait_for(connection.send_text(message), WS_SEND_TIMEOUT)
+                return True
             except Exception:
-                disconnected.append(connection)
-        for conn in disconnected:
-            self.disconnect(conn)
+                return False
+
+        # Concurrent with a per-socket timeout: total cost is bounded by the
+        # slowest healthy client, not the sum of every client's latency.
+        results = await asyncio.gather(*(_send(c) for c in connections))
+        for conn, ok in zip(connections, results, strict=True):
+            if not ok:
+                self.disconnect(conn)
 
 
 # Module-level singleton: src.agent.core lazily imports this name to broadcast
@@ -157,6 +176,89 @@ async def lifespan(app: FastAPI):
             log.exception("Error while closing HTTP clients")
 
 
+#: Hard cap on any request body. The largest legitimate body is a 3MB upload
+#: plus multipart framing; /ingest/text's 200k chars stays under 1.2MB as JSON.
+MAX_REQUEST_BYTES = 4 * 1024 * 1024
+
+
+class BodySizeLimitMiddleware:
+    """Reject request bodies over MAX_REQUEST_BYTES before they're buffered.
+
+    Pydantic's `max_length` and the upload reader's cap only run after
+    Starlette has already read the whole body (or spooled the multipart parts
+    to disk), and FastAPI parses the body before the API-key dependency. So an
+    unauthenticated client could push an arbitrarily large body. A declared
+    Content-Length over the cap gets 413 immediately; chunked or lying bodies
+    are counted as they stream and aborted with 413 at the cap.
+    """
+
+    def __init__(self, app, max_bytes: int = MAX_REQUEST_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        for name, value in scope.get("headers", []):
+            if name == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = -1
+                if declared < 0 or declared > self.max_bytes:
+                    await self._reject(send)
+                    return
+                break
+
+        received = 0
+        response_started = False
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    raise _BodyTooLarge()
+            return message
+
+        async def tracking_send(message):
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracking_send)
+        except _BodyTooLarge:
+            if not response_started:
+                await self._reject(send)
+
+    @staticmethod
+    async def _reject(send) -> None:
+        body = b'{"detail":"request body too large"}'
+        await send({
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+class _BodyTooLarge(HTTPException):
+    """Raised from inside `receive`. Subclassing HTTPException matters: FastAPI
+    wraps arbitrary body-read errors into a 400, but re-raises HTTPException,
+    so the app's exception handling turns this into a proper 413."""
+
+    def __init__(self) -> None:
+        super().__init__(status_code=413, detail="request body too large")
+
+
 app = FastAPI(
     title="GraphAgent Forge",
     description="Turn scattered information into connected intelligence.",
@@ -179,6 +281,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Added last so it is the outermost middleware and runs before anything reads the body.
+app.add_middleware(BodySizeLimitMiddleware)
+
 app.include_router(router, prefix="/api")
 # Flattens FastAPI's list-of-dicts 422 body into a plain string so the
 # frontend's String(detail) never renders "[object Object]".
@@ -194,12 +299,34 @@ else:
     log.warning("Vendored asset directory missing: %s", FRONTEND_VENDOR)
 
 
+def _ws_origin_allowed(websocket: WebSocket) -> bool:
+    origin = websocket.headers.get("origin")
+    if not origin:
+        return True
+    if origin in ALLOWED_ORIGINS:
+        return True
+    # Same-origin is always fine (e.g. the UI opened via a LAN IP).
+    host = websocket.headers.get("host", "")
+    return bool(host) and urlparse(origin).netloc == host
+
+
 # ------------------------------------------------------------------
 # WebSocket endpoint for live graph growth
 # ------------------------------------------------------------------
 @app.websocket("/ws/graph")
 async def websocket_graph(websocket: WebSocket):
     """Push real-time graph updates to connected frontend clients."""
+    # Browsers always send Origin on a WebSocket handshake and CORS does not
+    # apply to WebSockets, so without this any website could subscribe to job
+    # and graph broadcasts. Non-browser clients (no Origin) are allowed.
+    if not _ws_origin_allowed(websocket):
+        log.warning("Rejected /ws/graph from origin %s", websocket.headers.get("origin"))
+        await websocket.close(code=1008)
+        return
+    if ws_manager.is_full():
+        log.warning("Rejected /ws/graph: %d connections already open", MAX_WS_CONNECTIONS)
+        await websocket.close(code=1013)
+        return
     await ws_manager.connect(websocket)
     try:
         while True:

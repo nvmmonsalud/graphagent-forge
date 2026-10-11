@@ -71,3 +71,26 @@ async def test_broadcast_sends_json_serialized_message() -> None:
 
     assert len(ws.sent) == 1
     assert '"type": "graph_update"' in ws.sent[0] or '"type":"graph_update"' in ws.sent[0]
+
+
+@pytest.mark.asyncio
+async def test_broadcast_drops_stalled_socket_without_blocking_others(monkeypatch) -> None:
+    import asyncio
+
+    import src.main as main_module
+
+    monkeypatch.setattr(main_module, "WS_SEND_TIMEOUT", 0.05)
+
+    class StalledWebSocket(FakeWebSocket):
+        async def send_text(self, message: str):
+            await asyncio.sleep(10)
+
+    manager = ConnectionManager()
+    good, stalled = FakeWebSocket(), StalledWebSocket()
+    await manager.connect(good)
+    await manager.connect(stalled)
+
+    await asyncio.wait_for(manager.broadcast({"type": "graph_update"}), timeout=1)
+
+    assert stalled not in manager.active_connections
+    assert len(good.sent) == 1

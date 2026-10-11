@@ -22,6 +22,15 @@ MAX_CHARS = 50_000  # Kimi has 1M context, but keep the prompt focused
 # Appended to any body clipped at MAX_CHARS. Shared with file_extractor so both
 # ingestion paths truncate byte-identically.
 TRUNCATION_SUFFIX = "\n\n[...truncated...]"
+
+# Client-facing fetch errors. Resolution and connection details (internal
+# hostnames, the private IP a name resolves to, raw socket errors) are logged
+# but never returned: the error lands in the job record, which is broadcast to
+# every /ws/graph client, so detailed text would be an internal-DNS oracle.
+ERR_DEST_BLOCKED = "Blocked: destination not allowed"
+ERR_UNRESOLVABLE = "Could not resolve hostname"
+ERR_FETCH_FAILED = "Could not fetch URL"
+ERR_FETCH_TIMEOUT = "Timed out fetching URL"
 REQUEST_TIMEOUT = 30
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -253,6 +262,20 @@ async def guard_url(url: str) -> str | None:
     return error
 
 
+def _client_guard_error(url: str, detail: str) -> str:
+    """Map a guard_url message to what the client may see.
+
+    URL-shape problems (scheme, userinfo, missing host) only describe the
+    caller's own input, so they pass through. Anything learned from DNS does not.
+    """
+    shape_error = check_url_shape(url)
+    if shape_error:
+        return shape_error
+    if detail.startswith("Failed to resolve"):
+        return ERR_UNRESOLVABLE
+    return ERR_DEST_BLOCKED
+
+
 def _parse_html(html: str) -> tuple[str, str]:
     """Parse + clean HTML. CPU-bound; always call via asyncio.to_thread."""
     soup = BeautifulSoup(html, "html.parser")
@@ -321,7 +344,7 @@ async def extract_from_url(url: str) -> dict[str, Any]:
         error = await guard_url(current)
         if error:
             log.warning("SSRF guard rejected %s: %s", current, error)
-            return _envelope(url, domain=domain, error=error)
+            return _envelope(url, domain=domain, error=_client_guard_error(current, error))
 
         try:
             async with client.stream("GET", current) as response:
@@ -360,9 +383,16 @@ async def extract_from_url(url: str) -> dict[str, Any]:
                 domain=domain,
                 error=f"HTTP {e.response.status_code} fetching {current}",
             )
+        except httpx.TimeoutException as e:
+            log.error("Timed out fetching %s: %s", current, e)
+            return _envelope(url, domain=domain, error=ERR_FETCH_TIMEOUT)
         except Exception as e:
-            log.error("Failed to fetch %s: %s", current, e)
-            return _envelope(url, domain=domain, error=f"{type(e).__name__}: {e}")
+            log.error("Failed to fetch %s: %s: %s", current, type(e).__name__, e)
+            # The connect-time guard raises ConnectError("Blocked: ...").
+            blocked = isinstance(e, httpx.ConnectError) and str(e).startswith("Blocked")
+            return _envelope(
+                url, domain=domain, error=ERR_DEST_BLOCKED if blocked else ERR_FETCH_FAILED
+            )
 
         break
     else:

@@ -334,3 +334,32 @@ def test_extract_from_text_keys_are_subset_of_file_envelope() -> None:
     assert set(text_result.keys()) == {
         "url", "title", "domain", "content", "char_count", "error",
     }
+
+
+# ------------------------------------------------------------------
+# PDF resource limits (parsed in a killable child process)
+# ------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_pdf_over_page_cap_is_rejected() -> None:
+    writer = pypdf.PdfWriter()
+    for _ in range(file_extractor.MAX_PDF_PAGES + 1):
+        writer.add_blank_page(width=10, height=10)
+    buf = io.BytesIO()
+    writer.write(buf)
+
+    env = await file_extractor.extract_from_file(buf.getvalue(), "many.pdf", "application/pdf")
+
+    assert env["error"] == file_extractor.ERR_PDF_TOO_MANY_PAGES.format(
+        max_pages=file_extractor.MAX_PDF_PAGES
+    )
+    assert env["pages"] == file_extractor.MAX_PDF_PAGES + 1
+
+
+@pytest.mark.asyncio
+async def test_pdf_parse_timeout_kills_child_and_reports_fixed_error(monkeypatch) -> None:
+    monkeypatch.setattr(file_extractor, "PDF_PARSE_TIMEOUT", 0.001)
+
+    env = await file_extractor.extract_from_file(TEXT_PDF_BYTES, "slow.pdf", "application/pdf")
+
+    assert env["error"] == file_extractor.ERR_PDF_TIMEOUT
+    assert env["content"] == ""

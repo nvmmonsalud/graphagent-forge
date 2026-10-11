@@ -257,3 +257,28 @@ async def test_shared_client_uses_guarded_backend_and_ignores_proxy_env(monkeypa
         assert not client._mounts  # no proxy transport picked up from the env
     finally:
         await extractor.aclose_client()
+
+
+@pytest.mark.asyncio
+async def test_extract_from_url_never_leaks_resolved_internal_ip(monkeypatch) -> None:
+    loop = asyncio.get_running_loop()
+
+    async def fake_getaddrinfo(host, port, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.3.7", 0))]
+
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    result = await extractor.extract_from_url("http://db.internal/")
+    assert result["error"] == extractor.ERR_DEST_BLOCKED
+    assert "10.0.3.7" not in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_extract_from_url_unresolvable_host_is_generic(monkeypatch) -> None:
+    loop = asyncio.get_running_loop()
+
+    async def fake_getaddrinfo(host, port, **kwargs):
+        raise socket.gaierror(8, "nodename nor servname provided")
+
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    result = await extractor.extract_from_url("http://missing.internal/")
+    assert result["error"] == extractor.ERR_UNRESOLVABLE
