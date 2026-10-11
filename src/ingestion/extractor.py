@@ -8,6 +8,7 @@ import socket
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
+import httpcore
 import httpx
 from bs4 import BeautifulSoup
 
@@ -46,8 +47,70 @@ def _get_client() -> httpx.AsyncClient:
             # every hop (a public host must not be able to 302 us to 169.254.169.254).
             follow_redirects=False,
             headers={"User-Agent": USER_AGENT},
+            transport=_guarded_transport(),
+            # Ignore HTTP(S)_PROXY/ALL_PROXY: a proxy resolves the name itself,
+            # which would bypass the connect-time IP check below.
+            trust_env=False,
         )
     return _client
+
+
+class _GuardedNetworkBackend(httpcore.AsyncNetworkBackend):
+    """Network backend that re-validates and PINS the destination IP at connect.
+
+    `guard_url` resolves the hostname before the request, but the socket used
+    to be opened by a second, independent resolution — so a DNS-rebinding
+    server (TTL 0) could answer a public IP to the guard and 169.254.169.254 to
+    the connection. Here resolution and connect use the same answer: every
+    record must be public, and the socket connects to one of those exact IPs.
+    TLS still verifies the certificate and sends SNI for the original hostname,
+    because httpcore takes `server_hostname` from the request, not from `host`.
+    """
+
+    def __init__(self, inner: httpcore.AsyncNetworkBackend) -> None:
+        self._inner = inner
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        addresses, error = await _resolve_public(host)
+        if error:
+            raise httpcore.ConnectError(error)
+        return await self._inner.connect_tcp(
+            str(addresses[0]),
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+    async def connect_unix_socket(self, *args: Any, **kwargs: Any) -> httpcore.AsyncNetworkStream:
+        raise httpcore.ConnectError("Blocked: unix sockets are not allowed")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._inner.sleep(seconds)
+
+
+def _guarded_transport() -> httpx.AsyncHTTPTransport:
+    """An httpx transport whose connection pool connects via the guarded backend.
+
+    httpx 0.28 doesn't expose `network_backend`, so it is swapped on the
+    transport's httpcore pool. Fail closed: if a future httpx changes that
+    internal layout, refuse to build a client rather than fetch unguarded.
+    """
+    transport = httpx.AsyncHTTPTransport()
+    pool = getattr(transport, "_pool", None)
+    if not isinstance(pool, httpcore.AsyncConnectionPool) or not hasattr(
+        pool, "_network_backend"
+    ):
+        raise RuntimeError("httpx transport layout changed; SSRF connect guard unavailable")
+    pool._network_backend = _GuardedNetworkBackend(pool._network_backend)
+    return transport
 
 
 async def aclose_client() -> None:
@@ -129,21 +192,15 @@ def check_url_shape(url: str) -> str | None:
     return None
 
 
-async def guard_url(url: str) -> str | None:
-    """Full SSRF guard for a single URL. Returns an error message or None.
+async def _resolve_public(
+    hostname: str,
+) -> tuple[list[ipaddress.IPv4Address | ipaddress.IPv6Address], str | None]:
+    """Resolve `hostname` and require every address to be public.
 
-    Residual risk — DNS rebinding (TOCTOU): the name is resolved here, but httpx
-    resolves it again when it opens the socket, so an attacker controlling a DNS
-    zone with a ~0s TTL could return a public IP to this check and a private one
-    to the connection. Closing that hole requires pinning the validated IP at
-    connect time (custom transport / connecting to the IP with a Host header),
-    which is deliberately deferred.
+    Returns `(addresses, None)` on success or `([], error_message)`. Shared by
+    the pre-request `guard_url` and the connect-time `_GuardedNetworkBackend`.
     """
-    shape_error = check_url_shape(url)
-    if shape_error:
-        return shape_error
-
-    hostname = urlparse(url).hostname or ""
+    hostname = hostname.strip("[]")
 
     # Literal IP hostnames never hit DNS.
     try:
@@ -152,15 +209,15 @@ async def guard_url(url: str) -> str | None:
         literal = None
     if literal is not None:
         if is_blocked_ip(literal):
-            return f"Blocked: {hostname} is a private/reserved address ({literal})"
-        return None
+            return [], f"Blocked: {hostname} is a private/reserved address ({literal})"
+        return [literal], None
 
     try:
         infos = await asyncio.get_running_loop().getaddrinfo(
             hostname, None, type=socket.SOCK_STREAM
         )
     except (socket.gaierror, OSError, UnicodeError) as e:
-        return f"Failed to resolve hostname {hostname}: {e}"
+        return [], f"Failed to resolve hostname {hostname}: {e}"
 
     addresses = []
     for info in infos:
@@ -170,14 +227,30 @@ async def guard_url(url: str) -> str | None:
             continue
 
     if not addresses:
-        return f"Failed to resolve hostname {hostname}: no usable A/AAAA records"
+        return [], f"Failed to resolve hostname {hostname}: no usable A/AAAA records"
 
     # Every record must be public — one private answer poisons the whole name.
     for address in addresses:
         if is_blocked_ip(address):
-            return f"Blocked: {hostname} resolves to private/reserved IP {address}"
+            return [], f"Blocked: {hostname} resolves to private/reserved IP {address}"
 
-    return None
+    return addresses, None
+
+
+async def guard_url(url: str) -> str | None:
+    """Full SSRF guard for a single URL. Returns an error message or None.
+
+    This early check gives a clean error before any request. It is not the
+    only line of defense against DNS rebinding: the shared client's
+    `_GuardedNetworkBackend` resolves again at connect time, re-checks every
+    record, and connects to the exact IP it validated.
+    """
+    shape_error = check_url_shape(url)
+    if shape_error:
+        return shape_error
+
+    _addresses, error = await _resolve_public(urlparse(url).hostname or "")
+    return error
 
 
 def _parse_html(html: str) -> tuple[str, str]:

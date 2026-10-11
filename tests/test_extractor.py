@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
+from unittest.mock import AsyncMock
 
+import httpcore
 import httpx
 import pytest
 
@@ -208,3 +210,50 @@ async def test_too_many_redirects_blocked(mock_client) -> None:
     result = await extractor.extract_from_url("http://8.8.8.8/loop")
     assert result["error"] is not None
     assert "redirects" in result["error"]
+
+
+# ------------------------------------------------------------------
+# DNS rebinding: the connect-time backend re-resolves and pins the IP
+# ------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_guarded_backend_blocks_rebound_private_address(monkeypatch) -> None:
+    """Guard saw a public IP; the connect-time lookup returns loopback."""
+    loop = asyncio.get_running_loop()
+
+    async def fake_getaddrinfo(host, port, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
+
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    inner = AsyncMock()
+    backend = extractor._GuardedNetworkBackend(inner)
+    with pytest.raises(httpcore.ConnectError, match="private/reserved"):
+        await backend.connect_tcp("rebind.example", 80)
+    inner.connect_tcp.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_guarded_backend_connects_to_the_validated_ip(monkeypatch) -> None:
+    loop = asyncio.get_running_loop()
+
+    async def fake_getaddrinfo(host, port, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.215.14", 0))]
+
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    inner = AsyncMock()
+    backend = extractor._GuardedNetworkBackend(inner)
+    await backend.connect_tcp("example.com", 443, timeout=5)
+    assert inner.connect_tcp.await_args.args[:2] == ("93.184.215.14", 443)
+
+
+@pytest.mark.asyncio
+async def test_shared_client_uses_guarded_backend_and_ignores_proxy_env(monkeypatch) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setattr(extractor, "_client", None)
+    client = extractor._get_client()
+    try:
+        assert client.trust_env is False
+        pool = client._transport._pool
+        assert isinstance(pool._network_backend, extractor._GuardedNetworkBackend)
+        assert not client._mounts  # no proxy transport picked up from the env
+    finally:
+        await extractor.aclose_client()

@@ -91,6 +91,12 @@ async def lifespan(app: FastAPI):
     Neo4j failures are non-fatal: the app still boots in a degraded mode where
     `/api/health` reports the outage and graph-touching routes answer 503.
     """
+    if not os.getenv("API_KEY"):
+        log.warning(
+            "API_KEY is not set: ingest, ask, delete/clear and the Daytona sandbox "
+            "routes are open to anyone who can reach this server. Keep it bound to "
+            "loopback (APP_HOST=127.0.0.1, the default) or set API_KEY."
+        )
     neo4j = Neo4jClient(
         uri=os.getenv("NEO4J_URI", "bolt://localhost:7687"),
         user=os.getenv("NEO4J_USER", "neo4j"),
@@ -225,7 +231,7 @@ if __name__ == "__main__":
 
     uvicorn.run(
         "src.main:app",
-        host=os.getenv("APP_HOST", "0.0.0.0"),
+        host=os.getenv("APP_HOST", "127.0.0.1"),
         port=int(os.getenv("APP_PORT", "8000")),
         # Off by default: a reload restarts the process, so any in-flight
         # ingest job in the in-memory queue is lost (it never reports back).

@@ -122,6 +122,18 @@ class DaytonaExecutor:
             _MIN_FANOUT_CONCURRENCY, min(fanout_budget, _MAX_FANOUT_CONCURRENCY)
         )
 
+    #: Caps concurrent local-fallback subprocesses process-wide, so parallel
+    #: verify/analytics/fan-out calls without Daytona can't fork unbounded
+    #: CPU-bound interpreters. Created lazily inside the running event loop.
+    _LOCAL_MAX_PROCS: ClassVar[int] = max(2, min(os.cpu_count() or 2, 8))
+    _local_semaphore: ClassVar[asyncio.Semaphore | None] = None
+
+    @classmethod
+    def _local_gate(cls) -> asyncio.Semaphore:
+        if cls._local_semaphore is None:
+            cls._local_semaphore = asyncio.Semaphore(cls._LOCAL_MAX_PROCS)
+        return cls._local_semaphore
+
     # Map language names to actual shell commands
     _LANG_COMMANDS: ClassVar[dict[str, str]] = {
         "python": "python3",
@@ -200,6 +212,12 @@ class DaytonaExecutor:
         """
         cmd = self._LANG_COMMANDS.get(language.lower(), "python3")
 
+        async with self._local_gate():
+            return await self._local_exec(cmd, code, stdin_data)
+
+    async def _local_exec(
+        self, cmd: str, code: str, stdin_data: bytes | None
+    ) -> dict[str, Any]:
         try:
             proc = await asyncio.create_subprocess_exec(
                 cmd, "-c", code,

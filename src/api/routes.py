@@ -102,18 +102,23 @@ _MAX_TRACKED_CLIENTS = 4096
 _rate_buckets: dict[str, deque] = {}
 
 
-def _rate_limit_allow(client_ip: str, now: float) -> bool:
+def _rate_limit_allow(client_ip: str, now: float, max_hits: int | None = None) -> bool:
     """Record a hit for `client_ip`, returning False when over the limit.
+
+    `max_hits` defaults to RATE_LIMIT_MAX (looked up at call time so tests can
+    patch it). Separate limits share `_rate_buckets` under a key prefix, so one
+    `.clear()` resets them all.
 
     Pure stdlib and side-effect-local so it can be exercised without FastAPI.
     """
+    limit = RATE_LIMIT_MAX if max_hits is None else max_hits
     bucket = _rate_buckets.get(client_ip)
     if bucket is None:
         bucket = _rate_buckets.setdefault(client_ip, deque())
     cutoff = now - RATE_LIMIT_WINDOW
     while bucket and bucket[0] <= cutoff:
         bucket.popleft()
-    if len(bucket) >= RATE_LIMIT_MAX:
+    if len(bucket) >= limit:
         return False
     bucket.append(now)
     # Bound memory: an idle client's timestamps are only popped when that same
@@ -134,10 +139,36 @@ async def rate_limit(request: Request) -> None:
         raise HTTPException(status_code=429, detail="rate limit exceeded")
 
 
+#: Separate, tighter bucket for the routes that start Daytona sandboxes (or
+#: local CPU-bound subprocesses when Daytona isn't configured). Kept apart from
+#: the ingest/ask bucket so clicking the audit panels doesn't eat ask quota.
+SANDBOX_RATE_LIMIT_MAX = int(os.getenv("SANDBOX_RATE_LIMIT_MAX", "6"))
+
+
+async def sandbox_rate_limit(request: Request) -> None:
+    """SANDBOX_RATE_LIMIT_MAX requests/minute per client IP on sandbox routes."""
+    client_ip = request.client.host if request.client else "unknown"
+    if not _rate_limit_allow(f"sandbox:{client_ip}", time.monotonic(), SANDBOX_RATE_LIMIT_MAX):
+        log.warning("Sandbox rate limit exceeded for %s on %s", client_ip, request.url.path)
+        raise HTTPException(status_code=429, detail="rate limit exceeded")
+
+
+#: Fan-out and sweep each start up to dozens of sandboxes. Only one such batch
+#: may run per process at a time; a second request gets 429 instead of
+#: stacking another batch on the same Daytona CPU budget.
+_sandbox_batch_lock = asyncio.Lock()
+
+
+def _claim_sandbox_batch() -> None:
+    if _sandbox_batch_lock.locked():
+        raise HTTPException(status_code=429, detail="a sandbox batch is already running")
+
+
 GRAPH_DEP = [Depends(require_graph)]
 MUTATING_DEP = [Depends(require_api_key), Depends(require_graph)]
 INGEST_DEP = [Depends(require_api_key), Depends(rate_limit), Depends(require_graph)]
-ASK_DEP = [Depends(rate_limit), Depends(require_graph)]
+ASK_DEP = [Depends(require_api_key), Depends(rate_limit), Depends(require_graph)]
+SANDBOX_DEP = [Depends(require_api_key), Depends(sandbox_rate_limit), Depends(require_graph)]
 
 
 # ------------------------------------------------------------------
@@ -507,7 +538,7 @@ async def graph_search(req: SearchRequest, request: Request):
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 
-@router.get("/graph/verify", dependencies=GRAPH_DEP)
+@router.get("/graph/verify", dependencies=SANDBOX_DEP)
 async def graph_verify(request: Request):
     """Run graph-integrity verification inside a Daytona sandbox.
 
@@ -524,7 +555,7 @@ async def graph_verify(request: Request):
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 
-@router.post("/graph/verify/fanout", dependencies=GRAPH_DEP)
+@router.post("/graph/verify/fanout", dependencies=SANDBOX_DEP)
 async def graph_verify_fanout(request: Request, limit: int = Query(default=6, ge=1, le=16)):
     """Audit every source's sub-graph in its OWN Daytona sandbox, concurrently.
 
@@ -535,7 +566,9 @@ async def graph_verify_fanout(request: Request, limit: int = Query(default=6, ge
     `fanout_update` message, so the run is watchable while it happens rather
     than being a spinner.
 
-    Read-only, so it sits behind GRAPH_DEP exactly like `/graph/verify`. The
+    Read-only, but it spends sandbox credits, so it sits behind SANDBOX_DEP
+    (API key + sandbox rate limit) like `/graph/verify`, and only one fan-out
+    or sweep batch may run at a time. The
     per-source failure story is the executor's: one source failing yields an
     item with `ok: false` and never a 500.
     """
@@ -549,22 +582,24 @@ async def graph_verify_fanout(request: Request, limit: int = Query(default=6, ge
         if manager is not None:
             await manager.broadcast({"type": "fanout_update", **event})
 
+    _claim_sandbox_batch()
     try:
-        sources = await neo4j.get_sources()
-        # get_sources() orders by node_count DESC, so the cap keeps the biggest
-        # sub-graphs. The limit is a credit budget, not a correctness bound.
-        ordered = [rec["source_doc"] for rec in sources[:limit] if rec.get("source_doc")]
-        payloads = await asyncio.gather(
-            *(neo4j.get_graph_data_by_source(source_doc) for source_doc in ordered)
-        )
-        graphs = dict(zip(ordered, payloads, strict=True))
-        return await agent.daytona.verify_graph_fanout(graphs, on_event=_on_event)
+        async with _sandbox_batch_lock:
+            sources = await neo4j.get_sources()
+            # get_sources() orders by node_count DESC, so the cap keeps the biggest
+            # sub-graphs. The limit is a credit budget, not a correctness bound.
+            ordered = [rec["source_doc"] for rec in sources[:limit] if rec.get("source_doc")]
+            payloads = await asyncio.gather(
+                *(neo4j.get_graph_data_by_source(source_doc) for source_doc in ordered)
+            )
+            graphs = dict(zip(ordered, payloads, strict=True))
+            return await agent.daytona.verify_graph_fanout(graphs, on_event=_on_event)
     except Exception:
         log.exception("Fan-out verification failed")
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 
-@router.post("/graph/verify/sweep", dependencies=GRAPH_DEP)
+@router.post("/graph/verify/sweep", dependencies=SANDBOX_DEP)
 async def graph_verify_sweep(request: Request, req: SweepRequest | None = None):
     """Audit one sub-graph N sandboxes at a time, for every N in `sizes`.
 
@@ -579,7 +614,7 @@ async def graph_verify_sweep(request: Request, req: SweepRequest | None = None):
     (`replicated: true`, `distinct_sources: 1`, plus the payload's own node and
     edge counts) rather than implying N crawled documents.
 
-    Read-only, so it sits behind GRAPH_DEP exactly like `/graph/verify` and
+    Behind SANDBOX_DEP and the single-batch lock, exactly like
     `/graph/verify/fanout`. The size loop lives in the executor, which owns the
     measurement and the error vocabulary; this route picks the payload and
     forwards the result, computing nothing itself. A sweep in which no size
@@ -594,33 +629,35 @@ async def graph_verify_sweep(request: Request, req: SweepRequest | None = None):
         if manager is not None:
             await manager.broadcast({"type": "sweep_update", **event})
 
+    _claim_sandbox_batch()
     try:
-        sources = await neo4j.get_sources()
-        ordered = [rec["source_doc"] for rec in sources if rec.get("source_doc")]
-        if not ordered:
-            # Nothing to replicate: no sources means no sub-graph to audit, and
-            # that is infrastructure news, not a verdict about the graph.
-            return {
-                "ok": False,
-                "error": SWEEP_ERROR_UNAVAILABLE,
-                "method": "unknown",
-                "wall_ms": 0,
-                "distinct_sources": 0,
-            }
+        async with _sandbox_batch_lock:
+            sources = await neo4j.get_sources()
+            ordered = [rec["source_doc"] for rec in sources if rec.get("source_doc")]
+            if not ordered:
+                # Nothing to replicate: no sources means no sub-graph to audit, and
+                # that is infrastructure news, not a verdict about the graph.
+                return {
+                    "ok": False,
+                    "error": SWEEP_ERROR_UNAVAILABLE,
+                    "method": "unknown",
+                    "wall_ms": 0,
+                    "distinct_sources": 0,
+                }
 
-        source_doc = ordered[0]
-        payload = await neo4j.get_graph_data_by_source(source_doc)
-        sizes = req.sizes if req is not None else list(DEFAULT_SWEEP_SIZES)
-        result = await agent.daytona.verify_graph_sweep(
-            payload, sizes=sizes, on_event=_on_event
-        )
-        return {
-            "source_doc": source_doc,
-            "distinct_sources": 1,
-            "payload_nodes": len(payload.get("nodes") or []),
-            "payload_edges": len(payload.get("edges") or []),
-            **result,
-        }
+            source_doc = ordered[0]
+            payload = await neo4j.get_graph_data_by_source(source_doc)
+            sizes = req.sizes if req is not None else list(DEFAULT_SWEEP_SIZES)
+            result = await agent.daytona.verify_graph_sweep(
+                payload, sizes=sizes, on_event=_on_event
+            )
+            return {
+                "source_doc": source_doc,
+                "distinct_sources": 1,
+                "payload_nodes": len(payload.get("nodes") or []),
+                "payload_edges": len(payload.get("edges") or []),
+                **result,
+            }
     except Exception:
         log.exception("Concurrency sweep failed")
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
@@ -649,7 +686,7 @@ async def graph_duplicates(request: Request, limit: int = Query(default=20, ge=1
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
 
-@router.get("/graph/analytics", dependencies=GRAPH_DEP)
+@router.get("/graph/analytics", dependencies=SANDBOX_DEP)
 async def graph_analytics(request: Request, top: int = Query(default=10, ge=1, le=50)):
     """Graph analytics: type histograms, degree ranking and structural metrics.
 

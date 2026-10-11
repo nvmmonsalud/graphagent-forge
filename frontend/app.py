@@ -5,6 +5,8 @@ import httpx
 import json
 
 API_BASE = os.getenv("GRAPHAGENT_API", "http://localhost:8000") + "/api"
+# Matches the server's API_KEY when it is set; sent on ingest/ask calls.
+HEADERS = {"X-API-Key": k} if (k := os.getenv("GRAPHAGENT_API_KEY")) else {}
 
 st.set_page_config(
     page_title="GraphAgent Forge",
@@ -65,6 +67,7 @@ with tab_ingest:
                             f"{API_BASE}/ingest/url?wait=true",
                             json={"url": url},
                             timeout=120,
+                            headers=HEADERS,
                         ).json()
 
                         if result.get("success"):
@@ -96,6 +99,7 @@ with tab_ingest:
                             f"{API_BASE}/ingest/text?wait=true",
                             json={"text": text, "source": source},
                             timeout=120,
+                            headers=HEADERS,
                         ).json()
 
                         if result.get("success"):
@@ -122,6 +126,7 @@ with tab_ingest:
                             files={"file": (up.name, up.getvalue(), up_type)},
                             data={"source": source} if source else None,
                             timeout=120,
+                            headers=HEADERS,
                         ).json()
 
                         if result.get("success"):
@@ -156,6 +161,7 @@ with tab_query:
                         f"{API_BASE}/ask",
                         json={"question": question},
                         timeout=120,
+                        headers=HEADERS,
                     ).json()
 
                     # Answer
