@@ -418,6 +418,10 @@ def extract_from_text(text: str, source: str = "manual") -> dict[str, Any]:
     """Wrap raw text input in the standard extraction format."""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     clean_text = "\n".join(lines)
+    # Same cap as URL and file ingests: the route accepts up to 200k chars, and
+    # without this one text ingest cost ~4x a URL ingest in Kimi tokens.
+    if len(clean_text) > MAX_CHARS:
+        clean_text = clean_text[:MAX_CHARS] + TRUNCATION_SUFFIX
 
     return {
         "url": None,

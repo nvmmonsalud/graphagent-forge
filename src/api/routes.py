@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import ipaddress
 import logging
 import os
 import secrets
@@ -131,9 +132,25 @@ def _rate_limit_allow(client_ip: str, now: float, max_hits: int | None = None) -
     return True
 
 
+def _client_key(request: Request) -> str:
+    """Rate-limit identity for a request: the client IP, or its /64 for IPv6.
+
+    One IPv6 host typically controls a whole /64, so keying on the full address
+    would hand a client billions of fresh buckets (and grow `_rate_buckets`).
+    """
+    host = request.client.host if request.client else "unknown"
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is None:
+        return str(ipaddress.ip_network(f"{address}/64", strict=False))
+    return str(address.ipv4_mapped or address) if address.version == 6 else host
+
+
 async def rate_limit(request: Request) -> None:
     """10 requests/minute per client IP on the expensive routes."""
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _client_key(request)
     if not _rate_limit_allow(client_ip, time.monotonic()):
         log.warning("Rate limit exceeded for %s on %s", client_ip, request.url.path)
         raise HTTPException(status_code=429, detail="rate limit exceeded")
@@ -147,7 +164,7 @@ SANDBOX_RATE_LIMIT_MAX = int(os.getenv("SANDBOX_RATE_LIMIT_MAX", "6"))
 
 async def sandbox_rate_limit(request: Request) -> None:
     """SANDBOX_RATE_LIMIT_MAX requests/minute per client IP on sandbox routes."""
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _client_key(request)
     if not _rate_limit_allow(f"sandbox:{client_ip}", time.monotonic(), SANDBOX_RATE_LIMIT_MAX):
         log.warning("Sandbox rate limit exceeded for %s on %s", client_ip, request.url.path)
         raise HTTPException(status_code=429, detail="rate limit exceeded")

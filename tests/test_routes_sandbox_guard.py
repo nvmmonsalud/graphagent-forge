@@ -118,3 +118,20 @@ async def test_only_one_sandbox_batch_runs_at_a_time(app, client) -> None:
     assert (await first).status_code == 200
     assert not routes_module._sandbox_batch_lock.locked()
     assert (await client.post("/api/graph/verify/sweep")).status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("203.0.113.9", "203.0.113.9"),
+        ("2001:db8:1:2:aaaa::1", "2001:db8:1:2::/64"),
+        ("2001:db8:1:2:ffff::9", "2001:db8:1:2::/64"),
+        ("::ffff:203.0.113.9", "203.0.113.9"),
+        ("testclient", "testclient"),
+    ],
+)
+def test_rate_limit_key_groups_ipv6_by_64(host, expected) -> None:
+    from types import SimpleNamespace
+
+    request = SimpleNamespace(client=SimpleNamespace(host=host))
+    assert routes_module._client_key(request) == expected

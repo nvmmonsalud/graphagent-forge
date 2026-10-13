@@ -103,3 +103,62 @@ async def test_no_nodes_extracted_reports_failure_without_write() -> None:
 
     assert result["success"] is False
     neo4j.write_graph.assert_not_awaited()
+
+
+# ------------------------------------------------------------------
+# sanitize_graph — LLM output is untrusted input
+# ------------------------------------------------------------------
+def test_sanitize_drops_malformed_items_and_clips_strings() -> None:
+    from src.ingestion import graph_writer
+
+    data = {
+        "nodes": [
+            "not a dict",
+            {"id": ["list"], "label": "Bad id"},
+            {"id": "a", "label": {"nested": 1}},
+            {"id": "a", "label": "A" * 500, "type": 7, "properties": {"summary": "s" * 5000}},
+            {"id": "a", "label": "Duplicate id"},
+            {"id": 2, "label": "Numeric id", "properties": "not a dict"},
+        ],
+        "edges": [
+            None,
+            {"source": "a", "target": None},
+            {"source": "a", "target": 2, "relationship": ["X"], "properties": {"context": 9}},
+        ],
+    }
+
+    out, dropped_nodes, dropped_edges = graph_writer.sanitize_graph(data)
+
+    assert [n["id"] for n in out["nodes"]] == ["a", "2"]
+    first = out["nodes"][0]
+    assert len(first["label"]) == graph_writer.MAX_LABEL_LEN
+    assert first["type"] == "7"
+    assert len(first["properties"]["summary"]) == graph_writer.MAX_SUMMARY_LEN
+    assert out["nodes"][1]["properties"] == {"summary": ""}
+    assert out["edges"] == [
+        {"source": "a", "target": "2", "relationship": "RELATES_TO",
+         "properties": {"context": "9"}},
+    ]
+    assert (dropped_nodes, dropped_edges) == (4, 2)
+
+
+def test_sanitize_caps_node_and_edge_counts() -> None:
+    from src.ingestion import graph_writer
+
+    n = graph_writer.MAX_NODES + 50
+    data = {
+        "nodes": [{"id": f"n{i}", "label": f"N{i}"} for i in range(n)],
+        "edges": [{"source": "n0", "target": "n1"}] * (graph_writer.MAX_EDGES + 5),
+    }
+    out, dropped_nodes, dropped_edges = graph_writer.sanitize_graph(data)
+    assert len(out["nodes"]) == graph_writer.MAX_NODES
+    assert len(out["edges"]) == graph_writer.MAX_EDGES
+    assert (dropped_nodes, dropped_edges) == (50, 5)
+
+
+def test_sanitize_handles_non_list_payloads() -> None:
+    from src.ingestion import graph_writer
+
+    out, dropped_nodes, dropped_edges = graph_writer.sanitize_graph({"nodes": "x", "edges": 5})
+    assert out["nodes"] == [] and out["edges"] == []
+    assert (dropped_nodes, dropped_edges) == (0, 0)

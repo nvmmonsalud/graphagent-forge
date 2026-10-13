@@ -282,3 +282,9 @@ async def test_extract_from_url_unresolvable_host_is_generic(monkeypatch) -> Non
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
     result = await extractor.extract_from_url("http://missing.internal/")
     assert result["error"] == extractor.ERR_UNRESOLVABLE
+
+
+def test_extract_from_text_truncates_like_url_and_file_ingest() -> None:
+    result = extractor.extract_from_text("x" * (extractor.MAX_CHARS + 10), "big")
+    assert result["content"] == "x" * extractor.MAX_CHARS + extractor.TRUNCATION_SUFFIX
+    assert result["char_count"] == len(result["content"])

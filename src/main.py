@@ -259,12 +259,73 @@ class _BodyTooLarge(HTTPException):
         super().__init__(status_code=413, detail="request body too large")
 
 
+#: Interactive API docs publish the full route surface and pull Swagger/ReDoc
+#: assets from a CDN, so they're opt-in: ENABLE_API_DOCS=1.
+API_DOCS_ENABLED = os.getenv("ENABLE_API_DOCS", "0") == "1"
+
 app = FastAPI(
     title="GraphAgent Forge",
     description="Turn scattered information into connected intelligence.",
     version="0.1.0",
     lifespan=lifespan,
+    docs_url="/docs" if API_DOCS_ENABLED else None,
+    redoc_url="/redoc" if API_DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if API_DOCS_ENABLED else None,
 )
+
+# The UI is one file with inline <script>/<style> and inline onclick handlers,
+# so 'unsafe-inline' is unavoidable for now. Everything else is pinned: no
+# third-party scripts (D3 is vendored), fonts only from Google Fonts, network
+# only to this origin, and the page can't be framed (clickjacking on "Clear graph").
+CONTENT_SECURITY_POLICY = "; ".join([
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com",
+    "img-src 'self' data:",
+    "connect-src 'self' ws: wss:",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+])
+SECURITY_HEADERS = [
+    (b"x-content-type-options", b"nosniff"),
+    (b"x-frame-options", b"DENY"),
+    (b"referrer-policy", b"no-referrer"),
+    (b"content-security-policy", CONTENT_SECURITY_POLICY.encode()),
+]
+_DOCS_PATHS = ("/docs", "/redoc")
+
+
+class SecurityHeadersMiddleware:
+    """Add SECURITY_HEADERS to every HTTP response.
+
+    The CSP is skipped on the opt-in docs pages, which load Swagger/ReDoc from
+    a CDN; the other headers still apply there.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        skip_csp = scope.get("path", "").startswith(_DOCS_PATHS)
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                present = {name.lower() for name, _ in headers}
+                for name, value in SECURITY_HEADERS:
+                    if name in present or (skip_csp and name == b"content-security-policy"):
+                        continue
+                    headers.append((name, value))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
 
 ALLOWED_ORIGINS = [
     origin.strip()
@@ -281,6 +342,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.add_middleware(SecurityHeadersMiddleware)
 # Added last so it is the outermost middleware and runs before anything reads the body.
 app.add_middleware(BodySizeLimitMiddleware)
 

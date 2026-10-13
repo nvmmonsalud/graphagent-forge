@@ -64,3 +64,26 @@ def test_websocket_refuses_when_full(ws_client, monkeypatch) -> None:
         with ws_client.websocket_connect("/ws/graph") as ws:
             ws.receive_text()
     assert exc.value.code == 1013
+
+
+@pytest.mark.asyncio
+async def test_security_headers_on_every_http_response() -> None:
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        for path in ("/", "/api/health"):
+            resp = await client.get(path)
+            assert resp.headers["x-content-type-options"] == "nosniff"
+            assert resp.headers["x-frame-options"] == "DENY"
+            assert resp.headers["referrer-policy"] == "no-referrer"
+            csp = resp.headers["content-security-policy"]
+            assert "frame-ancestors 'none'" in csp
+            assert "default-src 'self'" in csp
+
+
+@pytest.mark.asyncio
+async def test_api_docs_disabled_by_default() -> None:
+    assert main_module.API_DOCS_ENABLED is False
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        for path in ("/docs", "/redoc", "/openapi.json"):
+            assert (await client.get(path)).status_code == 404
