@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
+from unittest.mock import AsyncMock
 
+import httpcore
 import httpx
 import pytest
 
@@ -208,3 +210,162 @@ async def test_too_many_redirects_blocked(mock_client) -> None:
     result = await extractor.extract_from_url("http://8.8.8.8/loop")
     assert result["error"] is not None
     assert "redirects" in result["error"]
+
+
+# ------------------------------------------------------------------
+# DNS rebinding: the connect-time backend re-resolves and pins the IP
+# ------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_guarded_backend_blocks_rebound_private_address(monkeypatch) -> None:
+    """Guard saw a public IP; the connect-time lookup returns loopback."""
+    loop = asyncio.get_running_loop()
+
+    async def fake_getaddrinfo(host, port, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0))]
+
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    inner = AsyncMock()
+    backend = extractor._GuardedNetworkBackend(inner)
+    with pytest.raises(httpcore.ConnectError, match="private/reserved"):
+        await backend.connect_tcp("rebind.example", 80)
+    inner.connect_tcp.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_guarded_backend_connects_to_the_validated_ip(monkeypatch) -> None:
+    loop = asyncio.get_running_loop()
+
+    async def fake_getaddrinfo(host, port, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.215.14", 0))]
+
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    inner = AsyncMock()
+    backend = extractor._GuardedNetworkBackend(inner)
+    await backend.connect_tcp("example.com", 443, timeout=5)
+    assert inner.connect_tcp.await_args.args[:2] == ("93.184.215.14", 443)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [httpcore.ConnectError, httpcore.ConnectTimeout])
+async def test_guarded_backend_falls_back_to_next_validated_address(monkeypatch, failure) -> None:
+    resolver = AsyncMock(return_value=(
+        [ipaddress.ip_address("2606:4700:4700::1111"), ipaddress.ip_address("1.1.1.1")],
+        None,
+    ))
+    monkeypatch.setattr(extractor, "_resolve_public", resolver)
+    stream = object()
+    inner = AsyncMock()
+    inner.connect_tcp.side_effect = [failure("IPv6 unavailable"), stream]
+    backend = extractor._GuardedNetworkBackend(inner)
+    options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+
+    result = await backend.connect_tcp(
+        "example.com", 443, timeout=5, local_address="0.0.0.0", socket_options=options,
+    )
+
+    assert result is stream
+    resolver.assert_awaited_once_with("example.com")
+    calls = inner.connect_tcp.await_args_list
+    assert [call.args for call in calls] == [
+        ("2606:4700:4700::1111", 443), ("1.1.1.1", 443),
+    ]
+    assert 0 < calls[0].kwargs["timeout"] <= 2.5
+    assert 0 < calls[1].kwargs["timeout"] < 5
+    for call in calls:
+        assert call.kwargs["local_address"] == "0.0.0.0"
+        assert call.kwargs["socket_options"] is options
+
+
+@pytest.mark.asyncio
+async def test_guarded_backend_propagates_last_connection_failure(monkeypatch) -> None:
+    monkeypatch.setattr(extractor, "_resolve_public", AsyncMock(return_value=(
+        [ipaddress.ip_address("8.8.8.8"), ipaddress.ip_address("1.1.1.1")], None,
+    )))
+    inner = AsyncMock()
+    last_error = httpcore.ConnectTimeout("last address timed out")
+    inner.connect_tcp.side_effect = [httpcore.ConnectError("unreachable"), last_error]
+    backend = extractor._GuardedNetworkBackend(inner)
+
+    with pytest.raises(httpcore.ConnectTimeout) as caught:
+        await backend.connect_tcp("example.com", 443)
+
+    assert caught.value is last_error
+    assert inner.connect_tcp.await_count == 2
+    assert all(call.kwargs["timeout"] is None for call in inner.connect_tcp.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_guarded_backend_timeout_includes_dns_resolution(monkeypatch) -> None:
+    async def stalled_resolution(host):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(extractor, "_resolve_public", stalled_resolution)
+    inner = AsyncMock()
+    backend = extractor._GuardedNetworkBackend(inner)
+    with pytest.raises(httpcore.ConnectTimeout):
+        await backend.connect_tcp("example.com", 443, timeout=0.01)
+    inner.connect_tcp.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_guarded_backend_enforces_timeout_across_connection_attempts(monkeypatch) -> None:
+    monkeypatch.setattr(extractor, "_resolve_public", AsyncMock(return_value=(
+        [ipaddress.ip_address("8.8.8.8"), ipaddress.ip_address("1.1.1.1")], None,
+    )))
+
+    async def connect(host, port, **kwargs):
+        if host == "8.8.8.8":
+            raise httpcore.ConnectError("unreachable")
+        await asyncio.Event().wait()
+
+    inner = AsyncMock()
+    inner.connect_tcp.side_effect = connect
+    backend = extractor._GuardedNetworkBackend(inner)
+    with pytest.raises(httpcore.ConnectTimeout):
+        await backend.connect_tcp("example.com", 443, timeout=0.01)
+    assert inner.connect_tcp.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_shared_client_uses_guarded_backend_and_ignores_proxy_env(monkeypatch) -> None:
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setattr(extractor, "_client", None)
+    client = extractor._get_client()
+    try:
+        assert client.trust_env is False
+        pool = client._transport._pool
+        assert isinstance(pool._network_backend, extractor._GuardedNetworkBackend)
+        assert not client._mounts  # no proxy transport picked up from the env
+    finally:
+        await extractor.aclose_client()
+
+
+@pytest.mark.asyncio
+async def test_extract_from_url_never_leaks_resolved_internal_ip(monkeypatch) -> None:
+    loop = asyncio.get_running_loop()
+
+    async def fake_getaddrinfo(host, port, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.3.7", 0))]
+
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    result = await extractor.extract_from_url("http://db.internal/")
+    assert result["error"] == extractor.ERR_DEST_BLOCKED
+    assert "10.0.3.7" not in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_extract_from_url_unresolvable_host_is_generic(monkeypatch) -> None:
+    loop = asyncio.get_running_loop()
+
+    async def fake_getaddrinfo(host, port, **kwargs):
+        raise socket.gaierror(8, "nodename nor servname provided")
+
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    result = await extractor.extract_from_url("http://missing.internal/")
+    assert result["error"] == extractor.ERR_UNRESOLVABLE
+
+
+def test_extract_from_text_truncates_like_url_and_file_ingest() -> None:
+    result = extractor.extract_from_text("x" * (extractor.MAX_CHARS + 10), "big")
+    assert result["content"] == "x" * extractor.MAX_CHARS + extractor.TRUNCATION_SUFFIX
+    assert result["char_count"] == len(result["content"])

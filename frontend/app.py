@@ -5,6 +5,18 @@ import httpx
 import json
 
 API_BASE = os.getenv("GRAPHAGENT_API", "http://localhost:8000") + "/api"
+# Matches the server's API_KEY when it is set; sent on ingest/ask calls.
+HEADERS = {"X-API-Key": k} if (k := os.getenv("GRAPHAGENT_API_KEY")) else {}
+
+
+def md_escape(value) -> str:
+    """Backslash-escape markdown so scraped/LLM text can't inject links or images.
+
+    Used where Streamlit only takes markdown (expander labels, captions); free
+    text goes through st.text, which never renders markdown.
+    """
+    return "".join("\\" + c if c in "\\`*_{}[]()<>#+-.!|~" else c for c in str(value))
+
 
 st.set_page_config(
     page_title="GraphAgent Forge",
@@ -31,7 +43,7 @@ with st.sidebar:
         st.metric("Edges", stats.get("edges", 0))
         types = stats.get("entity_types", [])
         if types:
-            st.caption(f"Entity types: {', '.join(types[:8])}")
+            st.caption(f"Entity types: {md_escape(', '.join(types[:8]))}")
     except Exception:
         st.info("Start the API server to see graph stats")
 
@@ -65,6 +77,7 @@ with tab_ingest:
                             f"{API_BASE}/ingest/url?wait=true",
                             json={"url": url},
                             timeout=120,
+                            headers=HEADERS,
                         ).json()
 
                         if result.get("success"):
@@ -96,6 +109,7 @@ with tab_ingest:
                             f"{API_BASE}/ingest/text?wait=true",
                             json={"text": text, "source": source},
                             timeout=120,
+                            headers=HEADERS,
                         ).json()
 
                         if result.get("success"):
@@ -122,6 +136,7 @@ with tab_ingest:
                             files={"file": (up.name, up.getvalue(), up_type)},
                             data={"source": source} if source else None,
                             timeout=120,
+                            headers=HEADERS,
                         ).json()
 
                         if result.get("success"):
@@ -156,17 +171,24 @@ with tab_query:
                         f"{API_BASE}/ask",
                         json={"question": question},
                         timeout=120,
+                        headers=HEADERS,
                     ).json()
 
                     # Answer
                     st.subheader("📝 Answer")
-                    st.write(result.get("answer", "No answer generated"))
+                    if result.get("status") == "llm_unavailable":
+                        st.warning(
+                            "LLM unavailable (KIMI_API_KEY missing or the request failed); "
+                            "no answer generated."
+                        )
+                    else:
+                        st.text(result.get("answer", "No answer generated"))
 
                     # Context nodes
                     nodes = result.get("context_nodes", [])
                     if nodes:
                         st.subheader("🔗 Context Entities")
-                        st.write(" → ".join(nodes))
+                        st.text(" → ".join(nodes))
 
                     # Sources
                     sources = result.get("sources", [])
@@ -201,9 +223,10 @@ with tab_search:
                 if results:
                     st.write(f"Found {len(results)} entities:")
                     for entity in results:
-                        with st.expander(f"**{entity['label']}** ({entity['type']})"):
-                            st.write(entity.get("summary", "No summary"))
-                            st.caption(f"ID: {entity['id']}")
+                        label = md_escape(entity["label"])
+                        with st.expander(f"**{label}** ({md_escape(entity['type'])})"):
+                            st.text(entity.get("summary", "No summary"))
+                            st.caption(f"ID: {md_escape(entity['id'])}")
                 else:
                     st.info("No matching entities found. Try ingesting some data first!")
 

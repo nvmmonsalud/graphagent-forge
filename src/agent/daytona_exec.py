@@ -69,6 +69,49 @@ def _verify_error_literal(exc: BaseException | None) -> str:
     return _error_literal(exc, VERIFY_ERROR_UNAVAILABLE, VERIFY_ERROR_TIMEOUT)
 
 
+async def _finish_task(task: asyncio.Task) -> bool:
+    """Wait through repeated caller cancellation; report it after ownership is safe."""
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break  # retrieve below, preserving an earlier caller cancellation
+    # Retrieve failures even if the task completed before entering the loop.
+    try:
+        task.result()
+    except Exception:
+        if cancelled:
+            log.exception("Resource cleanup failed during cancellation")
+            raise asyncio.CancelledError from None
+        raise
+    return cancelled
+
+
+async def _delete_sandbox(sandbox: Any) -> None:
+    """Finish deletion before propagating cancellation to the caller."""
+    cancelled = await _finish_task(asyncio.create_task(sandbox.delete()))
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+async def _acquire_sandbox(operation: Awaitable, *, delete_on_cancel: bool = True) -> Any:
+    """Retain a late SDK result so cancellation cannot orphan a sandbox."""
+    task = asyncio.ensure_future(operation)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await _finish_task(task)
+            if delete_on_cancel:
+                await _delete_sandbox(task.result())
+        except Exception:
+            log.exception("Sandbox acquisition/cleanup failed during cancellation")
+        raise
+
+
 # Daytona SDK import (graceful fallback if not installed)
 try:
     from daytona import AsyncDaytona, DaytonaConfig
@@ -122,6 +165,18 @@ class DaytonaExecutor:
             _MIN_FANOUT_CONCURRENCY, min(fanout_budget, _MAX_FANOUT_CONCURRENCY)
         )
 
+    #: Caps concurrent local-fallback subprocesses process-wide, so parallel
+    #: verify/analytics/fan-out calls without Daytona can't fork unbounded
+    #: CPU-bound interpreters. Created lazily inside the running event loop.
+    _LOCAL_MAX_PROCS: ClassVar[int] = max(2, min(os.cpu_count() or 2, 8))
+    _local_semaphore: ClassVar[asyncio.Semaphore | None] = None
+
+    @classmethod
+    def _local_gate(cls) -> asyncio.Semaphore:
+        if cls._local_semaphore is None:
+            cls._local_semaphore = asyncio.Semaphore(cls._LOCAL_MAX_PROCS)
+        return cls._local_semaphore
+
     # Map language names to actual shell commands
     _LANG_COMMANDS: ClassVar[dict[str, str]] = {
         "python": "python3",
@@ -139,7 +194,7 @@ class DaytonaExecutor:
 
         sandbox = None
         try:
-            sandbox = await self.client.create()
+            sandbox = await _acquire_sandbox(self.client.create())
             response = await sandbox.process.code_run(code)
 
             return {
@@ -154,7 +209,7 @@ class DaytonaExecutor:
         finally:
             if sandbox is not None:
                 try:
-                    await sandbox.delete()
+                    await _delete_sandbox(sandbox)
                     log.info("Sandbox %s deleted", sandbox.id)
                 except Exception as e:
                     log.warning("Failed to delete sandbox %s: %s", sandbox.id, e)
@@ -168,7 +223,9 @@ class DaytonaExecutor:
 
         sandbox = None
         try:
-            sandbox = await self.client.get(sandbox_id)
+            sandbox = await _acquire_sandbox(
+                self.client.get(sandbox_id), delete_on_cancel=delete
+            )
             response = await sandbox.process.code_run(code)
             return {
                 "success": True,
@@ -182,7 +239,7 @@ class DaytonaExecutor:
         finally:
             if delete and sandbox is not None:
                 try:
-                    await sandbox.delete()
+                    await _delete_sandbox(sandbox)
                     log.info("Sandbox %s deleted", sandbox_id)
                 except Exception as e:
                     log.warning("Failed to delete sandbox %s: %s", sandbox_id, e)
@@ -200,13 +257,31 @@ class DaytonaExecutor:
         """
         cmd = self._LANG_COMMANDS.get(language.lower(), "python3")
 
+        async with self._local_gate():
+            return await self._local_exec(cmd, code, stdin_data)
+
+    async def _local_exec(
+        self, cmd: str, code: str, stdin_data: bytes | None
+    ) -> dict[str, Any]:
+        proc = None
+        execution_cancelled = False
+        creation = asyncio.create_task(asyncio.create_subprocess_exec(
+            cmd, "-c", code,
+            stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        ))
         try:
-            proc = await asyncio.create_subprocess_exec(
-                cmd, "-c", code,
-                stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
+            try:
+                # Shield acquisition so cancellation cannot lose a newly created child.
+                proc = await asyncio.shield(creation)
+            except asyncio.CancelledError:
+                try:
+                    await _finish_task(creation)
+                    proc = creation.result()
+                except Exception:
+                    log.exception("Local subprocess creation failed during cancellation")
+                raise
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(input=stdin_data), timeout=30
             )
@@ -217,14 +292,37 @@ class DaytonaExecutor:
                 "error": stderr.decode() if stderr else None,
                 "method": "local",
             }
+        except asyncio.CancelledError:
+            execution_cancelled = True
+            raise
         except TimeoutError:
-            try:
-                proc.kill()
-            except Exception:
-                pass
             return {"success": False, "error": "Execution timed out (30s)", "method": "local"}
         except Exception as e:
             return {"success": False, "error": str(e), "method": "local"}
+        finally:
+            if proc is not None:
+                # The caller holds the local semaphore until this finishes. Draining
+                # pipes as well as waiting avoids a full-pipe transport deadlock.
+                async def reap() -> None:
+                    if proc.returncode is None:
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass  # exited between checking returncode and kill
+                    try:
+                        await proc.communicate()
+                    finally:
+                        await proc.wait()
+
+                try:
+                    cancelled = await _finish_task(asyncio.create_task(reap()))
+                except Exception as exc:
+                    log.exception("Local subprocess cleanup failed")
+                    if execution_cancelled:
+                        raise asyncio.CancelledError from None
+                    return {"success": False, "error": str(exc), "method": "local"}
+                if cancelled:
+                    raise asyncio.CancelledError
 
     async def create_persistent_sandbox(self, name: str) -> dict[str, Any]:
         """Create a named sandbox that persists across calls."""
@@ -232,7 +330,7 @@ class DaytonaExecutor:
             return {"sandbox_id": f"local-{name}", "method": "local"}
 
         try:
-            sandbox = await self.client.create()
+            sandbox = await _acquire_sandbox(self.client.create())
             return {"sandbox_id": sandbox.id, "method": "daytona"}
         except Exception as e:
             log.error("Failed to create persistent sandbox: %s", e)
@@ -371,9 +469,10 @@ print(json.dumps(result))
             )
             last_error: BaseException | None = None
             for attempt in range(2):
+                sandbox = None
                 try:
                     boot_started = time.perf_counter()
-                    sandbox = await self.client.create()
+                    sandbox = await _acquire_sandbox(self.client.create())
                     boot_ms = _elapsed_ms(boot_started)
                     sandbox_id = sandbox.id
                     response = await sandbox.process.code_run(script)
@@ -391,13 +490,13 @@ print(json.dumps(result))
                         "%s attempt %d failed: %s", label.capitalize(), attempt + 1,
                         exc, exc_info=True,
                     )
-                    if sandbox_id:
+                finally:
+                    if sandbox is not None:
                         try:
-                            sandbox = await self.client.get(sandbox_id)
-                            await sandbox.delete()
+                            await _delete_sandbox(sandbox)
                         except Exception:
-                            pass
-                        sandbox_id = None
+                            log.warning("Could not delete sandbox %s", sandbox_id, exc_info=True)
+                    sandbox_id = None
 
             log.error("Daytona %s failed after retries", label, exc_info=last_error)
             return {
@@ -415,16 +514,6 @@ print(json.dumps(result))
                 "method": method,
                 "duration_ms": _elapsed_ms(started),
             }
-
-        finally:
-            # Always clean up the sandbox
-            if sandbox_id and self.client:
-                try:
-                    sandbox = await self.client.get(sandbox_id)
-                    await sandbox.delete()
-                    log.info("%s sandbox %s deleted", label.capitalize(), sandbox_id)
-                except Exception as cleanup_err:
-                    log.warning("Could not delete sandbox %s: %s", sandbox_id, cleanup_err)
 
     async def verify_graph(self, graph_data: dict[str, Any]) -> dict[str, Any]:
         """Run graph-integrity validation inside a Daytona sandbox.

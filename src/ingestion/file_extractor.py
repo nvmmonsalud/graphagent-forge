@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -58,6 +60,20 @@ ERR_ENCRYPTED = "Encrypted or password-protected PDF — cannot extract text"
 ERR_PDF_PARSE = "Could not parse PDF (corrupt or unsupported file)"
 ERR_PDF_NO_TEXT = "No extractable text — scanned/image-only PDF? (OCR is not supported)"
 ERR_NO_TEXT = "No extractable text in file"
+ERR_PDF_TOO_MANY_PAGES = "Blocked: PDF has too many pages (max {max_pages})"
+ERR_PDF_TIMEOUT = "PDF took too long to parse"
+
+# PDF parsing runs in a separate, resource-limited child process: pypdf on a
+# hostile file (huge page trees, decompression bombs, costly content streams)
+# can burn CPU and memory, and a worker THREAD can't be cancelled when the job
+# times out. A child process can be killed.
+MAX_PDF_PAGES = 300
+PDF_PARSE_TIMEOUT = 30.0  # wall clock, seconds
+PDF_PARSE_CPU_SECONDS = 20
+PDF_PARSE_MAX_MEMORY = 1024 * 1024 * 1024  # 1 GiB address space (Linux only)
+PDF_PARSE_CONCURRENCY = 2
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_pdf_gate: asyncio.Semaphore | None = None
 
 
 def _err_unsupported_ext(ext: str) -> str:
@@ -121,6 +137,8 @@ def _parse_pdf(data: bytes) -> tuple[str, dict[str, Any]]:
         raise _ParseError(ERR_ENCRYPTED)
 
     pages = len(reader.pages)
+    if pages > MAX_PDF_PAGES:
+        raise _ParseError(ERR_PDF_TOO_MANY_PAGES.format(max_pages=MAX_PDF_PAGES), pages=pages)
     parts: list[str] = []
     total = 0
     for page in reader.pages:
@@ -251,6 +269,83 @@ def _run_parse(data: bytes, ext: str) -> tuple[str, dict[str, Any]]:
     return _clean_text(raw_text), extras
 
 
+def _limit_child_resources() -> None:  # pragma: no cover - runs in the child
+    """Cap the PDF child's CPU seconds and (where supported) memory.
+
+    Called first thing inside the child rather than as a `preexec_fn`, which
+    is unsafe in a multi-threaded parent (the job workers use threads)."""
+    if os.name != "posix":
+        return
+    import resource
+
+    resource.setrlimit(resource.RLIMIT_CPU, (PDF_PARSE_CPU_SECONDS, PDF_PARSE_CPU_SECONDS))
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (PDF_PARSE_MAX_MEMORY, PDF_PARSE_MAX_MEMORY))
+    except (ValueError, OSError):
+        pass  # macOS doesn't enforce RLIMIT_AS; the CPU cap and timeout still apply
+
+
+def _pdf_child_main() -> None:  # pragma: no cover - runs in the child
+    """Child entry point: PDF bytes on stdin, one JSON result on stdout."""
+    _limit_child_resources()
+    data = sys.stdin.buffer.read()
+    try:
+        text, extras = _run_parse(data, ".pdf")
+        out = {"text": text, "extras": extras}
+    except _ParseError as e:
+        out = {"error": e.message, "extras": e.extras}
+    sys.stdout.write(json.dumps(out))
+
+
+async def _run_pdf_isolated(data: bytes) -> tuple[str, dict[str, Any]]:
+    """Parse a PDF in a killable child process. Raises _ParseError on failure."""
+    if not HAS_PYPDF:
+        raise _ParseError(ERR_NO_PYPDF)
+
+    global _pdf_gate
+    if _pdf_gate is None:
+        _pdf_gate = asyncio.Semaphore(PDF_PARSE_CONCURRENCY)
+
+    code = (
+        f"import sys; sys.path.insert(0, {_REPO_ROOT!r}); "
+        "from src.ingestion.file_extractor import _pdf_child_main; _pdf_child_main()"
+    )
+    async with _pdf_gate:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", code,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input=data), timeout=PDF_PARSE_TIMEOUT
+            )
+        except BaseException:
+            # Timeout, or the ingest job itself was cancelled: never leave the
+            # parser running behind us.
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+            raise
+
+    if proc.returncode != 0:
+        # Killed by RLIMIT_CPU (SIGXCPU), out of memory, or a pypdf crash.
+        log.error(
+            "PDF child exited with %s: %s",
+            proc.returncode,
+            stderr.decode(errors="replace")[-2000:],
+        )
+        raise RuntimeError(f"PDF parser exited with status {proc.returncode}")
+    result = json.loads(stdout)
+    if "error" in result:
+        raise _ParseError(result["error"], **(result.get("extras") or {}))
+    return result["text"], result["extras"]
+
+
 async def extract_from_file(
     data: bytes,
     filename: str,
@@ -284,10 +379,17 @@ async def extract_from_file(
         log.warning("Rejected upload %r: %s", name, error)
         return _file_envelope(title=title, filename=name, error=error)
 
-    # ONE hop off the event loop wrapping ALL CPU work (decode/clean/page loop),
-    # exactly like `await asyncio.to_thread(_parse_html, html)` in extractor.py.
+    # ONE hop off the event loop wrapping ALL CPU work (decode/clean/page loop).
+    # Text formats use a worker thread, like `_parse_html` in extractor.py; PDFs
+    # go to a killable, resource-limited child process (see _run_pdf_isolated).
     try:
-        text, extras = await asyncio.to_thread(_run_parse, data, ext)
+        if ext == ".pdf":
+            text, extras = await _run_pdf_isolated(data)
+        else:
+            text, extras = await asyncio.to_thread(_run_parse, data, ext)
+    except TimeoutError:
+        log.warning("PDF parse of %r timed out after %ss", name, PDF_PARSE_TIMEOUT)
+        return _file_envelope(title=title, filename=name, error=ERR_PDF_TIMEOUT, fmt=ext)
     except _ParseError as e:
         return _file_envelope(
             title=title, filename=name, error=e.message, fmt=ext, pages=e.extras.get("pages")

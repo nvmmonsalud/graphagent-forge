@@ -1,12 +1,14 @@
 """GraphAgent Forge — Main entry point."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -51,15 +53,38 @@ FRONTEND_VENDOR = REPO_ROOT / "frontend" / "vendor"
 # ------------------------------------------------------------------
 # WebSocket broadcast manager
 # ------------------------------------------------------------------
+#: Hard cap on concurrent /ws/graph sockets; extra clients are refused with 1013.
+MAX_WS_CONNECTIONS = int(os.getenv("MAX_WS_CONNECTIONS", "100"))
+#: A client that doesn't drain its socket within this many seconds is dropped,
+#: so one stalled reader can't hold up job progress or merge broadcasts.
+WS_SEND_TIMEOUT = 2.0
+#: Bound close handshakes as well as sends when evicting an unhealthy client.
+WS_CLOSE_TIMEOUT = 2.0
+
+
 class ConnectionManager:
     """Manages active WebSocket connections for live graph updates."""
 
     def __init__(self):
         self.active_connections: list[WebSocket] = []
+        self._pending_connections = 0
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
+    def is_full(self) -> bool:
+        return len(self.active_connections) + self._pending_connections >= MAX_WS_CONNECTIONS
+
+    async def connect(self, websocket: WebSocket) -> bool:
+        # Check and reserve without yielding: concurrent handshakes must count
+        # toward capacity even while accept() is waiting on the transport.
+        if self.is_full():
+            return False
+        self._pending_connections += 1
+        try:
+            await websocket.accept()
+            self.active_connections.append(websocket)
+            return True
+        finally:
+            # Includes failed and cancelled handshakes.
+            self._pending_connections -= 1
 
     def disconnect(self, websocket: WebSocket):
         """Idempotent — safe to call from a `finally` after any failure path."""
@@ -69,14 +94,22 @@ class ConnectionManager:
     async def broadcast(self, data: dict[str, Any]):
         """Send graph update to all connected clients."""
         message = json.dumps(data)
-        disconnected = []
-        for connection in self.active_connections:
+        connections = list(self.active_connections)
+
+        async def _send(connection: WebSocket) -> None:
             try:
-                await connection.send_text(message)
+                await asyncio.wait_for(connection.send_text(message), WS_SEND_TIMEOUT)
             except Exception:
-                disconnected.append(connection)
-        for conn in disconnected:
-            self.disconnect(conn)
+                try:
+                    await asyncio.wait_for(connection.close(code=1013), WS_CLOSE_TIMEOUT)
+                except Exception:
+                    log.debug("Failed to close unhealthy WebSocket", exc_info=True)
+                finally:
+                    self.disconnect(connection)
+
+        # Concurrent with a per-socket timeout: total cost is bounded by the
+        # slowest healthy client, not the sum of every client's latency.
+        await asyncio.gather(*(_send(c) for c in connections))
 
 
 # Module-level singleton: src.agent.core lazily imports this name to broadcast
@@ -91,6 +124,12 @@ async def lifespan(app: FastAPI):
     Neo4j failures are non-fatal: the app still boots in a degraded mode where
     `/api/health` reports the outage and graph-touching routes answer 503.
     """
+    if not os.getenv("API_KEY"):
+        log.warning(
+            "API_KEY is not set: ingest, ask, delete/clear and the Daytona sandbox "
+            "routes are open to anyone who can reach this server. Keep it bound to "
+            "loopback (APP_HOST=127.0.0.1, the default) or set API_KEY."
+        )
     neo4j = Neo4jClient(
         uri=os.getenv("NEO4J_URI", "bolt://localhost:7687"),
         user=os.getenv("NEO4J_USER", "neo4j"),
@@ -151,12 +190,156 @@ async def lifespan(app: FastAPI):
             log.exception("Error while closing HTTP clients")
 
 
+#: Hard cap on any request body. The largest legitimate body is a 3MB upload
+#: plus multipart framing; /ingest/text's 200k chars stays under 1.2MB as JSON.
+MAX_REQUEST_BYTES = 4 * 1024 * 1024
+
+
+class BodySizeLimitMiddleware:
+    """Reject request bodies over MAX_REQUEST_BYTES before they're buffered.
+
+    Pydantic's `max_length` and the upload reader's cap only run after
+    Starlette has already read the whole body (or spooled the multipart parts
+    to disk), and FastAPI parses the body before the API-key dependency. So an
+    unauthenticated client could push an arbitrarily large body. A declared
+    Content-Length over the cap gets 413 immediately; chunked or lying bodies
+    are counted as they stream and aborted with 413 at the cap.
+    """
+
+    def __init__(self, app, max_bytes: int = MAX_REQUEST_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        for name, value in scope.get("headers", []):
+            if name == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = -1
+                if declared < 0 or declared > self.max_bytes:
+                    await self._reject(send)
+                    return
+                break
+
+        received = 0
+        response_started = False
+
+        async def limited_receive():
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    raise _BodyTooLarge()
+            return message
+
+        async def tracking_send(message):
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracking_send)
+        except _BodyTooLarge:
+            if not response_started:
+                await self._reject(send)
+
+    @staticmethod
+    async def _reject(send) -> None:
+        body = b'{"detail":"request body too large"}'
+        await send({
+            "type": "http.response.start",
+            "status": 413,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
+class _BodyTooLarge(HTTPException):
+    """Raised from inside `receive`. Subclassing HTTPException matters: FastAPI
+    wraps arbitrary body-read errors into a 400, but re-raises HTTPException,
+    so the app's exception handling turns this into a proper 413."""
+
+    def __init__(self) -> None:
+        super().__init__(status_code=413, detail="request body too large")
+
+
+#: Interactive API docs publish the full route surface and pull Swagger/ReDoc
+#: assets from a CDN, so they're opt-in: ENABLE_API_DOCS=1.
+API_DOCS_ENABLED = os.getenv("ENABLE_API_DOCS", "0") == "1"
+
 app = FastAPI(
     title="GraphAgent Forge",
     description="Turn scattered information into connected intelligence.",
     version="0.1.0",
     lifespan=lifespan,
+    docs_url="/docs" if API_DOCS_ENABLED else None,
+    redoc_url="/redoc" if API_DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if API_DOCS_ENABLED else None,
 )
+
+# The UI is one file with inline <script>/<style> and inline onclick handlers,
+# so 'unsafe-inline' is unavoidable for now. Everything else is pinned: no
+# third-party scripts (D3 is vendored), fonts only from Google Fonts, network
+# only to this origin, and the page can't be framed (clickjacking on "Clear graph").
+CONTENT_SECURITY_POLICY = "; ".join([
+    "default-src 'self'",
+    "script-src 'self' 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com",
+    "img-src 'self' data:",
+    "connect-src 'self' ws: wss:",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+])
+SECURITY_HEADERS = [
+    (b"x-content-type-options", b"nosniff"),
+    (b"x-frame-options", b"DENY"),
+    (b"referrer-policy", b"no-referrer"),
+    (b"content-security-policy", CONTENT_SECURITY_POLICY.encode()),
+]
+_DOCS_PATHS = ("/docs", "/redoc")
+
+
+class SecurityHeadersMiddleware:
+    """Add SECURITY_HEADERS to every HTTP response.
+
+    The CSP is skipped on the opt-in docs pages, which load Swagger/ReDoc from
+    a CDN; the other headers still apply there.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        skip_csp = scope.get("path", "").startswith(_DOCS_PATHS)
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                present = {name.lower() for name, _ in headers}
+                for name, value in SECURITY_HEADERS:
+                    if name in present or (skip_csp and name == b"content-security-policy"):
+                        continue
+                    headers.append((name, value))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
 
 ALLOWED_ORIGINS = [
     origin.strip()
@@ -173,6 +356,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.add_middleware(SecurityHeadersMiddleware)
+# Added last so it is the outermost middleware and runs before anything reads the body.
+app.add_middleware(BodySizeLimitMiddleware)
+
 app.include_router(router, prefix="/api")
 # Flattens FastAPI's list-of-dicts 422 body into a plain string so the
 # frontend's String(detail) never renders "[object Object]".
@@ -188,13 +375,34 @@ else:
     log.warning("Vendored asset directory missing: %s", FRONTEND_VENDOR)
 
 
+def _ws_origin_allowed(websocket: WebSocket) -> bool:
+    origin = websocket.headers.get("origin")
+    if not origin:
+        return True
+    if origin in ALLOWED_ORIGINS:
+        return True
+    # Same-origin is always fine (e.g. the UI opened via a LAN IP).
+    host = websocket.headers.get("host", "")
+    return bool(host) and urlparse(origin).netloc == host
+
+
 # ------------------------------------------------------------------
 # WebSocket endpoint for live graph growth
 # ------------------------------------------------------------------
 @app.websocket("/ws/graph")
 async def websocket_graph(websocket: WebSocket):
     """Push real-time graph updates to connected frontend clients."""
-    await ws_manager.connect(websocket)
+    # Browsers always send Origin on a WebSocket handshake and CORS does not
+    # apply to WebSockets, so without this any website could subscribe to job
+    # and graph broadcasts. Non-browser clients (no Origin) are allowed.
+    if not _ws_origin_allowed(websocket):
+        log.warning("Rejected /ws/graph from origin %s", websocket.headers.get("origin"))
+        await websocket.close(code=1008)
+        return
+    if not await ws_manager.connect(websocket):
+        log.warning("Rejected /ws/graph: %d connections already open", MAX_WS_CONNECTIONS)
+        await websocket.close(code=1013)
+        return
     try:
         while True:
             # Keep connection alive; client can send pings or messages
@@ -225,7 +433,7 @@ if __name__ == "__main__":
 
     uvicorn.run(
         "src.main:app",
-        host=os.getenv("APP_HOST", "0.0.0.0"),
+        host=os.getenv("APP_HOST", "127.0.0.1"),
         port=int(os.getenv("APP_PORT", "8000")),
         # Off by default: a reload restarts the process, so any in-flight
         # ingest job in the in-memory queue is lost (it never reports back).

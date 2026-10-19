@@ -1462,10 +1462,32 @@ const API = '/api';
 // ═══════════════════════════════════════
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
-async function apiFetch(url, opts) {
-  const res = await fetch(url, opts);
+// Optional shared secret (server env API_KEY). Kept in localStorage so the
+// prompt only appears once per browser; a 401 re-prompts and retries once.
+const API_KEY_STORAGE = 'graphagent_api_key';
+function storedApiKey() {
+  try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch { return ''; }
+}
+
+async function apiFetch(url, opts, retried) {
+  const reqOpts = { ...(opts || {}) };
+  const key = storedApiKey();
+  if (key) reqOpts.headers = { ...(reqOpts.headers || {}), 'X-API-Key': key };
+  const res = await fetch(url, reqOpts);
   let body = null;
   try { body = await res.json(); } catch {}
+  if (res.status === 401 && !retried) {
+    const entered = await confirmDialog({
+      title: 'API key required',
+      body: 'This server has API_KEY set. Enter it to continue; it is stored in this browser only.',
+      confirmLabel: 'Use key',
+      askSecret: 'API key (sent as X-API-Key)',
+    });
+    if (entered) {
+      try { localStorage.setItem(API_KEY_STORAGE, entered); } catch {}
+      return apiFetch(url, opts, true);
+    }
+  }
   if (!res.ok) {
     const err = new Error(detailText(body && body.detail) || res.statusText || 'Request failed');
     err.status = res.status;
@@ -1525,7 +1547,9 @@ function errorMessage(e) {
 // for every transient message — no native browser modals anywhere.
 let closeActiveDialog = null;
 
-function confirmDialog({ title, body, confirmLabel, danger, requireText } = {}) {
+// `askSecret` (a label string) turns the require-input into a password field
+// and resolves with the entered text (or null on cancel) instead of a boolean.
+function confirmDialog({ title, body, confirmLabel, danger, requireText, askSecret } = {}) {
   return new Promise(resolve => {
     const backdrop = document.getElementById('modal-backdrop');
     const titleEl = document.getElementById('modal-title');
@@ -1544,7 +1568,13 @@ function confirmDialog({ title, body, confirmLabel, danger, requireText } = {}) 
     confirmBtn.textContent = confirmLabel || 'Confirm';
     confirmBtn.classList.toggle('danger', !!danger);
 
-    if (requireText) {
+    requireInput.type = askSecret ? 'password' : 'text';
+    if (askSecret) {
+      requireWrap.style.display = 'block';
+      requireLabel.innerHTML = esc(askSecret);
+      requireInput.value = '';
+      confirmBtn.disabled = true;
+    } else if (requireText) {
       requireWrap.style.display = 'block';
       requireLabel.innerHTML = `Type <strong>${esc(requireText)}</strong> to continue`;
       requireInput.value = '';
@@ -1555,7 +1585,11 @@ function confirmDialog({ title, body, confirmLabel, danger, requireText } = {}) 
       confirmBtn.disabled = false;
     }
 
-    const onRequireInput = () => { confirmBtn.disabled = requireInput.value.trim() !== requireText; };
+    const onRequireInput = () => {
+      confirmBtn.disabled = askSecret
+        ? !requireInput.value.trim()
+        : requireInput.value.trim() !== requireText;
+    };
     const onKeydown = evt => {
       if (evt.key === 'Escape') { evt.preventDefault(); finish(false); }
       else if (evt.key === 'Enter' && !confirmBtn.disabled) { evt.preventDefault(); finish(true); }
@@ -1570,6 +1604,13 @@ function confirmDialog({ title, body, confirmLabel, danger, requireText } = {}) 
       backdrop.onmousedown = null;
       requireInput.removeEventListener('input', onRequireInput);
       document.removeEventListener('keydown', onKeydown, true);
+      if (askSecret) {
+        const entered = value ? requireInput.value.trim() : '';
+        requireInput.value = '';
+        requireInput.type = 'text';
+        resolve(entered || null);
+        return;
+      }
       resolve(value);
     }
 
@@ -1577,11 +1618,11 @@ function confirmDialog({ title, body, confirmLabel, danger, requireText } = {}) 
     confirmBtn.onclick = () => finish(true);
     cancelBtn.onclick = () => finish(false);
     backdrop.onmousedown = evt => { if (evt.target === backdrop) finish(false); };
-    if (requireText) requireInput.addEventListener('input', onRequireInput);
+    if (requireText || askSecret) requireInput.addEventListener('input', onRequireInput);
     document.addEventListener('keydown', onKeydown, true);
 
     backdrop.hidden = false;
-    (requireText ? requireInput : confirmBtn).focus();
+    (requireText || askSecret ? requireInput : confirmBtn).focus();
   });
 }
 

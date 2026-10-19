@@ -11,6 +11,92 @@ from src.ingestion.entity_parser import extract_entities
 log = logging.getLogger(__name__)
 
 
+# Bounds on what one LLM extraction may write. The model is steerable by the
+# document it reads, so its JSON is treated like any other untrusted input.
+MAX_NODES = 500
+MAX_EDGES = 1000
+MAX_ID_LEN = 100
+MAX_LABEL_LEN = 200
+MAX_TYPE_LEN = 60
+MAX_SUMMARY_LEN = 1000
+MAX_RELATIONSHIP_LEN = 60
+MAX_CONTEXT_LEN = 500
+
+
+def _clip(value: Any, limit: int) -> str | None:
+    """Return `value` as a stripped string clipped to `limit`, or None if it
+    isn't a plain string/number (lists, dicts, None, bools are rejected)."""
+    if isinstance(value, bool) or not isinstance(value, str | int | float):
+        return None
+    text = str(value).strip()
+    return text[:limit] if text else None
+
+
+def sanitize_graph(graph_data: dict) -> tuple[dict, int, int]:
+    """Coerce an LLM extraction into the shape `write_graph` expects.
+
+    Drops nodes/edges that aren't objects or lack a usable id/label/endpoint,
+    clips every string field, drops duplicate node ids, and caps the counts at
+    MAX_NODES / MAX_EDGES. A malformed item can no longer crash the Neo4j write
+    (turning a business failure into a `failed` job), and an injected document
+    can't make one ingest write an unbounded graph.
+
+    Returns ``(graph_data, dropped_nodes, dropped_edges)``.
+    """
+    raw_nodes = graph_data.get("nodes")
+    raw_edges = graph_data.get("edges")
+    raw_nodes = raw_nodes if isinstance(raw_nodes, list) else []
+    raw_edges = raw_edges if isinstance(raw_edges, list) else []
+
+    nodes: list[dict] = []
+    seen: set[str] = set()
+    for item in raw_nodes:
+        if len(nodes) >= MAX_NODES or not isinstance(item, dict):
+            continue
+        node_id = _clip(item.get("id"), MAX_ID_LEN)
+        label = _clip(item.get("label"), MAX_LABEL_LEN)
+        if not node_id or not label or node_id in seen:
+            continue
+        seen.add(node_id)
+        props = item.get("properties")
+        summary = _clip(props.get("summary"), MAX_SUMMARY_LEN) if isinstance(props, dict) else None
+        nodes.append({
+            "id": node_id,
+            "label": label,
+            "type": _clip(item.get("type"), MAX_TYPE_LEN) or "Unknown",
+            "properties": {"summary": summary or ""},
+        })
+
+    edges: list[dict] = []
+    for item in raw_edges:
+        if len(edges) >= MAX_EDGES or not isinstance(item, dict):
+            continue
+        source = _clip(item.get("source"), MAX_ID_LEN)
+        target = _clip(item.get("target"), MAX_ID_LEN)
+        if not source or not target:
+            continue
+        props = item.get("properties")
+        context = _clip(props.get("context"), MAX_CONTEXT_LEN) if isinstance(props, dict) else None
+        edges.append({
+            "source": source,
+            "target": target,
+            "relationship": _clip(item.get("relationship"), MAX_RELATIONSHIP_LEN) or "RELATES_TO",
+            "properties": {"context": context or ""},
+        })
+
+    dropped_nodes = len(raw_nodes) - len(nodes)
+    dropped_edges = len(raw_edges) - len(edges)
+    if dropped_nodes or dropped_edges:
+        log.warning(
+            "Sanitizer dropped %d node(s) and %d edge(s) from the LLM extraction",
+            dropped_nodes,
+            dropped_edges,
+        )
+    graph_data["nodes"] = nodes
+    graph_data["edges"] = edges
+    return graph_data, dropped_nodes, dropped_edges
+
+
 def prefix_and_validate(graph_data: dict, source_doc: str) -> tuple[dict, int]:
     """Apply the md5 doc-id prefix and drop edges referencing undeclared ids.
 
@@ -103,7 +189,9 @@ async def ingest_to_graph(
     # Prefix IDs with a doc hash to prevent cross-document collisions, and drop
     # edges the LLM invented endpoints for. Shared with `scripts.seed_graph` so
     # seeded ids are byte-identical to a live ingest of the same document.
+    graph_data, _dropped_nodes, invalid_edges = sanitize_graph(graph_data)
     graph_data, dropped_edges = prefix_and_validate(graph_data, source_doc)
+    dropped_edges += invalid_edges
     nodes = graph_data["nodes"]
     valid_edges = graph_data["edges"]
 

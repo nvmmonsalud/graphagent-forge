@@ -99,9 +99,9 @@ into reload; it restarts the process and loses in-flight jobs and history.
 - Keep upload size/filename/type/magic-byte checks. Optional `pypdf` and multipart
   imports must degrade safely; without multipart, omit the file route entirely.
 - Reuse route dependency groups for graph availability, optional API-key auth,
-  and per-IP rate limiting. Verification routes can spend sandbox resources even
-  though they do not mutate the graph. Return sanitized client errors and log
-  exception details server-side.
+  and per-IP rate limiting. Ask and sandbox routes also require the configured
+  API key; sandbox routes use a separate rate-limit bucket. Return sanitized
+  client errors and log exception details server-side.
 - Treat scraped, uploaded, LLM, and graph text as untrusted. Escape dynamic values
   through the UI's `esc()` helper before HTML interpolation. Preserve graph
   rendering, merge recovery, and WebSocket message dispatch when changing panels.
