@@ -40,7 +40,7 @@ def test_reader_disables_mutations_including_compute_gets():
     assert "This action requires an editor role." in HTML
     assert "[data-action=\"merge\"]" in HTML
     assert "event.stopImmediatePropagation(); applyReaderControls();" in HTML
-    assert "const readPost = ['/api/ask', '/api/graph/search', '/api/graph/path']" in HTML
+    assert "'/api/graph/path', '/api/research/compare'].includes(path)" in HTML
 
 
 def test_streamlit_auth_applies_to_reads_and_search():

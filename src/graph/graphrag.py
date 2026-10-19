@@ -26,45 +26,50 @@ class GraphRAGEngine:
         # Reuse the application client; retrieval relies on per-call metadata.
         self.nosana = nosana or NosanaClient()
 
-    async def query(self, question: str) -> dict:
+    async def query(self, question: str, source_id: str | None = None) -> dict:
         """Full GraphRAG pipeline: vector search → keyword search → traverse → reason → answer."""
         seen_ids: set[str] = set()
         candidates: list[dict] = []
+        semantic_method = "source_filter" if source_id is not None else "unavailable"
 
-        # Step 0: Vector search first (F3) — semantic similarity
-        try:
-            result = await self.nosana.get_embedding_result(question)
-            space = configured_embedding_space()
-            if (
-                result["method"] == "nosana"
-                and all(result.get(key) == value for key, value in space.items())
-                and _is_finite_embedding(result["embedding"])
-            ):
-                vec_results = await self.neo4j.vector_search(
-                    result["embedding"], limit=10,
-                    model=result["model"], version=result["version"],
-                )
-                for r in vec_results:
-                    seen_ids.add(r["id"])
-                    candidates.append(r)
-                if vec_results:
-                    log.info("Vector search returned %d candidates", len(vec_results))
-            else:
-                log.info("Skipping vector retrieval: semantic Nosana embedding unavailable")
-        except Exception as e:
-            log.warning("Vector search unavailable, falling back to keyword only: %s", e)
-
-        # Step 1: Keyword search for remaining gaps — all terms fan out in parallel
-        search_terms = self._extract_search_terms(question)
-        if search_terms:
-            term_results = await asyncio.gather(
-                *[self.neo4j.search_nodes(t, limit=8) for t in search_terms]
-            )
-            for results in term_results:
-                for r in results:
-                    if r["id"] not in seen_ids:
+        # Source-specific questions retrieve only original excerpts from that source.
+        # Avoid global entity summaries whose merged provenance can span sources.
+        if source_id is None:
+            # Step 0: Vector search first (F3) — semantic similarity
+            try:
+                result = await self.nosana.get_embedding_result(question)
+                semantic_method = result.get("method", "unavailable")
+                space = configured_embedding_space()
+                if (
+                    result["method"] == "nosana"
+                    and all(result.get(key) == value for key, value in space.items())
+                    and _is_finite_embedding(result["embedding"])
+                ):
+                    vec_results = await self.neo4j.vector_search(
+                        result["embedding"], limit=10,
+                        model=result["model"], version=result["version"],
+                    )
+                    for r in vec_results:
                         seen_ids.add(r["id"])
                         candidates.append(r)
+                    if vec_results:
+                        log.info("Vector search returned %d candidates", len(vec_results))
+                else:
+                    log.info("Skipping vector retrieval: semantic Nosana embedding unavailable")
+            except Exception as e:
+                log.warning("Vector search unavailable, falling back to keyword only: %s", e)
+
+            # Step 1: Keyword search for remaining gaps — all terms fan out in parallel
+            search_terms = self._extract_search_terms(question)
+            if search_terms:
+                term_results = await asyncio.gather(
+                    *[self.neo4j.search_nodes(t, limit=8) for t in search_terms]
+                )
+                for results in term_results:
+                    for r in results:
+                        if r["id"] not in seen_ids:
+                            seen_ids.add(r["id"])
+                            candidates.append(r)
 
         # Excerpt search must run even when there are no matching entities.
         selected = candidates[:5]
@@ -73,15 +78,28 @@ class GraphRAGEngine:
         )
         graph_evidence = [ctx for ctx in contexts if ctx.get("text")]
         labels = list(dict.fromkeys(candidate["label"] for candidate in selected))
-        chunks = bounded_evidence(await self.neo4j.search_evidence(
-            question, entity_ids=[candidate["id"] for candidate in selected], limit=6,
-        ))
+        options = {"entity_ids": [candidate["id"] for candidate in selected], "limit": 6}
+        if source_id is not None:
+            options["source_id"] = source_id
+        retrieved = await self.neo4j.search_evidence(question, **options)
+        # Defense in depth: even a regressed storage adapter cannot mix source
+        # excerpts into the provider prompt for an explicitly filtered question.
+        chunks = bounded_evidence([
+            chunk for chunk in retrieved
+            if source_id is None or chunk.get("source_id") == source_id
+        ])
+        diagnostics = dict(getattr(retrieved, "diagnostics", {}))
+        diagnostics["semantic_method"] = semantic_method
+        diagnostics["ranks"] = [
+            {"id": chunk["id"], **chunk.get("retrieval", {})} for chunk in chunks
+        ]
         source_docs = list(dict.fromkeys(
             [source for ctx in graph_evidence for source in ctx.get("source_docs", []) if source]
             + [chunk["source_id"] for chunk in chunks]
         ))
         base = {
             "context_nodes": labels, "sources": selected, "source_docs": source_docs,
+            "retrieval_diagnostics": diagnostics,
             "evidence": graph_evidence, "citations": [], "conflicts": [],
             "retrieved_evidence": [citation_metadata(chunk) for chunk in chunks],
         }

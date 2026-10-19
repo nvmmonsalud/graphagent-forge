@@ -93,8 +93,17 @@ async def test_private_lifespan_never_initializes_legacy_graph(tmp_path, monkeyp
         raise AssertionError('private mode touched legacy graph')
 
     monkeypatch.setattr(module, 'Neo4jClient', forbidden)
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    import src.security.workspaces as workspaces
+
+    runtime = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(neo4j_available=True)),
+                              shutdown=AsyncMock())
+    monkeypatch.setattr(workspaces, 'WorkspaceRuntime', lambda *args: runtime)
     app = FastAPI()
     async with module.lifespan(app):
         assert app.state.auth_mode == 'private'
         assert app.state.identity is not None
         assert app.state.workspace_runtime is not None
+        runtime.get.assert_awaited_once_with('research')

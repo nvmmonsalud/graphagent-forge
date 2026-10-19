@@ -338,6 +338,7 @@ body {
   overflow: hidden;
 }
 .ingest-card::before {
+  pointer-events: none;
   content: '';
   position: absolute;
   inset: 0;
@@ -886,6 +887,14 @@ footer a { color: var(--accent2); text-decoration: none; }
   user-select: none;
 }
 
+#research label { display:block; margin:0.8rem 0 0.3rem; font-size:0.85rem; }
+#research input, #research textarea, #question-source, #private-workspace {
+  position:relative; width:100%; background:var(--bg); color:var(--text);
+  border:1px solid var(--border); border-radius:8px; padding:0.7rem;
+}
+#private-workspace { width:auto; }
+#research textarea { min-height:90px; resize:vertical; }
+#research .result-box { overflow-wrap:anywhere; }
 /* ═══════ SOURCES / TOOLS ═══════ */
 .tools-grid {
   display: grid;
@@ -1393,6 +1402,9 @@ footer a { color: var(--accent2); text-decoration: none; }
       <input type="text" id="query-input" placeholder="Who are the sponsors and what do they provide?">
       <button class="btn" id="btn-query" onclick="doQuery()">🧠 Ask</button>
     </div>
+    <div class="input-group"><label for="question-source">Question scope</label>
+      <select id="question-source"><option value="">All sources</option></select>
+      <small>Source-scoped answers retrieve excerpts only from the selected source.</small></div>
     <div id="query-result" style="display:none"></div>
     <div id="query-history" style="display:none;margin-top:1.4rem"></div>
   </div>
@@ -1433,6 +1445,52 @@ footer a { color: var(--accent2); text-decoration: none; }
   </div>
 </section>
 
+<section class="section" id="research">
+ <div class="section-inner reveal">
+  <div class="section-label">06 — Research workspace</div><h2>Collect, revisit and compare.</h2>
+  <div class="tools-grid">
+   <div class="ingest-card"><h3>Bulk import</h3>
+    <label for="bulk-urls">URLs, one per line (up to 10)</label>
+    <textarea id="bulk-urls" placeholder="https://example.org/article"></textarea>
+    <label for="bulk-texts">Text manifest, JSON array</label>
+    <textarea id="bulk-texts" placeholder='[{"source":"notes","text":"Document text"}]'></textarea>
+    <p>Up to 10 combined items and 200,000 text characters. Each item is queued separately; queue limits may accept only part of a batch.</p>
+    <button class="btn" data-research="bulk" data-m5-write>Import batch</button>
+    <button class="mini-btn" data-research="batches">Refresh batch status</button>
+    <div id="research-batches" aria-live="polite"></div>
+   </div>
+   <div class="ingest-card"><h3>Scheduled URL refresh</h3>
+    <p>Opt in explicitly. Reuses URL safety checks; missed intervals coalesce. Version metadata reports changes, without historical text diffs. File sources require re-upload.</p>
+    <label for="refresh-url">URL</label><input id="refresh-url" type="url">
+    <label for="refresh-hours">Interval in hours (1–720)</label><input id="refresh-hours" type="number" min="1" max="720" value="24">
+    <button class="btn" data-research="refresh-create" data-m5-write>Schedule refresh</button>
+    <button class="mini-btn" data-research="refresh-list">Show schedules</button>
+    <div id="research-refreshes" aria-live="polite"></div>
+   </div>
+   <div class="ingest-card"><h3>Saved investigations</h3>
+    <label for="investigation-title">Title</label><input id="investigation-title" maxlength="200">
+    <label for="research-entities">Entity IDs to compare (one per line, up to 5)</label>
+    <textarea id="research-entities" placeholder="Copy exact entity IDs from search results"></textarea>
+    <p>Save the current question, question scope and selected IDs. Restoring a view does not re-run its question.</p>
+    <button class="btn" data-research="view-create" data-m5-write>Save new view</button>
+    <button class="mini-btn" data-research="views">Show saved views</button>
+    <button class="mini-btn" data-research="compare">Compare selected entities</button>
+    <div id="research-views"></div><div id="research-compare" aria-live="polite"></div>
+    <label for="annotation-evidence">Evidence ID</label><input id="annotation-evidence" placeholder="ev_…">
+    <label for="annotation-note">Evidence note (up to 2,000 characters)</label><textarea id="annotation-note" maxlength="2000"></textarea>
+    <button class="mini-btn" data-research="annotate" data-m5-write>Add note to restored view</button>
+    <div id="research-notes" aria-live="polite"></div>
+   </div>
+   <div class="ingest-card"><h3>Browse progressively</h3>
+    <p>Load 100 entities at a time using the current question scope. This view shows at most 500 entities and 1,000 relationships. It does not summarize unseen nodes.</p>
+    <button class="btn" id="research-browse-next" data-research="browse">Load next graph page</button>
+    <button class="mini-btn" data-research="browse-reset">Restart browsing</button>
+    <div id="research-browse" aria-live="polite"></div>
+   </div>
+  </div>
+  <div id="research-message" role="status"></div>
+ </div>
+</section>
 <div class="glow-line"></div>
 <footer>
   Built for <a href="https://luma.com/daytonatokyo">Daytona HackSprint Tokyo 2026</a> 🤙<br>
@@ -1505,7 +1563,7 @@ async function apiFetch(url, opts, retried) {
     reqOpts.headers = {...(reqOpts.headers || {}), 'X-Workspace-ID':activeWorkspace.id};
     const method = (reqOpts.method || 'GET').toUpperCase();
     const path = new URL(url, location.href).pathname;
-    const readPost = ['/api/ask', '/api/graph/search', '/api/graph/path'].includes(path);
+    const readPost = ['/api/ask', '/api/graph/search', '/api/graph/path', '/api/research/compare'].includes(path);
     if (readerMode() && ((method !== 'GET' && !(method === 'POST' && readPost)) ||
         path.startsWith('/api/graph/verify') || path === '/api/graph/analytics')) {
       throw new Error('This action requires an editor role.');
@@ -2515,7 +2573,7 @@ document.getElementById('query-result').addEventListener('click', async (event) 
   detail.textContent = 'Loading current excerpt…';
   try {
     const c = await apiFetch(API + '/evidence/' + encodeURIComponent(button.dataset.evidenceId));
-    detail.innerHTML = `<div class="result-box"><strong>${esc(c.title || c.source_id)}</strong><div>Version: ${esc(c.version)}</div><div>Normalized text offsets: ${esc(c.start)}–${esc(c.end)}</div><div>${esc(c.uri || '')}</div><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(c.text)}</pre></div>`;
+    detail.innerHTML = `<div class="result-box"><strong>${esc(c.title || c.source_id)}</strong><div>Evidence ID: ${esc(c.id)}</div><div>Version: ${esc(c.version)}</div><div>Normalized text offsets: ${esc(c.start)}–${esc(c.end)}</div><div>${esc(c.uri || '')}</div><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(c.text)}</pre></div>`;
   } catch (error) {
     detail.textContent = error.status === 404 ? 'This evidence was deleted or replaced. Re-run the question.' : errorMessage(error);
   }
@@ -2530,7 +2588,7 @@ async function doQuery() {
   result.style.display='block';
   result.innerHTML='<div class="result-box"><span class="loader"></span> Searching graph + reasoning with Kimi AI...</div>';
   try {
-    const d = await apiFetch(API+'/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});
+    const d = await apiFetch(API+'/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q, ...(document.getElementById('question-source').value ? {source_id:document.getElementById('question-source').value} : {})})});
     const ctx = contextChipsHtml(d);
     const prov = provenanceHtml(d);
     // Drive the result state off the server's `status`, NEVER off the answer text.
@@ -2548,6 +2606,7 @@ async function doQuery() {
       const answerHtml = esc(d.answer).replace(/\n/g, '<br>');
       result.innerHTML=`<div class="result-box success"><div style="white-space:pre-wrap">${answerHtml}</div>${citationsHtml(d)}${ctx}${prov}</div>`;
     }
+    if (d.retrieval_diagnostics) result.innerHTML += '<div class="result-box notice">Retrieval diagnostics (ranking signals, not confidence): ' + esc(JSON.stringify(d.retrieval_diagnostics)) + '</div>';
   } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${esc(errorMessage(e))}</div>`; }
   btn.disabled=false; btn.innerHTML='🧠 Ask';
   // History is a nice-to-have mirror of what just happened above — a failure
@@ -2567,7 +2626,7 @@ async function doSearch() {
   try {
     const d = await apiFetch(API+'/graph/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})});
     if (d && d.length) {
-      grid.innerHTML = d.map(e=>`<div class="search-card"><div class="type-badge" style="background:${tc(e.type)};color:${e.type==='Place'?'#333':'#fff'}">${esc(e.type)}</div><div class="entity-name">${esc(e.label)}</div><div class="entity-desc">${esc(e.summary||'')}</div></div>`).join('');
+      grid.innerHTML = d.map(e=>`<div class="search-card"><div class="type-badge" style="background:${tc(e.type)};color:${e.type==='Place'?'#333':'#fff'}">${esc(e.type)}</div><div class="entity-name">${esc(e.label)}</div><div class="entity-desc">${esc(e.summary||'')}</div><small>Entity ID: ${esc(e.id)}</small></div>`).join('');
     } else grid.innerHTML='<p style="color:var(--muted);grid-column:1/-1;text-align:center;padding:2rem">No matching entities found.</p>';
   } catch(e) { grid.innerHTML=`<p style="color:var(--accent3);grid-column:1/-1">❌ ${esc(errorMessage(e))}</p>`; }
   btn.disabled=false; btn.innerHTML='🔎 Search';
@@ -2922,6 +2981,11 @@ async function loadSources() {
   try {
     const d = await apiFetch(API + '/sources');
     const sources = (d && d.sources) || [];
+    const questionSource = document.getElementById('question-source');
+    const selectedQuestionSource = questionSource.value;
+    questionSource.replaceChildren(new Option('All sources', ''), ...sources.map(source =>
+      new Option(source.title || source.source_doc, source.source_doc)));
+    if (sources.some(source => source.source_doc === selectedQuestionSource)) questionSource.value = selectedQuestionSource;
     sourceTitles.clear();
     sources.forEach(s => sourceTitles.set(String(s.source_doc), s.title || s.source_doc));
     listEl.dataset.loaded = '1';
@@ -3075,7 +3139,7 @@ async function loadDuplicates() {
 // Groups are referenced BY INDEX (data-group) — node ids are never
 // serialized into the HTML.
 document.getElementById('duplicates-list')?.addEventListener('click', async (evt) => {
-  const btn = evt.target.closest('[data-action="merge"]');
+  const btn = evt.target.closest('[data-action="merge"], [data-m5-write]');
   if (!btn) return;
   const idx = parseInt(btn.dataset.group, 10);
   const group = duplicateGroups[idx];
@@ -4020,6 +4084,128 @@ document.getElementById('ingest-url-input').addEventListener('keydown', e => { i
 document.getElementById('path-from').addEventListener('keydown', e => { if(e.key==='Enter') document.getElementById('path-to').focus(); });
 document.getElementById('path-to').addEventListener('keydown', e => { if(e.key==='Enter') doFindPath(); });
 
+let researchActiveView = null;
+let researchBrowse = {cursor:null,nodes:[],edges:[],done:false};
+const researchValue = id => document.getElementById(id).value.trim();
+const researchEndpoint = '/api/research';
+const researchJSON = (url, method, body) => apiFetch(url, {method,
+  headers:{'Content-Type':'application/json'}, ...(body ? {body:JSON.stringify(body)} : {})});
+function researchEntityIDs() {
+  const ids = [...new Set(researchValue('research-entities').split(/\n/).map(s=>s.trim()).filter(Boolean))];
+  if (ids.length > 5) throw new Error('Select at most five entity IDs.');
+  return ids;
+}
+function viewPayload() {
+  return {title:researchValue('investigation-title'), query:researchValue('query-input'),
+    source_id:researchValue('question-source') || null, selected_entity_ids:researchEntityIDs(),
+    annotations:researchActiveView?.annotations?.map(({evidence_id,note})=>({evidence_id,note})) || []};
+}
+function renderResearchBatch(batch) {
+  return '<div class="result-box"><strong>Batch '+esc(batch.id)+'</strong>' +
+    (batch.items || []).map(item=>'<div>Item '+esc(Number(item.index)+1)+': '+esc(item.status)+
+      (item.reason ? ' · '+esc(item.reason) : '')+'</div>').join('') +
+    '<button class="mini-btn" data-research="batch-cancel" data-m5-write data-id="'+esc(batch.id)+'">Cancel active items</button></div>';
+}
+function renderResearchNotes(view) {
+  document.getElementById('research-notes').innerHTML = '<p>Current view: ' + esc(view.title) + '</p>' +
+    (view.annotations || []).map(note => '<div class="result-box">' + esc(note.note) +
+      '<div>' + esc(note.evidence_id) + ' · ' + esc(note.version) +
+      (note.stale ? ' · stale: excluded from answer grounding' : ' · current at last check') + '</div></div>').join('');
+}
+async function researchAction(button) {
+  const action = button.dataset.research, id = button.dataset.id;
+  if (button.hasAttribute('data-m5-write') && readerMode()) throw new Error('Editor role required.');
+  if (action === 'bulk') {
+    const urls = researchValue('bulk-urls').split(/\n/).map(s=>s.trim()).filter(Boolean);
+    const texts = researchValue('bulk-texts') ? JSON.parse(researchValue('bulk-texts')) : [];
+    if (!Array.isArray(texts) || texts.some(t=>!t || typeof t.text !== 'string' || typeof t.source !== 'string')) throw new Error('Text manifest must contain source/text objects.');
+    const commands = [...urls.map(url=>({version:1,kind:'url',url})),
+      ...texts.map(({source,text})=>({version:1,kind:'text',source,text}))];
+    if (!commands.length || commands.length > 10 || texts.reduce((n,t)=>n+t.text.length,0)>200000) throw new Error('Use 1–10 items and at most 200,000 text characters.');
+    const batch = await researchJSON(researchEndpoint+'/bulk','POST',{commands});
+    document.getElementById('research-batches').innerHTML = renderResearchBatch(batch);
+  } else if (action === 'batches' || action === 'batch-cancel') {
+    if (action === 'batch-cancel') await researchJSON(researchEndpoint+'/batches/'+encodeURIComponent(id)+'/cancel','POST');
+    const data = await apiFetch(researchEndpoint+'/batches');
+    document.getElementById('research-batches').innerHTML = (data.batches || []).map(batch =>
+      renderResearchBatch(batch)).join('') || 'No batches.';
+  } else if (action.startsWith('refresh-')) {
+    if (action === 'refresh-create') {
+      const interval_seconds = Number(researchValue('refresh-hours'))*3600;
+      if (!Number.isFinite(interval_seconds) || interval_seconds<3600 || interval_seconds>2592000) throw new Error('Use an interval from 1 to 720 hours.');
+      await researchJSON(researchEndpoint+'/refreshes','POST',{url:researchValue('refresh-url'),interval_seconds});
+      document.getElementById('refresh-url').value = '';
+    } else if (action === 'refresh-run') await researchJSON(researchEndpoint+'/refreshes/'+encodeURIComponent(id)+'/run','POST');
+    else if (action === 'refresh-delete') await researchJSON(researchEndpoint+'/refreshes/'+encodeURIComponent(id),'DELETE');
+    const data = await apiFetch(researchEndpoint+'/refreshes');
+    document.getElementById('research-refreshes').innerHTML = (data.refreshes || []).map(item =>
+      '<div class="result-box"><strong>'+esc(item.display_uri || item.source_id || item.id)+'</strong><div>Status: '+esc(item.last_status || 'scheduled')+' · next due: '+esc(item.next_due)+'</div><div>Previous version: '+esc(item.previous_version || 'none')+'</div><div>Current version: '+esc(item.current_version || 'none')+' · changed: '+esc(item.changed ?? 'not checked')+'</div><button class="mini-btn" data-research="refresh-run" data-m5-write data-id="'+esc(item.id)+'">Run now</button> <button class="mini-btn" data-research="refresh-delete" data-m5-write data-id="'+esc(item.id)+'">Delete schedule</button></div>').join('') || 'No schedules.';
+  } else if (action === 'view-create') {
+    researchActiveView = await researchJSON(researchEndpoint+'/investigations','POST',viewPayload());
+    renderResearchNotes(researchActiveView);
+    await researchAction({dataset:{research:'views'},hasAttribute:()=>false});
+  } else if (action === 'views' || action === 'view-delete') {
+    if (action === 'view-delete') {
+      await researchJSON(researchEndpoint+'/investigations/'+encodeURIComponent(id),'DELETE');
+      if (researchActiveView?.id === id) { researchActiveView = null; document.getElementById('research-notes').replaceChildren(); }
+    }
+    const data = await apiFetch(researchEndpoint+'/investigations');
+    document.getElementById('research-views').innerHTML = (data.investigations || []).map(view=>
+      '<div class="result-box">'+esc(view.title)+' <button class="mini-btn" data-research="view-restore" data-id="'+esc(view.id)+'">Restore</button> <button class="mini-btn" data-research="view-delete" data-m5-write data-id="'+esc(view.id)+'">Delete</button></div>').join('') || 'No saved views.';
+  } else if (action === 'view-restore') {
+    const view = await apiFetch(researchEndpoint+'/investigations/'+encodeURIComponent(id));
+    researchActiveView = view;
+    document.getElementById('investigation-title').value = view.title;
+    document.getElementById('query-input').value = view.query;
+    const source = document.getElementById('question-source');
+    if (view.source_id && !Array.from(source.options).some(o=>o.value===view.source_id)) source.add(new Option(sourceTitle(view.source_id),view.source_id));
+    source.value = view.source_id || '';
+    document.getElementById('research-entities').value = (view.selected_entity_ids || []).join('\n');
+    renderResearchNotes(view); resetResearchBrowse();
+  } else if (action === 'annotate') {
+    if (!researchActiveView) throw new Error('Restore a saved view before adding a note.');
+    const payload = viewPayload(); payload.revision = researchActiveView.revision;
+    payload.annotations.push({evidence_id:researchValue('annotation-evidence'),note:researchValue('annotation-note')});
+    researchActiveView = await researchJSON(researchEndpoint+'/investigations/'+encodeURIComponent(researchActiveView.id),'PUT',payload);
+    document.getElementById('annotation-note').value = ''; renderResearchNotes(researchActiveView);
+  } else if (action === 'compare') {
+    const data = await researchJSON(researchEndpoint+'/compare','POST',{entity_ids:researchEntityIDs()});
+    document.getElementById('research-compare').innerHTML = (data.contexts || []).map(context=>
+      '<div class="result-box"><strong>'+esc(context.id)+'</strong><pre style="white-space:pre-wrap">'+esc(context.text || '')+'</pre><div>Sources: '+(context.source_docs || []).map(source=>esc(sourceTitle(source))).join(', ')+'</div></div>').join('') +
+      ((data.missing_ids || []).length ? '<div class="result-box notice">Missing entity IDs: '+data.missing_ids.map(esc).join(', ')+'</div>' : '');
+  } else if (action === 'browse-reset') resetResearchBrowse();
+  else if (action === 'browse') {
+    if (researchBrowse.done) return;
+    const params = new URLSearchParams({limit:'100'});
+    if (researchBrowse.cursor) params.set('cursor',researchBrowse.cursor);
+    if (researchValue('question-source')) params.set('source_id',researchValue('question-source'));
+    const page = await apiFetch(researchEndpoint+'/browse?'+params);
+    const nodes = new Map(researchBrowse.nodes.map(node=>[node.id,node]));
+    for (const node of (page.nodes || [])) if (nodes.size<500 || nodes.has(node.id)) nodes.set(node.id,node);
+    const edges = new Map();
+    for (const edge of researchBrowse.edges.concat(page.edges || [])) {
+      const [from,to] = edgeEndpointIds(edge);
+      if (nodes.has(from) && nodes.has(to) && edges.size<1000) edges.set(JSON.stringify([from,to,edge.type,edge.source_doc]),{...edge,source:from,target:to});
+    }
+    researchBrowse = {nodes:[...nodes.values()],edges:[...edges.values()],cursor:page.next_cursor,
+      done:!page.next_cursor || nodes.size>=500};
+    renderGraph({nodes:researchBrowse.nodes.map(n=>({...n})),edges:researchBrowse.edges.map(e=>({...e}))});
+    document.getElementById('research-browse-next').disabled = researchBrowse.done;
+    document.getElementById('research-browse').textContent = researchBrowse.nodes.length+' entities displayed'+(researchBrowse.done?' · end of view or display limit':' · more available');
+  }
+}
+function resetResearchBrowse() {
+  researchBrowse = {cursor:null,nodes:[],edges:[],done:false};
+  document.getElementById('research-browse-next').disabled = false;
+  document.getElementById('research-browse').textContent = '';
+}
+document.getElementById('question-source').addEventListener('change',resetResearchBrowse);
+document.getElementById('research').addEventListener('click', async event => {
+  const button = event.target.closest('[data-research]'); if (!button || button.disabled) return;
+  try { await withButtonBusy(button,'Working…',()=>researchAction(button)); }
+  catch (error) { document.getElementById('research-message').textContent = errorMessage(error); }
+  finally { document.getElementById('research-browse-next').disabled = researchBrowse.done; applyReaderControls(); }
+});
 function clearWorkspaceView() {
   workspaceGeneration++; authReady = false;
   workspaceAbort.abort(); workspaceAbort = new AbortController();
@@ -4038,6 +4224,9 @@ function clearWorkspaceView() {
   graphData = {nodes:[],edges:[]}; currentSourceFilter = null;
   sourceTitles.clear(); queryHistoryEntries = []; fanoutRows.clear(); sweepRows.clear();
   selectedIngestFile = null; duplicateGroups = []; analyticsData = null; sweepMeta = null;
+  researchActiveView = null; researchBrowse = {cursor:null,nodes:[],edges:[],done:false};
+  document.getElementById('question-source').replaceChildren(new Option('All sources',''));
+  document.getElementById('research-browse-next').disabled = false;
   currentPathNodeIds.clear(); currentPathEdgeKeys.clear(); pathActive = false;
   setIngestButtonsBusy(null);
   document.querySelectorAll('button').forEach(button => {
@@ -4047,11 +4236,13 @@ function clearWorkspaceView() {
   document.getElementById('force-graph').replaceChildren();
   for (const id of ['sources-list','duplicates-list','query-result','query-history','ingest-result',
       'search-results','path-result','verify-result','fanout-result','fanout-list','sweep-result',
-      'sweep-chart','analytics-list','legend-bar','toast-stack']) {
+      'sweep-chart','analytics-list','legend-bar','toast-stack','research-batches','research-refreshes',
+      'research-views','research-compare','research-notes','research-browse','research-message']) {
     const el = document.getElementById(id); if (el) { el.replaceChildren(); delete el.dataset.loaded; }
   }
   for (const id of ['query-input','search-input','ingest-url-input','ingest-text-input',
-      'ingest-source','ingest-file-source','ingest-file-input','path-from','path-to']) {
+      'ingest-source','ingest-file-source','ingest-file-input','path-from','path-to','bulk-urls',
+      'bulk-texts','refresh-url','investigation-title','research-entities','annotation-evidence','annotation-note']) {
     const el = document.getElementById(id); if (el) el.value = '';
   }
   document.getElementById('ingest-file-name').textContent = 'no file selected';
@@ -4068,7 +4259,7 @@ function showPrivateLogin(message = '') {
 }
 function applyReaderControls() {
   const readOnly = readerMode();
-  const selector = '#ingest button, #ingest input, #ingest textarea, #btn-clear-graph, #btn-verify, #btn-fanout, #btn-sweep, #btn-analytics, [data-action="save"], [data-action="delete"], [data-source-delete], [data-merge], [data-action="merge"]';
+  const selector = '#ingest button, #ingest input, #ingest textarea, #btn-clear-graph, #btn-verify, #btn-fanout, #btn-sweep, #btn-analytics, [data-action="save"], [data-action="delete"], [data-source-delete], [data-merge], [data-action="merge"], [data-m5-write]';
   document.querySelectorAll(selector).forEach(el => {
     if (readOnly) { el.disabled = true; el.dataset.roleDisabled = '1'; }
     else if (el.dataset.roleDisabled) { el.disabled = false; delete el.dataset.roleDisabled; }
@@ -4123,7 +4314,7 @@ document.getElementById('private-logout').addEventListener('click', async () => 
 });
 document.addEventListener('click', event => {
   const control = event.target.closest('button, input, textarea');
-  if (readerMode() && control?.matches('#ingest *, #btn-clear-graph, #btn-verify, #btn-fanout, #btn-sweep, #btn-analytics, [data-action="save"], [data-action="delete"], [data-action="merge"]')) {
+  if (readerMode() && control?.matches('#ingest *, #btn-clear-graph, #btn-verify, #btn-fanout, #btn-sweep, #btn-analytics, [data-action="save"], [data-action="delete"], [data-action="merge"], [data-m5-write]')) {
     event.preventDefault(); event.stopImmediatePropagation(); applyReaderControls();
   }
 }, true);

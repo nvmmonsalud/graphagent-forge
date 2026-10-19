@@ -119,6 +119,19 @@ into reload; memory state is lost, while durable mode recovers bounded jobs/hist
   fencing. Never put private credentials/history in localStorage or token URLs.
 - Read docs/M4_CONTRACT.md and docs/M4_UPGRADE.md before auth/scoping changes.
 
+## Research workflow contracts
+
+- New fulltext indexes/procedure literals must be included in the workspace
+  schema allowlist. Source-specific questions filter before retrieval/provider
+  input; rankings are diagnostics, never confidence or entailment scores.
+- Research services are per-resource, initialized before HTTP work and stopped
+  before jobs/drivers. Private startup reopens enabled workspaces for schedules.
+- Keep schedule URLs private, revalidate SSRF every fetch, fence claims/completion,
+  and preserve server-added actor identity. Bulk acceptance may be partial.
+- Investigation updates use revision CAS and server-validated evidence metadata;
+  stale notes keep original provenance. Browse cursors cannot grant access.
+- See docs/M5_CONTRACT.md and docs/M5_UPGRADE.md for bounds and page-local edges.
+
 ## Security and frontend changes
 
 - Preserve URL SSRF defenses: HTTP(S) only, all DNS records validated, redirects

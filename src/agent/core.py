@@ -464,9 +464,11 @@ class GraphAgent:
             "structure": structure,
         }
 
-    async def ask(self, question: str) -> dict[str, Any]:
-        """Answer a question using GraphRAG."""
-        return await self.graphrag.query(question)
+    async def ask(self, question: str, source_id: str | None = None) -> dict[str, Any]:
+        """Answer using current evidence, optionally restricted to one source."""
+        if source_id is None:
+            return await self.graphrag.query(question)
+        return await self.graphrag.query(question, source_id=source_id)
 
     async def get_graph_stats(self) -> dict[str, Any]:
         """Get knowledge graph statistics."""

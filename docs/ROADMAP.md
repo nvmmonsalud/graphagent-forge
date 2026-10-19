@@ -181,6 +181,11 @@ the LLM. Security reviewer approval is a release requirement for private hosting
 
 ## M5 — Scalable research and discovery
 
+Delivery status: slices1–3 implemented with bounded workflows. See
+[M5_UPGRADE.md](M5_UPGRADE.md) for indexed retrieval/fallback, refresh opt-in,
+saved investigations and page-local graph browsing limits. Optional global
+synthesis remains conditional; no reranker or broad quality claim is added.
+
 Deliver independently after foundational gates:
 
 1. **Ranked hybrid retrieval:** indexed lexical search plus semantic candidates,

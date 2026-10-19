@@ -17,6 +17,7 @@ RELATIONSHIPS = {'RELATES_TO', 'HAS_CHUNK'}
 SCHEMA_NAMES = {
     'source_id', 'evidence_id', 'ingest_operation_id', 'ingest_operation_created',
     'graph_state_id', 'evidence_source_id', 'entity_norm_label', 'entity_semantic_embedding',
+    'evidence_fulltext',
 }
 ID_PATTERN = re.compile(r'[a-z0-9_-]{1,48}\Z')
 _LITERAL = re.compile(r"'(?:\\.|''|[^'\\])*'|\"(?:\\.|\"\"|[^\"\\])*\"|`[^`]*`")
@@ -100,8 +101,8 @@ def scope_query(query: str, prefix: str) -> str:
         return match.group(1) + ' ' + prefix + match.group(2)
     code = re.sub(r'\b(INDEX|CONSTRAINT)\s+(\w+)(?=\s+IF\b)', schema_name, code)
     for index, literal in enumerate(literals):
-        if literal in ("'entity_semantic_embedding'", '"entity_semantic_embedding"'):
-            literal = literal[0] + prefix + 'entity_semantic_embedding' + literal[-1]
+        if literal[1:-1] in {'entity_semantic_embedding', 'evidence_fulltext'}:
+            literal = literal[0] + prefix + literal[1:-1] + literal[-1]
         code = code.replace(f'__LITERAL_{index}__', literal)
     return code
 

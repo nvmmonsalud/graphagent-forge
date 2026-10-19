@@ -118,3 +118,15 @@ labels/types/indexes and traversal intermediates. Each workspace owns SQLite
 jobs/history and an injected broadcast manager; principal membership is rechecked
 before sends and durable command stages/chunks/publication. See M4_CONTRACT and
 M4_UPGRADE for cookie/CSRF, revocation, provider disclosure and offline purge.
+
+
+## Research and discovery (M5)
+
+ResearchJobs and InvestigationStore attach to each resource bundle via
+research_services.py. Private startup eagerly opens bounded enabled workspaces
+for unattended persisted schedules. Teardown stops schedulers before jobs/drivers.
+Neo4j evidence fulltext candidates and entity links use RRF60 with bounded
+fallback diagnostics; source-specific Ask excludes global context/provider input.
+Schedule URLs/actor data stay private, recurring fetches retain SSRF validation,
+and saved annotations retain server-validated original provenance plus stale flags.
+See M5_CONTRACT/M5_UPGRADE before changing query namespaces, caps or replay.

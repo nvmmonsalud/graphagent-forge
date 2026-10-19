@@ -34,6 +34,14 @@ _EVIDENCE_STOPWORDS = frozenset(
 )
 
 
+class EvidenceResults(list):
+    """List-compatible internal results with per-call retrieval diagnostics."""
+
+    def __init__(self, chunks=(), *, diagnostics=None):
+        super().__init__(chunks)
+        self.diagnostics = diagnostics or {}
+
+
 class Neo4jClient:
     """Async Neo4j driver wrapper."""
 
@@ -85,6 +93,17 @@ class Neo4jClient:
         await self._migrate_source_docs()
         await self._backfill_norm_labels()
         await self.init_vector_index()
+        # Synchronous index updates preserve current-source publication visibility.
+        # English stemming is deliberately evaluated on the small M5 fixture.
+        try:
+            async with self.driver.session() as session:
+                await session.run("""
+                    CREATE FULLTEXT INDEX evidence_fulltext IF NOT EXISTS
+                    FOR (c:EvidenceChunk) ON EACH [c.text]
+                    OPTIONS {indexConfig: {`fulltext.analyzer`: 'english'}}
+                    """)
+        except Exception:
+            log.warning("Evidence fulltext index unavailable; lexical fallback enabled")
         log.info("Neo4j schema initialized")
 
     async def _migrate_source_docs(self) -> None:
@@ -340,27 +359,108 @@ class Neo4jClient:
             ORDER BY c.ordinal LIMIT 12
             """, id=source_id)
 
-    async def search_evidence(self, question: str, entity_ids=None, limit: int = 6) -> list[dict]:
-        """Rank current original excerpts in Cypher; transfer only bounded top hits."""
+    async def search_evidence(self, question: str, entity_ids=None, limit: int = 6,
+                              source_id: str | None = None) -> list[dict]:
+        """Fuse bounded indexed lexical and entity-linked current excerpt ranks.
+
+        Source filtering precedes ranking and LIMIT in both candidate queries.
+        Lucene syntax is built exclusively from bounded alphanumeric terms.
+        Only bounded candidate excerpts cross the database/Python boundary.
+        """
         terms = list(dict.fromkeys(
-            term for term in re.findall(r"[^\W_]{2,}", question[:4000].lower())
+            term[:64] for term in re.findall(r"[^\W_]{2,}", question[:4000].lower())
             if term not in _EVIDENCE_STOPWORDS
-        ))[:32]
+        ))[:12]
         selected = list(dict.fromkeys(entity_ids or []))[:1000]
         limit = max(1, min(int(limit), 12))
-        return await self._read_evidence("""
+        current = """
             MATCH (s:Source)-[:HAS_CHUNK]->(c:EvidenceChunk)
             WHERE c.source_id = s.id AND c.version = s.version
               AND NOT coalesce(s._deleted, false) AND NOT coalesce(s._placeholder, false)
-            WITH s, c, reduce(score = 0, term IN $terms |
-                score + CASE WHEN toLower(c.text) CONTAINS term THEN 1 ELSE 0 END) AS lexical,
-                EXISTS { MATCH (n:Entity) WHERE n.id IN $entity_ids
-                         AND c.id IN coalesce(n.evidence_ids, []) } AS linked
-            WHERE lexical > 0 OR linked
-            WITH s, c, lexical, linked
-            ORDER BY lexical DESC, linked DESC, s.id, c.ordinal LIMIT $limit
-            RETURN c {.*, title: s.title, uri: s.uri} AS chunk
-            """, terms=terms, entity_ids=selected, limit=limit)
+              AND ($source_id IS NULL OR s.id = $source_id)
+            """
+        lexical = []
+        fallback = False
+        if terms:
+            try:
+                lexical = await self._read_evidence("""
+                    CALL db.index.fulltext.queryNodes('evidence_fulltext', $lucene)
+                    YIELD node, score
+                    WITH node AS c, score
+                    """ + current + """
+                    WITH s, c, score ORDER BY score DESC, s.id, c.ordinal LIMIT 40
+                    RETURN c {.*, title: s.title, uri: s.uri} AS chunk
+                    """, lucene=' OR '.join('"' + term + '"' for term in terms),
+                    source_id=source_id)
+            except Exception:
+                fallback = True
+                log.info("Using bounded lexical evidence fallback")
+                lexical = await self._read_evidence(current + """
+                    WITH s, c ORDER BY s.updated_at DESC, s.id, c.ordinal LIMIT 1000
+                    WITH s, c, reduce(score = 0, term IN $terms |
+                        score + CASE WHEN toLower(c.text) CONTAINS term THEN 1 ELSE 0 END) AS score
+                    WHERE score > 0
+                    WITH s, c, score ORDER BY score DESC, s.id, c.ordinal LIMIT 40
+                    RETURN c {.*, title: s.title, uri: s.uri} AS chunk
+                    """, terms=terms, source_id=source_id)
+        linked = []
+        if selected:
+            linked = await self._read_evidence("""
+                UNWIND $entity_ids AS entity_id
+                MATCH (n:Entity {id: entity_id})
+                UNWIND coalesce(n.evidence_ids, []) AS evidence_id
+                WITH DISTINCT evidence_id
+                MATCH (c:EvidenceChunk {id: evidence_id})
+                """ + current + """
+                AND EXISTS { MATCH (n:Entity) WHERE n.id IN $entity_ids
+                    AND c.id IN coalesce(n.evidence_ids, []) }
+                WITH s, c ORDER BY s.id, c.ordinal LIMIT 40
+                RETURN c {.*, title: s.title, uri: s.uri} AS chunk
+                """, entity_ids=selected, source_id=source_id)
+        by_id = {}
+        for name, chunks in [('lexical_rank', lexical), ('entity_rank', linked)]:
+            for rank, chunk in enumerate(chunks, 1):
+                item = by_id.setdefault(chunk['id'], {**chunk, 'retrieval': {}})
+                item['retrieval'][name] = rank
+        method = 'lexical_fallback' if fallback else 'fulltext_rrf'
+        for item in by_id.values():
+            ranks = item['retrieval']
+            ranks['rrf_score'] = sum(1 / (60 + ranks[key]) for key in (
+                'lexical_rank', 'entity_rank') if key in ranks)
+            ranks['method'] = method
+        ranked = sorted(by_id.values(), key=lambda item: (
+            -item['retrieval']['rrf_score'], item['source_id'], item['ordinal'], item['id']))
+        return EvidenceResults(ranked[:limit], diagnostics={
+            'method': method, 'fallback': fallback, 'rrf_k': 60,
+            'candidate_count': len(by_id), 'lexical_candidates': len(lexical),
+            'entity_candidates': len(linked),
+            **({'fallback_candidate_limit': 1000} if fallback else {}),
+        })
+
+    async def browse_graph(self, after_id=None, limit=100, source_id=None):
+        """Deterministic bounded node pages with edges closed over each page."""
+        safe_limit = max(1, min(int(limit), 100))
+        async with self.driver.session() as session:
+            result = await session.run("""
+                MATCH (n:Entity)
+                WHERE ($after_id IS NULL OR n.id > $after_id)
+                  AND ($source_id IS NULL OR $source_id IN coalesce(n.source_docs, []))
+                WITH n ORDER BY n.id LIMIT $fetch_limit
+                RETURN """ + _NODE_FIELDS,
+                after_id=after_id, source_id=source_id, fetch_limit=safe_limit + 1)
+            rows = [dict(record) async for record in result]
+            nodes = rows[:safe_limit]
+            result = await session.run("""
+                MATCH (a:Entity)-[r:RELATES_TO]->(b:Entity)
+                WHERE a.id IN $ids AND b.id IN $ids
+                  AND ($source_id IS NULL OR r.source_doc = $source_id)
+                RETURN a.id AS source, b.id AS target, coalesce(r.type, type(r)) AS type
+                ORDER BY source, target, type LIMIT 301
+                """, ids=[node['id'] for node in nodes], source_id=source_id)
+            edges = [dict(record) async for record in result]
+        return {'nodes': nodes, 'edges': edges[:300], 'limit': safe_limit,
+                'next_id': nodes[-1]['id'] if len(rows) > safe_limit else None,
+                'truncated': len(rows) > safe_limit or len(edges) > 300}
 
     @staticmethod
     def _validate_operation_id(operation_id):
