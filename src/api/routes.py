@@ -211,6 +211,7 @@ class IngestTextRequest(BaseModel):
 
 
 class AskRequest(BaseModel):
+    source_id: str | None = Field(None, min_length=1, max_length=500)
     question: str = Field(
         ..., min_length=1, max_length=1000, description="Question to ask the knowledge graph"
     )
@@ -589,7 +590,8 @@ async def ask(req: AskRequest, request: Request):
     agent = _resources(request).agent
     started = time.perf_counter()
     try:
-        result = await agent.ask(req.question)
+        result = (await agent.ask(req.question) if req.source_id is None
+                  else await agent.ask(req.question, source_id=req.source_id))
     except Exception:
         log.exception("Failed to answer question")
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None

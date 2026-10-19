@@ -138,6 +138,13 @@ evidence and WebSocket resources. Set `AUTH_MODE=private` with durable state and
 an operator-managed identity config. See the [M4 setup and deletion guide](docs/M4_UPGRADE.md)
 before enabling it. Local mode remains explicit and separate from private data.
 
+## Research and discovery
+
+M5 adds ranked evidence retrieval and source-specific questions, bulk import and
+opt-in URL refresh schedules, saved investigations/evidence notes, exact entity
+comparison and progressive graph pages. See the [M5 workflow and limits guide](docs/M5_UPGRADE.md).
+Durable state retains schedules/views; private mode scopes them to workspace members.
+
 ## 📁 Project Structure
 
 ```

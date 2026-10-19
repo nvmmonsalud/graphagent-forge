@@ -83,13 +83,15 @@ async def test_cancelled_evidence_read_releases_mutation_lock():
 async def test_search_parameters_and_result_limit_are_bounded_without_entities():
     db, _, _ = mocked_client()
     db._read_evidence = AsyncMock(return_value=[])
-    await db.search_evidence("' malicious MATCH DELETE " + "word " * 2000, limit=1000)
+    results = await db.search_evidence("' malicious MATCH DELETE " + "word " * 2000, limit=1000)
     call = db._read_evidence.call_args
-    assert call.kwargs["limit"] == 12
-    assert call.kwargs["entity_ids"] == []
-    assert len(call.kwargs["terms"]) <= 32
+    assert len(results) <= 12
+    terms = call.kwargs["lucene"].split(" OR ")
+    assert len(terms) <= 12
+    assert all(len(term) <= 66 and term.startswith('"') for term in terms)
     assert "malicious" not in call.args[0]
-    assert "ORDER BY lexical DESC" in call.args[0]
+    assert "ORDER BY score DESC" in call.args[0]
+    assert "LIMIT 40" in call.args[0]
     assert "c.version = s.version" in call.args[0]
 
 

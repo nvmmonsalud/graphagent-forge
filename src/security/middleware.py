@@ -10,7 +10,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 log = logging.getLogger(__name__)
-_READ_POSTS = {'/api/ask', '/api/graph/search', '/api/graph/path'}
+_READ_POSTS = {'/api/ask', '/api/graph/search', '/api/graph/path', '/api/research/compare'}
 _EDITOR_GETS = {'/api/graph/verify', '/api/graph/analytics'}
 
 

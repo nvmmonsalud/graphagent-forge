@@ -24,6 +24,8 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 from src.agent.core import GraphAgent  # noqa: E402
 from src.agent.history import QueryHistory  # noqa: E402
 from src.agent.jobs import JobManager  # noqa: E402
+from src.api.bulk_routes import router as bulk_router  # noqa: E402
+from src.api.investigation_routes import router as investigation_router  # noqa: E402
 from src.api.routes import install_exception_handlers, router  # noqa: E402
 from src.graph.neo4j_client import Neo4jClient  # noqa: E402
 from src.security.auth_routes import router as auth_router  # noqa: E402
@@ -169,6 +171,16 @@ async def lifespan(app: FastAPI):
         app.state.workspace_runtime = runtime
         app.state.neo4j_available = False
         try:
+            configured, principals = await identity.configuration()
+            enabled = [workspace_id for workspace_id in configured if any(
+                workspace_id in person["memberships"] for person in principals.values()
+            )]
+            # Resume opted-in queues/schedules even without a browser opening
+            # the workspace after restart. Config bounds this to eight bundles.
+            opened = [await runtime.get(workspace_id) for workspace_id in enabled]
+            app.state.neo4j_available = bool(opened) and all(
+                resource.neo4j_available for resource in opened
+            )
             yield
         finally:
             await runtime.shutdown()
@@ -230,18 +242,26 @@ async def lifespan(app: FastAPI):
             await jobs.start()
             app.state.history = history
             app.state.storage_mode = "sqlite"
+            app.state.database = database
         else:
             jobs = JobManager(broadcast=ws_manager.broadcast)
             app.state.jobs = jobs
             jobs.start()
             app.state.history = QueryHistory()
+            app.state.database = None
+        from src.agent.research_services import initialize_research
+        await initialize_research(app.state)
         yield
     finally:
         # Drain jobs FIRST: in-flight work still holds the Neo4j driver and the
         # shared httpx clients, so this has to finish before they are closed.
         try:
-            if app.state.jobs is not None:
-                await app.state.jobs.shutdown()
+            from src.agent.research_services import shutdown_research
+            try:
+                await shutdown_research(app.state)
+            finally:
+                if app.state.jobs is not None:
+                    await app.state.jobs.shutdown()
         except Exception:
             log.exception("Error while shutting down the ingest job queue")
         # Close whenever a driver object was actually created — `connect()` can
@@ -433,6 +453,8 @@ app.add_middleware(SecurityHeadersMiddleware)
 # Added last so it is the outermost middleware and runs before anything reads the body.
 app.add_middleware(BodySizeLimitMiddleware)
 
+app.include_router(bulk_router)
+app.include_router(investigation_router)
 app.include_router(auth_router)
 app.include_router(router, prefix="/api")
 # Flattens FastAPI's list-of-dicts 422 body into a plain string so the

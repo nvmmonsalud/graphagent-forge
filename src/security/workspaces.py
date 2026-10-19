@@ -170,11 +170,14 @@ class WorkspaceRuntime:
             )
             await jobs.initialize()
             await jobs.start()
-            return SimpleNamespace(
+            resource = SimpleNamespace(
                 neo4j=neo4j, agent=agent, jobs=jobs, history=history,
                 ws_manager=manager, neo4j_available=available, storage_mode='sqlite',
                 database=database, lock_descriptor=descriptor,
             )
+            from src.agent.research_services import initialize_research
+            await initialize_research(resource, identity=self.identity, workspace_id=workspace_id)
+            return resource
         except BaseException:
             if jobs is not None:
                 await jobs.shutdown()
@@ -230,19 +233,23 @@ class WorkspaceRuntime:
             self._resources.clear()
 
         async def close(resource):
+            from src.agent.research_services import shutdown_research
+
+            errors = []
             try:
-                try:
-                    await resource.jobs.shutdown()
-                finally:
+                for cleanup in (
+                    lambda: shutdown_research(resource), resource.jobs.shutdown,
+                    resource.ws_manager.shutdown, resource.neo4j.close,
+                    resource.agent.nosana.aclose,
+                ):
                     try:
-                        await resource.ws_manager.shutdown()
-                    finally:
-                        try:
-                            await resource.neo4j.close()
-                        finally:
-                            await resource.agent.nosana.aclose()
+                        await cleanup()
+                    except BaseException as error:
+                        errors.append(error)
             finally:
                 os.close(resource.lock_descriptor)
+            if errors:
+                raise errors[0]
 
         results = await asyncio.gather(*(close(resource) for resource in resources),
                                        return_exceptions=True)
