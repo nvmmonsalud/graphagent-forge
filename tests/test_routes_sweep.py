@@ -254,3 +254,17 @@ async def test_500_body_is_scrubbed(app, client) -> None:
     assert resp.json()["detail"] == "internal error"
     assert "hunter2" not in resp.text
     assert "bolt://" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_sweep_is_rate_limited(app, client) -> None:
+    """Sandbox work consumes the dedicated per-IP sandbox bucket."""
+    sweep = _wire(app)
+
+    for _ in range(routes_module.SANDBOX_RATE_LIMIT_MAX):
+        assert (await client.post("/api/graph/verify/sweep")).status_code == 200
+    resp = await client.post("/api/graph/verify/sweep")
+
+    assert resp.status_code == 429
+    assert resp.json() == {"detail": "rate limit exceeded"}
+    assert sweep.await_count == routes_module.SANDBOX_RATE_LIMIT_MAX

@@ -246,6 +246,87 @@ async def test_guarded_backend_connects_to_the_validated_ip(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [httpcore.ConnectError, httpcore.ConnectTimeout])
+async def test_guarded_backend_falls_back_to_next_validated_address(monkeypatch, failure) -> None:
+    resolver = AsyncMock(return_value=(
+        [ipaddress.ip_address("2606:4700:4700::1111"), ipaddress.ip_address("1.1.1.1")],
+        None,
+    ))
+    monkeypatch.setattr(extractor, "_resolve_public", resolver)
+    stream = object()
+    inner = AsyncMock()
+    inner.connect_tcp.side_effect = [failure("IPv6 unavailable"), stream]
+    backend = extractor._GuardedNetworkBackend(inner)
+    options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+
+    result = await backend.connect_tcp(
+        "example.com", 443, timeout=5, local_address="0.0.0.0", socket_options=options,
+    )
+
+    assert result is stream
+    resolver.assert_awaited_once_with("example.com")
+    calls = inner.connect_tcp.await_args_list
+    assert [call.args for call in calls] == [
+        ("2606:4700:4700::1111", 443), ("1.1.1.1", 443),
+    ]
+    assert 0 < calls[0].kwargs["timeout"] <= 2.5
+    assert 0 < calls[1].kwargs["timeout"] < 5
+    for call in calls:
+        assert call.kwargs["local_address"] == "0.0.0.0"
+        assert call.kwargs["socket_options"] is options
+
+
+@pytest.mark.asyncio
+async def test_guarded_backend_propagates_last_connection_failure(monkeypatch) -> None:
+    monkeypatch.setattr(extractor, "_resolve_public", AsyncMock(return_value=(
+        [ipaddress.ip_address("8.8.8.8"), ipaddress.ip_address("1.1.1.1")], None,
+    )))
+    inner = AsyncMock()
+    last_error = httpcore.ConnectTimeout("last address timed out")
+    inner.connect_tcp.side_effect = [httpcore.ConnectError("unreachable"), last_error]
+    backend = extractor._GuardedNetworkBackend(inner)
+
+    with pytest.raises(httpcore.ConnectTimeout) as caught:
+        await backend.connect_tcp("example.com", 443)
+
+    assert caught.value is last_error
+    assert inner.connect_tcp.await_count == 2
+    assert all(call.kwargs["timeout"] is None for call in inner.connect_tcp.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_guarded_backend_timeout_includes_dns_resolution(monkeypatch) -> None:
+    async def stalled_resolution(host):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(extractor, "_resolve_public", stalled_resolution)
+    inner = AsyncMock()
+    backend = extractor._GuardedNetworkBackend(inner)
+    with pytest.raises(httpcore.ConnectTimeout):
+        await backend.connect_tcp("example.com", 443, timeout=0.01)
+    inner.connect_tcp.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_guarded_backend_enforces_timeout_across_connection_attempts(monkeypatch) -> None:
+    monkeypatch.setattr(extractor, "_resolve_public", AsyncMock(return_value=(
+        [ipaddress.ip_address("8.8.8.8"), ipaddress.ip_address("1.1.1.1")], None,
+    )))
+
+    async def connect(host, port, **kwargs):
+        if host == "8.8.8.8":
+            raise httpcore.ConnectError("unreachable")
+        await asyncio.Event().wait()
+
+    inner = AsyncMock()
+    inner.connect_tcp.side_effect = connect
+    backend = extractor._GuardedNetworkBackend(inner)
+    with pytest.raises(httpcore.ConnectTimeout):
+        await backend.connect_tcp("example.com", 443, timeout=0.01)
+    assert inner.connect_tcp.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_shared_client_uses_guarded_backend_and_ignores_proxy_env(monkeypatch) -> None:
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
     monkeypatch.setattr(extractor, "_client", None)

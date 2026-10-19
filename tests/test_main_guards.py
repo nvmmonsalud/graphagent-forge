@@ -1,10 +1,12 @@
 """App-level guards in src.main: request body cap and WebSocket origin/cap."""
 from __future__ import annotations
 
+import asyncio
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 import src.main as main_module
 from src.main import MAX_REQUEST_BYTES, app
@@ -87,3 +89,41 @@ async def test_api_docs_disabled_by_default() -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
         for path in ("/docs", "/redoc", "/openapi.json"):
             assert (await client.get(path)).status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stalled", [False, True])
+async def test_broadcast_closes_unhealthy_socket_and_releases_endpoint(
+    monkeypatch, stalled
+) -> None:
+    manager = main_module.ConnectionManager()
+    monkeypatch.setattr(main_module, "ws_manager", manager)
+    monkeypatch.setattr(main_module, "WS_SEND_TIMEOUT", 0.01)
+    incoming = asyncio.Queue()
+    incoming.put_nowait({"type": "websocket.connect"})
+    accepted = asyncio.Event()
+    sent = []
+
+    async def send(message):
+        if message["type"] == "websocket.accept":
+            accepted.set()
+        elif message["type"] == "websocket.send":
+            if stalled:
+                await asyncio.Event().wait()
+            raise RuntimeError("send failed")
+        elif message["type"] == "websocket.close":
+            incoming.put_nowait({"type": "websocket.disconnect", "code": message["code"]})
+        sent.append(message)
+
+    websocket = WebSocket({"type": "websocket", "headers": []}, incoming.get, send)
+    endpoint = asyncio.create_task(main_module.websocket_graph(websocket))
+    try:
+        await asyncio.wait_for(accepted.wait(), timeout=1)
+        await asyncio.wait_for(manager.broadcast({"type": "graph_update"}), timeout=1)
+        await asyncio.wait_for(endpoint, timeout=1)
+    finally:
+        if not endpoint.done():
+            endpoint.cancel()
+            await asyncio.gather(endpoint, return_exceptions=True)
+    assert {"type": "websocket.close", "code": 1013, "reason": ""} in sent
+    assert not manager.active_connections

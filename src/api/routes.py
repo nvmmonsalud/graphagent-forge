@@ -149,7 +149,7 @@ def _client_key(request: Request) -> str:
 
 
 async def rate_limit(request: Request) -> None:
-    """10 requests/minute per client IP on the expensive routes."""
+    """Shared ingest/ask quota per client; sandbox routes use a separate bucket."""
     client_ip = _client_key(request)
     if not _rate_limit_allow(client_ip, time.monotonic()):
         log.warning("Rate limit exceeded for %s on %s", client_ip, request.url.path)

@@ -58,6 +58,8 @@ MAX_WS_CONNECTIONS = int(os.getenv("MAX_WS_CONNECTIONS", "100"))
 #: A client that doesn't drain its socket within this many seconds is dropped,
 #: so one stalled reader can't hold up job progress or merge broadcasts.
 WS_SEND_TIMEOUT = 2.0
+#: Bound close handshakes as well as sends when evicting an unhealthy client.
+WS_CLOSE_TIMEOUT = 2.0
 
 
 class ConnectionManager:
@@ -65,13 +67,24 @@ class ConnectionManager:
 
     def __init__(self):
         self.active_connections: list[WebSocket] = []
+        self._pending_connections = 0
 
     def is_full(self) -> bool:
-        return len(self.active_connections) >= MAX_WS_CONNECTIONS
+        return len(self.active_connections) + self._pending_connections >= MAX_WS_CONNECTIONS
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
+    async def connect(self, websocket: WebSocket) -> bool:
+        # Check and reserve without yielding: concurrent handshakes must count
+        # toward capacity even while accept() is waiting on the transport.
+        if self.is_full():
+            return False
+        self._pending_connections += 1
+        try:
+            await websocket.accept()
+            self.active_connections.append(websocket)
+            return True
+        finally:
+            # Includes failed and cancelled handshakes.
+            self._pending_connections -= 1
 
     def disconnect(self, websocket: WebSocket):
         """Idempotent — safe to call from a `finally` after any failure path."""
@@ -83,19 +96,20 @@ class ConnectionManager:
         message = json.dumps(data)
         connections = list(self.active_connections)
 
-        async def _send(connection: WebSocket) -> bool:
+        async def _send(connection: WebSocket) -> None:
             try:
                 await asyncio.wait_for(connection.send_text(message), WS_SEND_TIMEOUT)
-                return True
             except Exception:
-                return False
+                try:
+                    await asyncio.wait_for(connection.close(code=1013), WS_CLOSE_TIMEOUT)
+                except Exception:
+                    log.debug("Failed to close unhealthy WebSocket", exc_info=True)
+                finally:
+                    self.disconnect(connection)
 
         # Concurrent with a per-socket timeout: total cost is bounded by the
         # slowest healthy client, not the sum of every client's latency.
-        results = await asyncio.gather(*(_send(c) for c in connections))
-        for conn, ok in zip(connections, results, strict=True):
-            if not ok:
-                self.disconnect(conn)
+        await asyncio.gather(*(_send(c) for c in connections))
 
 
 # Module-level singleton: src.agent.core lazily imports this name to broadcast
@@ -385,11 +399,10 @@ async def websocket_graph(websocket: WebSocket):
         log.warning("Rejected /ws/graph from origin %s", websocket.headers.get("origin"))
         await websocket.close(code=1008)
         return
-    if ws_manager.is_full():
+    if not await ws_manager.connect(websocket):
         log.warning("Rejected /ws/graph: %d connections already open", MAX_WS_CONNECTIONS)
         await websocket.close(code=1013)
         return
-    await ws_manager.connect(websocket)
     try:
         while True:
             # Keep connection alive; client can send pings or messages

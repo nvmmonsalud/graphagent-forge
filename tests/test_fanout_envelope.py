@@ -238,6 +238,30 @@ async def test_a_crashing_verification_is_normalized_never_raw(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_a_crashed_item_is_charged_its_own_time_not_the_batch(monkeypatch) -> None:
+    """A crash that lands early must not carry the whole batch's wall clock."""
+    executor = DaytonaExecutor()
+
+    async def _fake(graph_data):
+        if graph_data["source_doc"] == "bad":
+            raise RuntimeError("boom")
+        await asyncio.sleep(0.05)
+        return _ok_item(graph_data["source_doc"])
+
+    monkeypatch.setattr(executor, "verify_graph", _fake)
+
+    # Concurrency 1 forces "bad" to wait behind "slow" before it can crash.
+    result = await executor.verify_graph_fanout(
+        {"slow": {"source_doc": "slow"}, "bad": {"source_doc": "bad"}},
+        max_concurrency=1,
+    )
+
+    by_source = {item["source"]: item for item in result["sources"]}
+    assert by_source["bad"]["duration_ms"] < 40
+    assert by_source["bad"]["duration_ms"] < result["wall_ms"]
+
+
+@pytest.mark.asyncio
 async def test_event_sink_sees_started_then_done_per_source(monkeypatch) -> None:
     executor = DaytonaExecutor()
     events: list[dict] = []

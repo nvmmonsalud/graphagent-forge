@@ -87,16 +87,35 @@ class _GuardedNetworkBackend(httpcore.AsyncNetworkBackend):
         local_address: str | None = None,
         socket_options: Any = None,
     ) -> httpcore.AsyncNetworkStream:
-        addresses, error = await _resolve_public(host)
-        if error:
-            raise httpcore.ConnectError(error)
-        return await self._inner.connect_tcp(
-            str(addresses[0]),
-            port,
-            timeout=timeout,
-            local_address=local_address,
-            socket_options=socket_options,
-        )
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+        try:
+            # Resolution and every attempt share one budget. Splitting the
+            # remaining time leaves room for IPv4 when IPv6 silently times out.
+            async with asyncio.timeout(timeout):
+                addresses, error = await _resolve_public(host)
+                if error:
+                    raise httpcore.ConnectError(error)
+                for index, address in enumerate(addresses):
+                    attempt_timeout = None
+                    if deadline is not None:
+                        remaining = deadline - loop.time()
+                        if remaining <= 0:
+                            raise httpcore.ConnectTimeout()
+                        attempt_timeout = remaining / (len(addresses) - index)
+                    try:
+                        return await self._inner.connect_tcp(
+                            str(address),
+                            port,
+                            timeout=attempt_timeout,
+                            local_address=local_address,
+                            socket_options=socket_options,
+                        )
+                    except (httpcore.ConnectError, httpcore.ConnectTimeout):
+                        if index == len(addresses) - 1:
+                            raise
+        except TimeoutError as exc:
+            raise httpcore.ConnectTimeout() from exc
 
     async def connect_unix_socket(self, *args: Any, **kwargs: Any) -> httpcore.AsyncNetworkStream:
         raise httpcore.ConnectError("Blocked: unix sockets are not allowed")
