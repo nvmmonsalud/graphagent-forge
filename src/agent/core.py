@@ -11,9 +11,11 @@ from src.agent.daytona_exec import DaytonaExecutor
 from src.agent.nosana_client import NosanaClient
 from src.graph.graphrag import GraphRAGEngine
 from src.graph.neo4j_client import Neo4jClient
+from src.ingestion.entity_parser import _resolve_model
 from src.ingestion.extractor import extract_from_text, extract_from_url
 from src.ingestion.file_extractor import extract_from_file
 from src.ingestion.graph_writer import ingest_to_graph
+from src.ingestion.sources import build_source
 
 log = logging.getLogger(__name__)
 
@@ -30,8 +32,7 @@ class GraphAgent:
     def __init__(self, neo4j: Neo4jClient):
         self.neo4j = neo4j
         self.nosana = NosanaClient()
-        # Share a single NosanaClient so `last_embedding_method` has one
-        # source of truth across ingestion and query paths.
+        # Reuse connections; embedding metadata is returned per call.
         self.graphrag = GraphRAGEngine(neo4j, nosana=self.nosana)
         self.daytona = DaytonaExecutor()
         self._ingest_semaphore = asyncio.Semaphore(2)
@@ -54,6 +55,15 @@ class GraphAgent:
                 "nodes": nodes,
                 "edges": edges,
             })
+
+    async def _broadcast_graph_reset(self, source_doc: str):
+        """Publication replaces a source graph, so clients must refetch it."""
+        try:
+            manager = self._get_ws_manager()
+            if manager:
+                await manager.broadcast({"type": "graph_reset", "source": source_doc})
+        except Exception as exc:
+            log.warning("Failed to broadcast graph reset: %s", exc)
 
     async def _broadcast_graph_merge(self, res: dict):
         """Broadcast a completed entity merge to connected WebSocket clients."""
@@ -88,7 +98,7 @@ class GraphAgent:
 
     async def ingest_url(self, url: str, progress: ProgressCb | None = None) -> dict[str, Any]:
         """Ingest a URL: extract → graph → store."""
-        log.info("Ingesting URL: %s", url)
+        log.info("Ingesting URL")
 
         # Extract content
         await self._report(progress, "fetching")
@@ -96,13 +106,19 @@ class GraphAgent:
         if extraction.get("error"):
             return {"success": False, "error": extraction["error"]}
 
+        model = _resolve_model(None)
+        source = build_source(
+            "url", url, extraction.get("title") or url, extraction["content"], model=model,
+        )
         # Write to graph
         await self._report(progress, "extracting")
         async with self._ingest_semaphore:
             result = await ingest_to_graph(
                 self.neo4j,
                 extraction["content"],
-                source_doc=extraction.get("title") or url,
+                source_doc=source["id"],
+                source=source,
+                model=model,
             )
 
         result["extraction"] = {
@@ -113,7 +129,7 @@ class GraphAgent:
 
         return await self._post_ingest(
             result,
-            source_doc=extraction.get("title") or url,
+            source_doc=source["id"],
             content=extraction["content"],
             progress=progress,
         )
@@ -123,18 +139,22 @@ class GraphAgent:
     ) -> dict[str, Any]:
         """Ingest raw text: extract → graph → store."""
         extraction = extract_from_text(text, source)
+        model = _resolve_model(None)
+        source_metadata = build_source("text", source, source, extraction["content"], model=model)
 
         await self._report(progress, "extracting")
         async with self._ingest_semaphore:
             result = await ingest_to_graph(
                 self.neo4j,
                 extraction["content"],
-                source_doc=source,
+                source_doc=source_metadata["id"],
+                source=source_metadata,
+                model=model,
             )
 
         return await self._post_ingest(
             result,
-            source_doc=source,
+            source_doc=source_metadata["id"],
             content=extraction["content"],
             progress=progress,
         )
@@ -158,7 +178,13 @@ class GraphAgent:
         if extraction.get("error"):
             return {"success": False, "error": extraction["error"]}
 
-        source_doc = source or extraction.get("filename") or filename
+        model = _resolve_model(None)
+        source_name = source or extraction.get("filename") or filename
+        source_metadata = build_source(
+            "file", source_name, extraction.get("title") or source_name, extraction["content"],
+            model=model,
+        )
+        source_doc = source_metadata["id"]
 
         await self._report(progress, "extracting")
         async with self._ingest_semaphore:
@@ -166,6 +192,8 @@ class GraphAgent:
                 self.neo4j,
                 extraction["content"],
                 source_doc=source_doc,
+                source=source_metadata,
+                model=model,
             )
 
         result["extraction"] = {
@@ -196,7 +224,7 @@ class GraphAgent:
         """
         log.debug("Post-ingest for '%s' (%d chars of source content)", source_doc, len(content))
 
-        if not result.get("success"):
+        if not result.get("success") or result.get("unchanged"):
             # Nothing new landed in the graph — skip embedding/broadcast/verify.
             result.setdefault("embedding_stored", False)
             return result
@@ -204,9 +232,12 @@ class GraphAgent:
         # F2: per-entity embeddings so the vector index holds distinct vectors
         await self._report(progress, "embedding")
         try:
-            stored = await self._embed_source_nodes(source_doc)
+            methods: set[str] = set()
+            stored = await self._embed_source_nodes(source_doc, methods=methods)
             result["embedding_stored"] = stored > 0
-            result["embedding_method"] = self.nosana.last_embedding_method
+            result["embedding_method"] = (
+                next(iter(methods)) if len(methods) == 1 else "mixed" if methods else None
+            )
         except Exception as e:
             log.warning("Embedding generation failed: %s", e)
             result["embedding_stored"] = False
@@ -232,7 +263,10 @@ class GraphAgent:
 
         # Broadcast live graph update via WebSocket
         await self._report(progress, "broadcasting")
-        await self._broadcast_new_nodes(source_doc)
+        if result.get("source_metadata"):
+            await self._broadcast_graph_reset(source_doc)
+        else:
+            await self._broadcast_new_nodes(source_doc)
 
         # F1: verify integrity of just this document's subgraph in a sandbox
         await self._report(progress, "verifying")
@@ -241,12 +275,14 @@ class GraphAgent:
 
         return result
 
-    async def _embed_source_nodes(self, source_doc: str) -> int:
+    async def _embed_source_nodes(
+        self, source_doc: str, *, methods: set[str] | None = None,
+    ) -> int:
         """Embed each entity of `source_doc` individually and persist the vectors.
 
         Returns the number of node embeddings written.
         """
-        nodes = await self.neo4j.get_nodes_by_source(source_doc)
+        nodes = await self.neo4j.get_nodes_by_source(source_doc, limit=5000)
         if not nodes:
             log.info("No nodes found for '%s' — nothing to embed", source_doc)
             return 0
@@ -264,24 +300,29 @@ class GraphAgent:
                 return None
             async with semaphore:
                 try:
-                    embedding = await self.nosana.get_embedding(text)
+                    embedding_result = await self.nosana.get_embedding_result(text)
                 except Exception as exc:
                     log.warning("Embedding failed for node %s: %s", node_id, exc)
                     return None
-            if not embedding:
+            if not embedding_result.get("embedding"):
                 return None
-            return {"id": node_id, "embedding": embedding}
+            return {
+                **embedding_result, "id": node_id,
+                "expected_label": node.get("label") or "",
+                "expected_summary": node.get("summary") or "",
+            }
 
         results = await asyncio.gather(*(embed_one(n) for n in nodes))
         items = [item for item in results if item]
 
+        stored = 0
         if items:
-            await self.neo4j.set_node_embeddings(
-                items, method=self.nosana.last_embedding_method
-            )
-            log.info("Stored %d/%d node embeddings for '%s'", len(items), len(nodes), source_doc)
+            stored = await self.neo4j.set_node_embeddings(items)
+            if methods is not None:
+                methods.update(item["method"] for item in items)
+            log.info("Stored %d/%d node embeddings for '%s'", stored, len(nodes), source_doc)
 
-        return len(items)
+        return stored
 
     async def merge_entities(
         self, node_ids: list[str], canonical_id: str | None = None
@@ -301,11 +342,14 @@ class GraphAgent:
             summary = (canonical.get("summary") or "").strip()
             text = f"{label}: {summary}" if (label and summary) else (label or summary)
             if text:
-                embedding = await self.nosana.get_embedding(text)
-                if embedding:
+                embedding_result = await self.nosana.get_embedding_result(text)
+                if embedding_result.get("embedding"):
                     await self.neo4j.set_node_embeddings(
-                        [{"id": canonical["id"], "embedding": embedding}],
-                        method=self.nosana.last_embedding_method,
+                        [{
+                            **embedding_result, "id": canonical["id"],
+                            "expected_label": canonical.get("label") or "",
+                            "expected_summary": canonical.get("summary") or "",
+                        }],
                     )
         except Exception as exc:
             log.warning("Re-embedding merged entity failed: %s", exc)

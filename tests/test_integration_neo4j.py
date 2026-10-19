@@ -10,6 +10,7 @@ import uuid
 
 import pytest
 
+from src.graph.embedding_space import configured_embedding_space
 from src.graph.neo4j_client import Neo4jClient
 
 NEO4J_URI = os.getenv("NEO4J_URI")
@@ -126,7 +127,8 @@ async def test_set_node_embeddings_then_vector_search_finds_node(neo4j, source_d
 
         embedding = [0.05] * 384
         await neo4j.set_node_embeddings(
-            [{"id": node_id, "embedding": embedding}], method="nosana"
+            [{"id": node_id, "embedding": embedding, "method": "nosana",
+              **configured_embedding_space()}]
         )
 
         results = await neo4j.vector_search(embedding, limit=5)
@@ -301,12 +303,12 @@ async def test_merge_round_trip(neo4j) -> None:
         assert len(knows_from_b) == 1
         assert knows_from_b[0]["source_doc"] == doc_b
 
-        # (canonical, ext_shared, WORKS_AT) existed on both sides pre-merge —
-        # deduped to a single edge.
+        # Same endpoints/type retain both independent source assertions.
         works_at_to_shared = [
             e for e in edges if e["tgt"] == ext_shared and e["rel_type"] == "WORKS_AT"
         ]
-        assert len(works_at_to_shared) == 1
+        assert len(works_at_to_shared) == 2
+        assert {e["source_doc"] for e in works_at_to_shared} == {doc_a, doc_b}
     finally:
         await neo4j.delete_source(doc_a)
         await neo4j.delete_source(doc_b)

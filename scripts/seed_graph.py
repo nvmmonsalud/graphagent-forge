@@ -287,10 +287,13 @@ async def _embed_documents(client, source_docs: list[str], verbose: bool) -> str
                 text = f"{label}: {summary}" if (label and summary) else (label or summary)
                 if not text:
                     continue
-                embedding = await nosana.get_embedding(text)
-                if embedding:
-                    items.append({"id": node["id"], "embedding": embedding})
-            method = nosana.last_embedding_method
+                result = await nosana.get_embedding_result(text)
+                if result["embedding"]:
+                    items.append({"id": node["id"], **result,
+                                  "expected_label": node.get("label") or "",
+                                  "expected_summary": node.get("summary") or ""})
+            methods = {item["method"] for item in items}
+            method = next(iter(methods)) if len(methods) == 1 else "mixed"
             if items:
                 await client.set_node_embeddings(items, method=method)
             if verbose:

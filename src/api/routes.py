@@ -199,7 +199,8 @@ class IngestTextRequest(BaseModel):
     text: str = Field(
         ..., min_length=1, max_length=200_000, description="Text content to ingest"
     )
-    source: str = Field(default="manual", max_length=300, description="Source label")
+    source: str = Field(default="manual", max_length=300,
+                        description="Source name; reuse to refresh this text source")
 
 
 class AskRequest(BaseModel):

@@ -59,7 +59,10 @@ async def test_merge_entities_happy_path() -> None:
         "canonical": canonical,
         "edges": [{"source": "a", "target": "c", "type": "WORKS_WITH"}],
     }
-    nosana.get_embedding.return_value = [0.1] * 384
+    nosana.get_embedding_result.return_value = {
+        "embedding": [0.1] * 384, "method": "nosana", "model": "m", "version": "1",
+        "dimension": 384,
+    }
     nosana.last_embedding_method = "nosana"
 
     # Duplicate id in the request should be deduped before hitting neo4j.
@@ -71,12 +74,15 @@ async def test_merge_entities_happy_path() -> None:
     assert list(called_ids) == ["a", "b"]
 
     # Re-embed canonical with the reported method.
-    nosana.get_embedding.assert_awaited_once()
+    nosana.get_embedding_result.assert_awaited_once()
     neo4j.set_node_embeddings.assert_awaited_once()
     embed_call = neo4j.set_node_embeddings.call_args
     items = embed_call.args[0] if embed_call.args else embed_call.kwargs["items"]
-    assert items == [{"id": "a", "embedding": [0.1] * 384}]
-    assert embed_call.kwargs.get("method") == "nosana"
+    assert items == [{
+        "id": "a", **nosana.get_embedding_result.return_value,
+        "expected_label": "Acme", "expected_summary": "a company",
+    }]
+    assert "method" not in embed_call.kwargs
 
     # Broadcast graph_merge payload.
     manager.broadcast.assert_awaited_once()
@@ -103,7 +109,7 @@ async def test_merge_entities_not_found() -> None:
     result = await agent.merge_entities(["a", "ghost"])
 
     assert result == {"error": "not_found", "missing": ["ghost"]}
-    nosana.get_embedding.assert_not_awaited()
+    nosana.get_embedding_result.assert_not_awaited()
     neo4j.set_node_embeddings.assert_not_awaited()
     manager.broadcast.assert_not_awaited()
 
@@ -129,7 +135,7 @@ async def test_merge_entities_embedding_failure_is_tolerated() -> None:
         "canonical": canonical,
         "edges": [],
     }
-    nosana.get_embedding.side_effect = RuntimeError("nosana unreachable")
+    nosana.get_embedding_result.side_effect = RuntimeError("nosana unreachable")
 
     # Must not raise.
     result = await agent.merge_entities(["a", "b"])

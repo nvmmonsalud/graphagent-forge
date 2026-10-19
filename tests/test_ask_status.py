@@ -16,8 +16,9 @@ from src.ingestion.entity_parser import LLM_UNAVAILABLE_PREFIX
 
 def _mock_nosana(method: str = "local_hash_fallback") -> AsyncMock:
     nosana = AsyncMock()
-    nosana.get_embedding.return_value = [0.1] * 384
-    nosana.last_embedding_method = method
+    nosana.get_embedding_result.return_value = {
+        "embedding": [0.1] * 384, "method": method,
+    }
     return nosana
 
 
@@ -44,7 +45,10 @@ async def test_candidates_but_missing_kimi_key_yields_llm_unavailable_status(
     neo4j.search_nodes.return_value = [
         {"id": "n1", "label": "Test Entity", "source_docs": ["doc1"]}
     ]
-    neo4j.get_node_context.return_value = "Test Entity (Concept): a thing"
+    neo4j.get_entity_context.return_value = {
+        "text": "Test Entity (Concept): a thing", "source_docs": ["doc1"],
+        "entity_ids": ["n1"], "nodes": [], "edges": [],
+    }
     engine = GraphRAGEngine(neo4j=neo4j, nosana=_mock_nosana())
 
     result = await engine.query("Tell me about the test entity")

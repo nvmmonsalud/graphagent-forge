@@ -107,6 +107,17 @@ pytest                     # offline test suite — no keys or Neo4j needed
 pytest -m integration      # extra tests against a live Neo4j (reads NEO4J_* env)
 ```
 
+## Source refresh and retrieval integrity
+
+New URL sources have stable IDs separate from page titles. Reusing a text source
+name or upload filename refreshes that source atomically; unchanged versions skip
+extraction. Answers include graph evidence retrieved by entity ID, including
+isolated entity summaries and traversed source provenance.
+
+Before upgrading an existing graph, follow the [M1 migration and re-embedding
+guide](docs/M1_UPGRADE.md). Legacy embeddings are excluded from semantic search
+until they have compatible per-result model metadata.
+
 ## 📁 Project Structure
 
 ```

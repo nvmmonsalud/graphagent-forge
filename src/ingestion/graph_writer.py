@@ -97,8 +97,13 @@ def sanitize_graph(graph_data: dict) -> tuple[dict, int, int]:
     return graph_data, dropped_nodes, dropped_edges
 
 
-def prefix_and_validate(graph_data: dict, source_doc: str) -> tuple[dict, int]:
-    """Apply the md5 doc-id prefix and drop edges referencing undeclared ids.
+def prefix_and_validate(
+    graph_data: dict, source_doc: str, version: str | None = None,
+) -> tuple[dict, int]:
+    """Namespace document IDs and drop edges referencing undeclared IDs.
+
+    New versioned ingestion uses the full SHA-256 of source ID and version.
+    Without a version, retain historical seeded IDs for backward compatibility.
 
     Node ids become ``<md5(source_doc)[:8]>_<raw id>`` so two documents that
     happen to reuse the same local id never collide, and edge endpoints are
@@ -111,7 +116,10 @@ def prefix_and_validate(graph_data: dict, source_doc: str) -> tuple[dict, int]:
 
     Returns ``(graph_data, dropped_edges)``.
     """
-    doc_hash = hashlib.md5(source_doc.encode()).hexdigest()[:8]
+    doc_hash = (
+        hashlib.sha256(f"{source_doc}\0{version}".encode()).hexdigest()
+        if version is not None else hashlib.md5(source_doc.encode()).hexdigest()[:8]
+    )
 
     nodes = graph_data.get("nodes", [])
     edges = graph_data.get("edges", [])
@@ -160,9 +168,23 @@ async def ingest_to_graph(
     content: str,
     source_doc: str = "",
     model: str | None = None,
+    *,
+    source: dict | None = None,
 ) -> dict[str, Any]:
     """Full pipeline: extract entities → write to Neo4j."""
     log.info("Extracting entities from '%s' (%d chars)", source_doc, len(content))
+
+    expected_version = None
+    if source is not None:
+        source_doc = source["id"]
+        current = await neo4j.get_source(source_doc)
+        expected_version = current.get("version") if current else None
+        if expected_version == source["version"]:
+            return {
+                "success": True, "source": source_doc, "source_metadata": source,
+                "nodes": 0, "edges": 0, "unchanged": True,
+                "version": source["version"],
+            }
 
     # Step 1: Extract entities and relationships via Kimi
     graph_data = await extract_entities(content, model=model)
@@ -190,7 +212,9 @@ async def ingest_to_graph(
     # edges the LLM invented endpoints for. Shared with `scripts.seed_graph` so
     # seeded ids are byte-identical to a live ingest of the same document.
     graph_data, _dropped_nodes, invalid_edges = sanitize_graph(graph_data)
-    graph_data, dropped_edges = prefix_and_validate(graph_data, source_doc)
+    graph_data, dropped_edges = prefix_and_validate(
+        graph_data, source_doc, source["version"] if source is not None else None,
+    )
     dropped_edges += invalid_edges
     nodes = graph_data["nodes"]
     valid_edges = graph_data["edges"]
@@ -204,7 +228,18 @@ async def ingest_to_graph(
         }
 
     # Step 2: Write to Neo4j
-    result = await neo4j.write_graph(graph_data, source_doc=source_doc)
+    if source is None:
+        result = await neo4j.write_graph(graph_data, source_doc=source_doc)
+    else:
+        result = await neo4j.publish_source_graph(
+            graph_data, source=source, expected_version=expected_version,
+        )
+        if result.get("conflict"):
+            return {
+                "success": False, "source": source_doc, "conflict": True,
+                "error": "Source changed during extraction; retry ingestion",
+                "nodes": 0, "edges": 0,
+            }
 
     log.info(
         "Ingestion complete: %d nodes, %d edges from '%s'",
@@ -213,7 +248,12 @@ async def ingest_to_graph(
         source_doc,
     )
 
+    metadata = ({
+        "source_metadata": source, "version": source["version"],
+        "unchanged": result.get("unchanged", False),
+    } if source is not None else {})
     return {
+        **metadata,
         "success": True,
         "source": source_doc,
         "nodes": result["nodes_written"],
