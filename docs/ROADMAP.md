@@ -28,6 +28,15 @@ or private hosted release should precede M4, even if M2/M3 are already complete.
 
 ## M0 — Reliable execution and quality baseline
 
+Delivery status: in progress; lifecycle slice implemented. R5 local child cleanup
+and remote sandbox ownership during cancellation have process-lifecycle and mocked
+SDK regressions. Validation: 1,484 offline tests passed, 14 integration tests
+deselected, Ruff passed; independent code and security reviews passed. Remote
+provider behavior was mocked; a hanging SDK acquisition/deletion can still delay
+cancellation, and provider deletion failures remain logged best effort. The
+evaluation corpus, expanded CI, telemetry, and dependency/security checks below
+remain separate work items.
+
 Scope:
 
 - Fix R5: deterministic local child cleanup on cancellation, timeout, and errors;
