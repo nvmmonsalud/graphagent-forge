@@ -81,8 +81,11 @@ into reload; it restarts the process and loses in-flight jobs and history.
   semantic name in `r.type`; read it with `coalesce(r.type, type(r))`.
 - Preserve document-scoped IDs and provenance through ingestion, merge, and
   deletion. Exact duplicate auto-merge is opt-in (`AUTO_MERGE=exact`); otherwise
-  duplicate suggestions require an explicit merge action. URL source identity
-  currently uses the HTML title with URL fallback, so equal titles can collide.
+  duplicate suggestions require an explicit merge action. New sources use stable
+  IDs separate from titles. Publication, merge, clear and deletion share a graph
+  mutation lock; Source version compare-and-swap prevents conflicting refreshes.
+  Retain tombstones against stale work. Legacy provenance strings remain valid
+  keys; see docs/M1_UPGRADE.md for explicit migration and rollback.
 - Every returned edge must reference nodes included in the same graph response,
   including capped reads and per-source boundary nodes. Preserve graph metadata
   (`truncated`, totals, `limit`) and the distinction between incremental graph

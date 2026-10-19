@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import logging
+import math
+import uuid
 from typing import Any
 
 from neo4j import AsyncGraphDatabase
 
+from src.graph.embedding_space import configured_embedding_space
 from src.graph.normalize import normalize_label
 
 log = logging.getLogger(__name__)
@@ -49,6 +52,9 @@ class Neo4jClient:
         """Create indexes and constraints for performance."""
         queries = [
             "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Entity) REQUIRE n.id IS UNIQUE",
+            "CREATE CONSTRAINT source_id IF NOT EXISTS FOR (s:Source) REQUIRE s.id IS UNIQUE",
+            "CREATE CONSTRAINT graph_state_id IF NOT EXISTS "
+            "FOR (s:GraphState) REQUIRE s.id IS UNIQUE",
             "CREATE INDEX IF NOT EXISTS FOR (n:Entity) ON (n.label)",
             "CREATE INDEX IF NOT EXISTS FOR (n:Entity) ON (n.type)",
             # Legacy scalar-provenance index: kept so pre-migration graphs stay
@@ -125,20 +131,202 @@ class Neo4jClient:
             log.info("Backfilled norm_label on %d nodes", total)
 
     async def init_vector_index(self):
-        """Create a vector index on Entity.embedding for semantic similarity."""
-        query = """
-        CREATE VECTOR INDEX entity_embedding IF NOT EXISTS
-        FOR (n:Entity) ON (n.embedding)
-        OPTIONS {
-          indexConfig: {
-            `vector.dimensions`: 384,
-            `vector.similarity_function`: 'cosine'
-          }
-        }
-        """
+        """Switch active space under the mutation lock, quarantining old vectors."""
+        space = configured_embedding_space()
         async with self.driver.session() as session:
-            await session.run(query)
-        log.info("Vector index created / already exists")
+            tx = await session.begin_transaction()
+            try:
+                await self._lock_graph(tx)
+                await tx.run("""
+                    MATCH (n:Entity)
+                    WHERE n:SemanticEntity OR n.semantic_embedding IS NOT NULL
+                    WITH n WHERE coalesce(n.embedding_method, '') <> 'nosana'
+                      OR coalesce(n.embedding_model, '') <> $model
+                      OR coalesce(n.embedding_version, '') <> $version
+                      OR size(coalesce(n.semantic_embedding, [])) <> $dimension
+                    REMOVE n:SemanticEntity, n.semantic_embedding
+                    """, **space)
+                await tx.run("""
+                    MATCH (g:GraphState {id: 'sources'})
+                    SET g.embedding_model = $model, g.embedding_version = $version,
+                        g.embedding_dimension = $dimension
+                    """, **space)
+                await tx.commit()
+            except BaseException:
+                await tx.rollback()
+                raise
+            await session.run("""
+                CREATE VECTOR INDEX entity_semantic_embedding IF NOT EXISTS
+                FOR (n:SemanticEntity) ON (n.semantic_embedding)
+                OPTIONS {indexConfig: {`vector.dimensions`: 384,
+                         `vector.similarity_function`: 'cosine'}}
+                """)
+
+    @staticmethod
+    async def _space_is_active(runner, space):
+        result = await runner.run("""
+            MATCH (g:GraphState {id:'sources'})
+            RETURN g.embedding_model = $model AND g.embedding_version = $version
+               AND g.embedding_dimension = $dimension AS active
+            """, **space)
+        row = await result.single()
+        return bool(row and row["active"])
+
+    @staticmethod
+    async def _lock_graph(tx):
+        # The lock also serializes source membership mutations across clear/merge.
+        await tx.run("MERGE (g:GraphState {id: 'sources'}) "
+                     "SET g.revision = coalesce(g.revision, 0) + 1")
+
+    async def _run_mutation(self, query, **params):
+        async with self.driver.session() as session:
+            tx = await session.begin_transaction()
+            try:
+                await self._lock_graph(tx)
+                if params.get("source_doc"):
+                    await self._touch_legacy_source(tx, params["source_doc"])
+                await tx.run(query, **params)
+                await tx.commit()
+            except BaseException:
+                await tx.rollback()
+                raise
+
+    @staticmethod
+    async def _touch_legacy_source(tx, source_doc):
+        # Legacy seeders retain their historical graph IDs. Revive existing
+        # reservations/tombstones and invalidate any extraction started before
+        # this direct write. New legacy IDs remain eligible for explicit migration.
+        await tx.run("""
+            MATCH (s:Source {id: $id})
+            SET s = {id: $id, title: $id, kind: 'legacy', version: $version,
+                     updated_at: datetime()}
+            """, id=source_doc, version="legacy_" + uuid.uuid4().hex)
+
+    async def get_source(self, source_id: str) -> dict | None:
+        # Register missing identities so clear/delete can invalidate extraction
+        # that started before the deletion, including first-ever publications.
+        async with self.driver.session() as session:
+            tx = await session.begin_transaction()
+            try:
+                await self._lock_graph(tx)
+                result = await tx.run("""
+                    MERGE (s:Source {id: $id})
+                    ON CREATE SET s._placeholder = true
+                    RETURN properties(s) AS source
+                    """, id=source_id)
+                row = await result.single()
+                await tx.commit()
+            except BaseException:
+                await tx.rollback()
+                raise
+        source = dict(row["source"]) if row else {}
+        if source.get("_placeholder"):
+            return None
+        return {k: v for k, v in source.items() if not k.startswith("_")}
+
+    async def publish_source_graph(self, graph_data: dict, *, source: dict,
+                                   expected_version: str | None) -> dict:
+        """Publish a complete source refresh atomically with optimistic concurrency."""
+        sid = source["id"]
+        nodes = [{"id": n["id"], "label": n.get("label", ""),
+                  "type": n.get("type", "Unknown"),
+                  "summary": n.get("properties", {}).get("summary", ""),
+                  "norm_label": normalize_label(n.get("label", ""))}
+                 for n in graph_data.get("nodes", [])]
+        edges = [{"source": e["source"], "target": e["target"],
+                  "type": e.get("relationship", "RELATES_TO"),
+                  "context": e.get("properties", {}).get("context", "")}
+                 for e in graph_data.get("edges", [])]
+        ids = {n["id"] for n in nodes}
+        if any(e["source"] not in ids or e["target"] not in ids for e in edges):
+            raise ValueError("Source graph contains missing edge endpoints")
+        metadata = {k: source[k] for k in ("id", "title", "kind", "uri", "content_hash",
+                                          "version", "extraction_version") if k in source}
+        async with self.driver.session() as session:
+            tx = await session.begin_transaction()
+            try:
+                await self._lock_graph(tx)
+                result = await tx.run("""
+                    MERGE (s:Source {id: $id})
+                    SET s._lock = coalesce(s._lock, 0) + 1
+                    RETURN s.version AS version
+                    """, id=sid)
+                row = await result.single()
+                current = row["version"] if row else None
+                if current == source["version"]:
+                    await tx.rollback()
+                    return dict(nodes_written=0, edges_written=0, unchanged=True, conflict=False)
+                if current != expected_version:
+                    await tx.rollback()
+                    return dict(nodes_written=0, edges_written=0, unchanged=False, conflict=True)
+                await self._remove_source_graph(tx, sid)
+                await tx.run("""
+                    UNWIND $nodes AS node
+                    MERGE (n:Entity {id: node.id})
+                    SET n.label = node.label, n.type = node.type, n.summary = node.summary,
+                        n.norm_label = node.norm_label,
+                        n.source_docs = CASE WHEN $sid IN coalesce(n.source_docs, [])
+                          THEN n.source_docs ELSE coalesce(n.source_docs, []) + $sid END,
+                        n.updated_at = datetime()
+                    """, nodes=nodes, sid=sid)
+                await tx.run("""
+                    UNWIND $edges AS edge
+                    MATCH (a:Entity {id: edge.source}), (b:Entity {id: edge.target})
+                    MERGE (a)-[r:RELATES_TO {type: edge.type, source_doc: $sid}]->(b)
+                    SET r.context = edge.context, r.updated_at = datetime()
+                    """, edges=edges, sid=sid)
+                await tx.run("MATCH (s:Source {id: $sid}) SET s += $metadata, "
+                             "s.updated_at = datetime() "
+                             "REMOVE s._placeholder, s._deleted, s._migration",
+                             sid=sid, metadata=metadata)
+                await tx.commit()
+            except BaseException:
+                await tx.rollback()
+                raise
+        return dict(nodes_written=len(nodes), edges_written=len(edges),
+                    unchanged=False, conflict=False)
+
+    @staticmethod
+    async def _remove_source_graph(tx, source_doc):
+        result = await tx.run("""
+            MATCH ()-[r:RELATES_TO]->() WHERE r.source_doc = $source_doc
+            WITH collect(r) AS rels, count(r) AS deleted,
+                 collect(DISTINCT startNode(r).id) + collect(DISTINCT endNode(r).id) AS endpoints
+            FOREACH (r IN rels | DELETE r) RETURN deleted, endpoints
+            """, source_doc=source_doc)
+        row = await result.single()
+        deleted_edges = row["deleted"] if row else 0
+        endpoints = row["endpoints"] if row else []
+        result = await tx.run("""
+            MATCH (n:Entity) WHERE $source_doc IN coalesce(n.source_docs, [])
+            SET n.source_docs = [s IN n.source_docs WHERE s <> $source_doc],
+                n.summary = '', n.aliases = []
+            REMOVE n:SemanticEntity, n.semantic_embedding, n.embedding,
+                   n.embedding_method, n.embedding_model, n.embedding_version,
+                   n.embedding_dimension
+            WITH collect(n) AS members, count(n) AS removed
+            WITH removed, [n IN members WHERE size(n.source_docs) = 0
+                 AND NOT EXISTS { MATCH (n)-[r:RELATES_TO]-()
+                                  WHERE r.source_doc <> $source_doc }] AS orphans
+            FOREACH (n IN orphans | DETACH DELETE n)
+            RETURN removed, size(orphans) AS deleted
+            """, source_doc=source_doc)
+        row = await result.single()
+        counts = {"deleted_edges": deleted_edges,
+                  "removed_memberships": row["removed"] if row else 0,
+                  "deleted_nodes": row["deleted"] if row else 0}
+        # A boundary entity retained for another source's assertion may have
+        # lost its last edge now, despite having no direct source membership.
+        result = await tx.run("""
+            MATCH (n:Entity) WHERE n.id IN $endpoints
+              AND coalesce(n.source_docs, []) = [] AND n.source_doc IS NULL
+              AND NOT EXISTS { MATCH (n)-[:RELATES_TO]-() }
+            WITH collect(n) AS nodes, count(n) AS deleted
+            FOREACH (n IN nodes | DETACH DELETE n) RETURN deleted
+            """, endpoints=endpoints)
+        row = await result.single()
+        counts["deleted_nodes"] += row["deleted"] if row else 0
+        return counts
 
     # ------------------------------------------------------------------
     # Write operations
@@ -156,11 +344,13 @@ class Neo4jClient:
               WHEN NOT $source_doc IN n.source_docs THEN n.source_docs + $source_doc
               ELSE n.source_docs END,
             n.updated_at = datetime()
+        REMOVE n:SemanticEntity, n.semantic_embedding, n.embedding,
+               n.embedding_method, n.embedding_model, n.embedding_version,
+               n.embedding_dimension
         """
         props = node.get("properties", {})
         label = node.get("label", "")
-        async with self.driver.session() as session:
-            await session.run(
+        await self._run_mutation(
                 query,
                 id=node["id"],
                 label=label,
@@ -175,14 +365,13 @@ class Neo4jClient:
         query = """
         MATCH (a:Entity {id: $source})
         MATCH (b:Entity {id: $target})
-        MERGE (a)-[r:RELATES_TO {type: $rel_type}]->(b)
+        MERGE (a)-[r:RELATES_TO {type: $rel_type, source_doc: $source_doc}]->(b)
         SET r.context = $context,
             r.source_doc = $source_doc,
             r.updated_at = datetime()
         """
         props = edge.get("properties", {})
-        async with self.driver.session() as session:
-            await session.run(
+        await self._run_mutation(
                 query,
                 source=edge["source"],
                 target=edge["target"],
@@ -233,12 +422,15 @@ class Neo4jClient:
               WHEN NOT $source_doc IN n.source_docs THEN n.source_docs + $source_doc
               ELSE n.source_docs END,
             n.updated_at = datetime()
+        REMOVE n:SemanticEntity, n.semantic_embedding, n.embedding,
+               n.embedding_method, n.embedding_model, n.embedding_version,
+               n.embedding_dimension
         """
         edge_query = """
         UNWIND $edges AS edge
         MATCH (a:Entity {id: edge.source})
         MATCH (b:Entity {id: edge.target})
-        MERGE (a)-[r:RELATES_TO {type: edge.rel_type}]->(b)
+        MERGE (a)-[r:RELATES_TO {type: edge.rel_type, source_doc: $source_doc}]->(b)
         SET r.context = edge.context,
             r.source_doc = $source_doc,
             r.updated_at = datetime()
@@ -248,12 +440,15 @@ class Neo4jClient:
             async with self.driver.session() as session:
                 tx = await session.begin_transaction()
                 try:
+                    await self._lock_graph(tx)
+                    if source_doc:
+                        await self._touch_legacy_source(tx, source_doc)
                     if batch_nodes:
                         await tx.run(node_query, nodes=batch_nodes, source_doc=source_doc)
                     if batch_edges:
                         await tx.run(edge_query, edges=batch_edges, source_doc=source_doc)
                     await tx.commit()
-                except Exception:
+                except BaseException:
                     await tx.rollback()
                     raise
 
@@ -264,7 +459,7 @@ class Neo4jClient:
     # Read / query operations
     # ------------------------------------------------------------------
     async def get_node_context(self, label: str, depth: int = 2) -> str:
-        """Get a node and its N-hop neighborhood as text context for GraphRAG.
+        """Legacy label-based context helper; GraphRAG uses get_entity_context by ID.
 
         The center is matched case-insensitively on `label` *or* on any merged
         alias, so questions phrased with a duplicate's wording still resolve.
@@ -297,7 +492,7 @@ class Neo4jClient:
         return "\n".join(lines) if lines else f"No context found for '{label}'"
 
     async def search_nodes(self, query_text: str, limit: int = 10) -> list[dict]:
-        """Full-text search across entity labels, aliases, and summaries."""
+        """Substring lexical search across entity labels, aliases, and summaries."""
         query = f"""
         MATCH (n:Entity)
         WHERE toLower(n.label) CONTAINS toLower($q)
@@ -310,18 +505,75 @@ class Neo4jClient:
             result = await session.run(query, q=query_text, limit=limit)
             return [dict(record) async for record in result]
 
-    async def vector_search(self, embedding: list[float], limit: int = 10) -> list[dict]:
-        """Find entities by cosine similarity against a pre-computed embedding vector."""
+    async def vector_search(self, embedding: list[float], limit: int = 10,
+                            model=None, version=None) -> list[dict]:
+        space = configured_embedding_space()
+        if ((model is not None and model != space["model"])
+                or (version is not None and version != space["version"])
+                or not self._valid_vector(embedding, space["dimension"])):
+            return []
         query = """
-        CALL db.index.vector.queryNodes('entity_embedding', $limit, $embedding)
+        CALL db.index.vector.queryNodes('entity_semantic_embedding', $limit, $embedding)
         YIELD node, score
+        WHERE node.embedding_method = 'nosana' AND node.embedding_model = $model
+          AND node.embedding_version = $version
+          AND size(node.semantic_embedding) = $dimension
         RETURN node.id AS id, node.label AS label, node.type AS type,
                node.summary AS summary, node.source_docs AS source_docs,
                node.aliases AS aliases, score
         """
         async with self.driver.session() as session:
-            result = await session.run(query, embedding=embedding, limit=int(limit))
+            if not await self._space_is_active(session, space):
+                return []
+            result = await session.run(query, embedding=embedding,
+                                       limit=max(1, min(int(limit), 100)), **space)
             return [dict(record) async for record in result]
+
+    async def get_entity_context(self, entity_id: str, depth: int = 2) -> dict:
+        """Expand a bounded frontier, never enumerate all paths through a dense graph."""
+        safe_depth = max(1, min(int(depth), 4))
+        nodes, edges, seen_edges, sources = {}, [], [], set()
+        projection = "{.id, .label, .type, .summary, .source_docs}"
+        async with self.driver.session() as session:
+            result = await session.run(
+                f"MATCH (n:Entity {{id: $id}}) RETURN n {projection} AS node", id=entity_id)
+            row = await result.single()
+            if row:
+                nodes[entity_id] = dict(row["node"])
+            frontier = list(nodes)
+            for _ in range(safe_depth):
+                if not frontier or len(edges) >= 50:
+                    break
+                result = await session.run(f"""
+                    MATCH (a:Entity) WHERE a.id IN $frontier
+                    MATCH (a)-[r:RELATES_TO]-(b:Entity)
+                    WHERE NOT elementId(r) IN $seen
+                    WITH a, r, b LIMIT $remaining
+                    RETURN a {projection} AS a, b {projection} AS b,
+                      elementId(r) AS edge_id,
+                      {{source: startNode(r).id, target: endNode(r).id,
+                        type: coalesce(r.type, type(r)), context: r.context,
+                        source_doc: r.source_doc}} AS edge
+                    """, frontier=frontier, seen=seen_edges, remaining=50 - len(edges))
+                next_frontier = []
+                async for row in result:
+                    for node in (row["a"], row["b"]):
+                        if node["id"] not in nodes:
+                            next_frontier.append(node["id"])
+                        nodes[node["id"]] = dict(node)
+                    if row["edge_id"] not in seen_edges:
+                        seen_edges.append(row["edge_id"])
+                        edges.append(dict(row["edge"]))
+                frontier = list(dict.fromkeys(next_frontier))
+        for node in nodes.values():
+            sources.update(node.get("source_docs") or [])
+        sources.update(e["source_doc"] for e in edges if e.get("source_doc"))
+        lines = [f"{n['label']} ({n['type']}): {n.get('summary') or ''}"
+                 for n in nodes.values()]
+        lines += [f"{nodes[e['source']]['label']} — [{e['type']}] → "
+                  f"{nodes[e['target']]['label']}: {e.get('context') or ''}" for e in edges]
+        return {"text": "\n".join(lines), "source_docs": sorted(sources - {""}),
+                "entity_ids": list(nodes), "nodes": list(nodes.values()), "edges": edges}
 
     async def get_stats(self) -> dict:
         """Quick graph statistics."""
@@ -554,113 +806,119 @@ class Neo4jClient:
         }
 
     async def get_sources(self) -> list[dict]:
-        """List ingested source documents with their entity counts."""
+        """List both explicit metadata and unmigrated legacy source memberships."""
         query = """
-        MATCH (n:Entity) WHERE n.source_docs IS NOT NULL
-        UNWIND n.source_docs AS src
-        WITH src AS source_doc, count(*) AS node_count, toString(max(n.updated_at)) AS updated_at
-        WHERE source_doc <> ''
-        RETURN source_doc, node_count, updated_at
-        ORDER BY node_count DESC
+        CALL () {
+          MATCH (n:Entity) UNWIND coalesce(n.source_docs, []) AS id RETURN id
+          UNION MATCH (s:Source) WHERE NOT coalesce(s._deleted, false)
+            AND NOT coalesce(s._placeholder, false) RETURN s.id AS id
+        }
+        WITH DISTINCT id WHERE id <> ''
+        OPTIONAL MATCH (n:Entity) WHERE id IN coalesce(n.source_docs, [])
+        WITH id, count(n) AS node_count, toString(max(n.updated_at)) AS updated_at
+        OPTIONAL MATCH (s:Source {id: id})
+        RETURN id AS source_doc, node_count, updated_at,
+               coalesce(s.title, id) AS title, coalesce(s.kind, 'legacy') AS kind,
+               s.uri AS uri, s.version AS version
+        ORDER BY node_count DESC, source_doc
         """
         async with self.driver.session() as session:
             result = await session.run(query)
             return [dict(record) async for record in result]
 
     async def delete_source(self, source_doc: str) -> dict:
-        """Remove one source document from the graph.
-
-        Edges are per-document assertions, so they are deleted outright. Nodes
-        only lose their membership in `source_docs`; a node is deleted once no
-        source claims it any more.
-        """
-        edges_query = """
-        MATCH ()-[r:RELATES_TO]->()
-        WHERE r.source_doc = $source_doc
-        WITH collect(r) AS rels, count(r) AS deleted
-        FOREACH (x IN rels | DELETE x)
-        RETURN deleted
-        """
-        membership_query = """
-        MATCH (n:Entity)
-        WHERE $source_doc IN coalesce(n.source_docs, [])
-        SET n.source_docs = [s IN n.source_docs WHERE s <> $source_doc]
-        RETURN count(n) AS removed
-        """
-        orphans_query = """
-        MATCH (n:Entity)
-        WHERE n.source_docs = []
-        WITH collect(n) AS nodes, count(n) AS deleted
-        FOREACH (x IN nodes | DETACH DELETE x)
-        RETURN deleted
-        """
-
         async with self.driver.session() as session:
             tx = await session.begin_transaction()
             try:
-                result = await tx.run(edges_query, source_doc=source_doc)
-                record = await result.single()
-                deleted_edges = record["deleted"] if record else 0
-
-                result = await tx.run(membership_query, source_doc=source_doc)
-                record = await result.single()
-                removed_memberships = record["removed"] if record else 0
-
-                result = await tx.run(orphans_query)
-                record = await result.single()
-                deleted_nodes = record["deleted"] if record else 0
-
+                await self._lock_graph(tx)
+                await tx.run("MERGE (s:Source {id: $id}) "
+                             "SET s._lock = coalesce(s._lock, 0) + 1", id=source_doc)
+                counts = await self._remove_source_graph(tx, source_doc)
+                await tx.run("MATCH (s:Source {id: $id}) "
+                             "SET s = {id: $id, version: $version, _deleted: true}",
+                             id=source_doc, version="deleted_" + uuid.uuid4().hex)
                 await tx.commit()
-            except Exception:
+            except BaseException:
                 await tx.rollback()
                 raise
-
-        log.info(
-            "Deleted source '%s': %d nodes, %d memberships, %d edges",
-            source_doc,
-            deleted_nodes,
-            removed_memberships,
-            deleted_edges,
-        )
-        return {
-            "deleted_nodes": deleted_nodes,
-            "removed_memberships": removed_memberships,
-            "deleted_edges": deleted_edges,
-        }
+        return counts
 
     async def clear_graph(self) -> dict:
-        """Delete every entity in the graph. Counts and deletes in one transaction."""
-        query = """
-        MATCH (n:Entity)
-        WITH collect(n) AS nodes, count(n) AS deleted
-        FOREACH (x IN nodes | DETACH DELETE x)
-        RETURN deleted
-        """
         async with self.driver.session() as session:
-            result = await session.run(query)
-            record = await result.single()
-            deleted = record["deleted"] if record else 0
+            tx = await session.begin_transaction()
+            try:
+                await self._lock_graph(tx)
+                result = await tx.run("""
+                    MATCH (n:Entity) WITH collect(n) AS nodes, count(n) AS deleted
+                    FOREACH (n IN nodes | DETACH DELETE n) RETURN deleted
+                    """)
+                row = await result.single()
+                await tx.run("MATCH (s:Source) "
+                             "SET s = {id: s.id, version: $version, _deleted: true}",
+                             version="deleted_" + uuid.uuid4().hex)
+                await tx.commit()
+            except BaseException:
+                await tx.rollback()
+                raise
+        return {"deleted_nodes": row["deleted"] if row else 0}
 
-        log.info("Graph cleared: %d nodes deleted", deleted)
-        return {"deleted_nodes": deleted}
+    @staticmethod
+    def _valid_vector(vector, dimension):
+        try:
+            return (isinstance(vector, list) and len(vector) == dimension
+                    and all(isinstance(v, (float, int)) and not isinstance(v, bool)
+                            and math.isfinite(v) for v in vector)
+                    and any(v != 0 for v in vector))
+        except (OverflowError, ValueError, TypeError):
+            return False
 
-    async def set_node_embeddings(self, items: list[dict], method: str = "unknown") -> None:
-        """Batch-attach embedding vectors to existing nodes.
-
-        Each item is {"id": str, "embedding": list[float]}. `method` records
-        which embedding path produced the vectors ("nosana" vs the local hash
-        fallback) — duplicate suggestion only trusts real semantic vectors.
-        """
+    async def set_node_embeddings(self, items: list[dict], method: str = "unknown") -> int:
+        """Quarantine fallback/unknown vectors; index only explicit active-space results."""
         if not items:
-            return
+            return 0
+        space = configured_embedding_space()
+        prepared = []
+        for item in items:
+            item_method = item.get("method", method)
+            model, version = item.get("model"), item.get("version")
+            vector = item.get("embedding")
+            semantic = (item_method == "nosana" and model == space["model"]
+                        and version == space["version"]
+                        and item.get("dimension") == space["dimension"]
+                        and self._valid_vector(vector, space["dimension"]))
+            prepared.append({"id": item["id"], "embedding": vector,
+                             "method": item_method, "model": model, "version": version,
+                             "dimension": item.get("dimension"), "semantic": semantic,
+                             "guard_summary": "expected_summary" in item,
+                             "guard_label": "expected_label" in item,
+                             "expected_summary": item.get("expected_summary"),
+                             "expected_label": item.get("expected_label")})
         query = """
-        UNWIND $items AS it
-        MATCH (n:Entity {id: it.id})
-        SET n.embedding = it.embedding,
-            n.embedding_method = $method
+        UNWIND $items AS it MATCH (n:Entity {id: it.id})
+        WHERE (NOT it.guard_summary OR coalesce(n.summary, '') = it.expected_summary)
+          AND (NOT it.guard_label OR coalesce(n.label, '') = it.expected_label)
+        SET n.embedding = it.embedding, n.embedding_method = it.method,
+            n.embedding_model = it.model, n.embedding_version = it.version,
+            n.embedding_dimension = it.dimension
+        REMOVE n:SemanticEntity, n.semantic_embedding
+        FOREACH (_ IN CASE WHEN it.semantic THEN [1] ELSE [] END |
+          SET n:SemanticEntity, n.semantic_embedding = it.embedding)
+        RETURN count(n) AS stored
         """
         async with self.driver.session() as session:
-            await session.run(query, items=items, method=method)
+            tx = await session.begin_transaction()
+            try:
+                await self._lock_graph(tx)
+                if not await self._space_is_active(tx, space):
+                    await tx.rollback()
+                    return 0
+                result = await tx.run(query, items=prepared)
+                row = await result.single()
+                await tx.commit()
+            except BaseException:
+                await tx.rollback()
+                raise
+        return row["stored"] if row else 0
 
     # ------------------------------------------------------------------
     # Deduplication: candidate generation
@@ -726,19 +984,22 @@ class Neo4jClient:
         safe_limit = max(1, min(int(limit), 100))
 
         count_query = """
-        MATCH (n:Entity)
-        WHERE n.embedding_method = 'nosana' AND n.embedding IS NOT NULL
+        MATCH (n:SemanticEntity)
+        WHERE n.embedding_method = 'nosana' AND n.embedding_model = $model
+          AND n.embedding_version = $version AND size(n.semantic_embedding) = $dimension
         RETURN count(n) AS embedded
         """
         pairs_query = f"""
-        MATCH (a:Entity) WHERE a.embedding_method = 'nosana' AND a.embedding IS NOT NULL
+        MATCH (a:SemanticEntity) WHERE a.embedding_method = 'nosana'
+          AND a.embedding_model = $model AND a.embedding_version = $version
+          AND size(a.semantic_embedding) = $dimension
         WITH a ORDER BY a.updated_at DESC LIMIT $cap
         WITH collect(a) AS ns
         UNWIND range(0, size(ns)-2) AS i
         UNWIND range(i+1, size(ns)-1) AS j
         WITH ns[i] AS a, ns[j] AS b
         WHERE a.norm_label <> b.norm_label
-        WITH a, b, vector.similarity.cosine(a.embedding, b.embedding) AS sim
+        WITH a, b, vector.similarity.cosine(a.semantic_embedding, b.semantic_embedding) AS sim
         WHERE sim >= $threshold
         RETURN a {_NODE_PROJECTION} AS a, b {_NODE_PROJECTION} AS b, sim
         ORDER BY sim DESC
@@ -746,7 +1007,9 @@ class Neo4jClient:
         """
 
         async with self.driver.session() as session:
-            result = await session.run(count_query)
+            if not await self._space_is_active(session, configured_embedding_space()):
+                return {"pairs": [], "enabled": False, "reason": "embedding space changed"}
+            result = await session.run(count_query, **configured_embedding_space())
             record = await result.single()
             embedded = record["embedded"] if record else 0
             if embedded < 2:
@@ -760,7 +1023,8 @@ class Neo4jClient:
                 }
 
             result = await session.run(
-                pairs_query, cap=safe_cap, threshold=safe_threshold, limit=safe_limit
+                pairs_query, cap=safe_cap, threshold=safe_threshold, limit=safe_limit,
+                **configured_embedding_space()
             )
             pairs = [
                 {"nodes": [record["a"], record["b"]], "similarity": float(record["sim"])}
@@ -776,10 +1040,10 @@ class Neo4jClient:
         """Merge duplicate entities into one canonical node, in one transaction.
 
         Edges of the duplicates are repointed at the canonical node (identical
-        (endpoint, type) pairs collapse), provenance is unioned, the
+        (endpoint, type, source_doc) triples collapse), provenance is unioned, the
         duplicates' labels/aliases become the canonical node's `aliases`, and
-        the longest summary wins. The canonical node's `norm_label` and
-        `embedding` are left alone — re-embedding is the agent layer's job.
+        the longest summary wins. The canonical node's `norm_label` is preserved;
+        embeddings are invalidated transactionally before agent re-embedding.
 
         Returns on success::
 
@@ -813,7 +1077,8 @@ class Neo4jClient:
         UNWIND $dup_ids AS did
         MATCH (d:Entity {id: did})-[r:RELATES_TO]->(m:Entity)
         WHERE m.id <> $canonical_id AND NOT m.id IN $dup_ids
-        MERGE (c)-[nr:RELATES_TO {type: coalesce(r.type, 'RELATES_TO')}]->(m)
+        MERGE (c)-[nr:RELATES_TO {type: coalesce(r.type, 'RELATES_TO'),
+                                      source_doc: coalesce(r.source_doc, '')}]->(m)
         ON CREATE SET nr.context = r.context,
                       nr.source_doc = r.source_doc,
                       nr.updated_at = r.updated_at
@@ -824,7 +1089,8 @@ class Neo4jClient:
         UNWIND $dup_ids AS did
         MATCH (m:Entity)-[r:RELATES_TO]->(d:Entity {id: did})
         WHERE m.id <> $canonical_id AND NOT m.id IN $dup_ids
-        MERGE (m)-[nr:RELATES_TO {type: coalesce(r.type, 'RELATES_TO')}]->(c)
+        MERGE (m)-[nr:RELATES_TO {type: coalesce(r.type, 'RELATES_TO'),
+                                      source_doc: coalesce(r.source_doc, '')}]->(c)
         ON CREATE SET nr.context = r.context,
                       nr.source_doc = r.source_doc,
                       nr.updated_at = r.updated_at
@@ -853,6 +1119,10 @@ class Neo4jClient:
             c.aliases = aliases,
             c.summary = best_summary,
             c.updated_at = datetime()
+        FOREACH (_ IN CASE WHEN size(dups) > 0 THEN [1] ELSE [] END |
+          REMOVE c:SemanticEntity, c.semantic_embedding, c.embedding,
+                 c.embedding_method, c.embedding_model, c.embedding_version,
+                 c.embedding_dimension)
         WITH c, dups, aliases, size(dups) AS merged
         FOREACH (d IN dups | DETACH DELETE d)
         RETURN c {.id, .label, .type, .summary, .source_docs, .aliases} AS canonical,
@@ -867,6 +1137,7 @@ class Neo4jClient:
         async with self.driver.session() as session:
             tx = await session.begin_transaction()
             try:
+                await self._lock_graph(tx)
                 result = await tx.run(validate_query, ids=ids)
                 record = await result.single()
                 found = set(record["found"]) if record else set()
@@ -900,7 +1171,7 @@ class Neo4jClient:
                 edges = [dict(r) async for r in result]
 
                 await tx.commit()
-            except Exception:
+            except BaseException:
                 await tx.rollback()
                 raise
 

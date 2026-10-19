@@ -30,6 +30,7 @@ import pytest
 
 import src.agent.core as core
 from src.agent.core import GraphAgent
+from src.ingestion.sources import build_source
 
 EXPECTED_STAGES = ["parsing", "extracting", "embedding", "broadcasting", "verifying"]
 
@@ -108,7 +109,9 @@ async def test_ingest_file_source_doc_falls_back_to_filename(agent, monkeypatch)
     await agent.ingest_file(b"irrelevant bytes", "notes.txt", source=None)
 
     fake_ingest_to_graph.assert_awaited_once()
-    assert fake_ingest_to_graph.await_args.kwargs["source_doc"] == "notes.txt"
+    assert fake_ingest_to_graph.await_args.kwargs["source_doc"] == build_source(
+        "file", "notes.txt", "", "",
+    )["id"]
 
 
 @pytest.mark.asyncio
@@ -124,7 +127,9 @@ async def test_ingest_file_source_doc_uses_explicit_source(agent, monkeypatch) -
     await agent.ingest_file(b"irrelevant bytes", "notes.txt", source="my-custom-doc")
 
     fake_ingest_to_graph.assert_awaited_once()
-    assert fake_ingest_to_graph.await_args.kwargs["source_doc"] == "my-custom-doc"
+    assert fake_ingest_to_graph.await_args.kwargs["source_doc"] == build_source(
+        "file", "my-custom-doc", "", "",
+    )["id"]
 
 
 @pytest.mark.asyncio

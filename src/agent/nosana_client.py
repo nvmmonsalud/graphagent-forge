@@ -11,10 +11,11 @@ from typing import Any
 
 import httpx
 
+from src.graph.embedding_space import EMBEDDING_DIM, configured_embedding_space
+
 log = logging.getLogger(__name__)
 
 DEFAULT_NOSANA_API = "https://dashboard.k8s.prd.nos.ci/api"
-EMBEDDING_DIM = 384
 _UINT32_SCALE = float(1 << 32)
 
 
@@ -39,6 +40,7 @@ class NosanaClient:
         self.embedding_url = os.getenv("NOSANA_EMBEDDING_URL", "").strip()
         self.headers = {}
         self.last_embedding_method = "uninitialized"
+        self.embedding_space = configured_embedding_space()
         self._client: httpx.AsyncClient | None = None
         if self.api_key:
             self.headers["Authorization"] = f"Bearer {self.api_key}"
@@ -114,11 +116,15 @@ class NosanaClient:
         )
 
     async def get_embedding(self, text: str) -> list[float]:
-        """Generate a 384-dim embedding vector for the given text.
+        """Compatibility wrapper returning only the generated vector."""
+        result = await self.get_embedding_result(text)
+        return result["embedding"]
 
-        Submits an embedding job to Nosana if an API key is configured and the
-        service is reachable.  Falls back to a deterministic hash-based
-        pseudo-embedding so that downstream vector indexes always work.
+    async def get_embedding_result(self, text: str) -> dict[str, Any]:
+        """Return a vector and per-call provenance, safe for concurrent callers.
+
+        ``last_embedding_method`` remains diagnostic only. The result's metadata
+        is a fresh snapshot and must accompany any stored or queried vector.
         """
         # Nosana's documented API manages GPU jobs/deployments; it does not
         # guarantee a hosted OpenAI-compatible /embeddings route. Only call an
@@ -136,7 +142,11 @@ class NosanaClient:
                 embedding = data.get("embedding", [])
                 if _is_finite_embedding(embedding):
                     self.last_embedding_method = "nosana"
-                    return [float(v) for v in embedding]
+                    return {
+                        **self.embedding_space,
+                        "embedding": [float(v) for v in embedding],
+                        "method": "nosana",
+                    }
                 if isinstance(embedding, list) and len(embedding) == EMBEDDING_DIM:
                     log.warning(
                         "Nosana embedding contained non-finite values, using hash fallback"
@@ -150,7 +160,11 @@ class NosanaClient:
             log.info("NOSANA_EMBEDDING_URL not configured; using local fallback")
 
         self.last_embedding_method = "local_hash_fallback"
-        return self._hash_embedding(text)
+        return {
+            **self.embedding_space,
+            "embedding": self._hash_embedding(text),
+            "method": "local_hash_fallback",
+        }
 
     @staticmethod
     def _hash_embedding(text: str) -> list[float]:

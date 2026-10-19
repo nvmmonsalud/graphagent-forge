@@ -1,8 +1,8 @@
 """Streamlit dashboard — GraphAgent Forge UI."""
 import os
-import streamlit as st
+
 import httpx
-import json
+import streamlit as st
 
 API_BASE = os.getenv("GRAPHAGENT_API", "http://localhost:8000") + "/api"
 # Matches the server's API_KEY when it is set; sent on ingest/ask calls.
@@ -32,7 +32,8 @@ with st.sidebar:
     st.image("https://img.icons8.com/color/96/brain.png", width=64)
     st.title("🧠 GraphAgent Forge")
     st.caption("Turn scattered information into connected intelligence")
-    st.caption("This is a secondary dashboard — the primary UI is served at the API root (GRAPHAGENT_API).")
+    st.caption("This is a secondary dashboard — the primary UI is served "
+               "at the API root (GRAPHAGENT_API).")
 
     st.divider()
 
@@ -63,7 +64,8 @@ tab_ingest, tab_query, tab_search = st.tabs(["📥 Ingest", "🔍 Query", "🔎 
 # ------------------------------------------------------------------
 with tab_ingest:
     st.header("📥 Ingest Data")
-    st.write("Feed URLs or text into the knowledge graph. Kimi AI extracts entities and relationships, Neo4j stores the graph.")
+    st.write("Feed URLs or text into the knowledge graph. Kimi AI extracts entities "
+             "and relationships, Neo4j stores the graph.")
 
     ingest_mode = st.radio("Mode", ["URL", "Text", "File"], horizontal=True)
 
@@ -82,6 +84,7 @@ with tab_ingest:
 
                         if result.get("success"):
                             st.success(
+                                "✅ Already up to date" if result.get("unchanged") else
                                 f"✅ Ingested! {result['nodes']} nodes, {result['edges']} edges"
                             )
                             ext = result.get("extraction", {})
@@ -100,7 +103,8 @@ with tab_ingest:
             height=200,
             placeholder="Paste an article, notes, or any text...",
         )
-        source = st.text_input("Source label", value="manual-input")
+        source = st.text_input("Source label", value="manual-input",
+                               help="Reusing this name replaces the existing text source.")
         if st.button("🚀 Ingest Text", type="primary"):
             if text:
                 with st.spinner("Extracting entities, building graph..."):
@@ -114,6 +118,7 @@ with tab_ingest:
 
                         if result.get("success"):
                             st.success(
+                                "✅ Already up to date" if result.get("unchanged") else
                                 f"✅ Ingested! {result['nodes']} nodes, {result['edges']} edges"
                             )
                         else:
@@ -125,7 +130,8 @@ with tab_ingest:
 
     else:
         up = st.file_uploader("File to ingest", type=["pdf", "txt", "md"])
-        source = st.text_input("Source label (optional)", value="")
+        source = st.text_input("Source label (optional)", value="",
+                               help="Reusing a name or filename replaces that file source.")
         if st.button("🚀 Ingest File", type="primary"):
             if up:
                 with st.spinner("Parsing file, extracting entities, building graph..."):
@@ -141,6 +147,7 @@ with tab_ingest:
 
                         if result.get("success"):
                             st.success(
+                                "✅ Already up to date" if result.get("unchanged") else
                                 f"✅ Ingested! {result['nodes']} nodes, {result['edges']} edges"
                             )
                         else:

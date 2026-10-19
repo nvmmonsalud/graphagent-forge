@@ -4,7 +4,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from src.agent.nosana_client import NosanaClient
+from src.agent.nosana_client import NosanaClient, _is_finite_embedding
+from src.graph.embedding_space import configured_embedding_space
 from src.graph.neo4j_client import Neo4jClient
 from src.ingestion.entity_parser import LLM_UNAVAILABLE_PREFIX, answer_query
 
@@ -16,8 +17,7 @@ class GraphRAGEngine:
 
     def __init__(self, neo4j: Neo4jClient, nosana: NosanaClient | None = None):
         self.neo4j = neo4j
-        # Share the agent's client when one is passed so `last_embedding_method`
-        # has a single source of truth; otherwise stand up our own.
+        # Reuse the application client; retrieval relies on per-call metadata.
         self.nosana = nosana or NosanaClient()
 
     async def query(self, question: str) -> dict:
@@ -27,9 +27,17 @@ class GraphRAGEngine:
 
         # Step 0: Vector search first (F3) — semantic similarity
         try:
-            embedding = await self.nosana.get_embedding(question)
-            if self.nosana.last_embedding_method == "nosana":
-                vec_results = await self.neo4j.vector_search(embedding, limit=10)
+            result = await self.nosana.get_embedding_result(question)
+            space = configured_embedding_space()
+            if (
+                result["method"] == "nosana"
+                and all(result.get(key) == value for key, value in space.items())
+                and _is_finite_embedding(result["embedding"])
+            ):
+                vec_results = await self.neo4j.vector_search(
+                    result["embedding"], limit=10,
+                    model=result["model"], version=result["version"],
+                )
                 for r in vec_results:
                     seen_ids.add(r["id"])
                     candidates.append(r)
@@ -60,30 +68,28 @@ class GraphRAGEngine:
                 "sources": [],
                 "source_docs": [],
                 "status": "no_context",
+                "evidence": [],
             }
 
         # Step 2: Get neighborhood context for top candidates, fetched in parallel
-        seen_labels: set[str] = set()
-        labels: list[str] = []
-        for candidate in candidates[:5]:  # Top 5 unique
-            label = candidate["label"]
-            if label in seen_labels:
-                continue
-            seen_labels.add(label)
-            labels.append(label)
-
+        selected = candidates[:5]
         contexts = await asyncio.gather(
-            *[self.neo4j.get_node_context(label, depth=2) for label in labels]
+            *[self.neo4j.get_entity_context(candidate["id"], depth=2) for candidate in selected]
         )
-        context = "\n\n".join(ctx for ctx in contexts if ctx)
-
-        # Collect provenance from candidates — each carries a list of source docs
-        # (merged canonicals span several documents).
-        source_docs: list[str] = []
-        for candidate in candidates[:5]:
-            for src in candidate.get("source_docs") or []:
-                if src and src not in source_docs:
-                    source_docs.append(src)
+        evidence = [ctx for ctx in contexts if ctx.get("text")]
+        if not evidence:
+            return {
+                "answer": "No relevant entity context found in the knowledge graph.",
+                "context_nodes": [], "sources": [], "source_docs": [],
+                "status": "no_context", "evidence": [],
+            }
+        context = "\n\n".join(ctx["text"] for ctx in evidence)
+        # Preserve the historical label list for display, but never use labels
+        # as graph identities: two selected entities may share the same label.
+        labels = list(dict.fromkeys(candidate["label"] for candidate in selected))
+        source_docs = list(dict.fromkeys(
+            source for ctx in evidence for source in ctx.get("source_docs", []) if source
+        ))
 
         # Step 3: Reason with LLM using graph context
         answer = await answer_query(question, context)
@@ -93,6 +99,7 @@ class GraphRAGEngine:
             "context_nodes": labels,
             "sources": candidates[:5],
             "source_docs": source_docs,
+            "evidence": evidence,
             # `answer_query` returns a plain string; a failure notice is flagged by
             # its fixed prefix so an "LLM unavailable" message is never presented
             # as a real answer.

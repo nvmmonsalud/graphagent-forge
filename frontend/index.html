@@ -1358,6 +1358,7 @@ footer a { color: var(--accent2); text-decoration: none; }
         <div class="input-group">
           <label>Source label</label>
           <input type="text" id="ingest-source" value="manual">
+          <small>Reusing a source name replaces that source.</small>
         </div>
         <button class="btn" id="btn-ingest-text" onclick="doIngestText()">🚀 Ingest Text</button>
       </div>
@@ -1373,6 +1374,7 @@ footer a { color: var(--accent2); text-decoration: none; }
         <div class="input-group">
           <label>Source label</label>
           <input type="text" id="ingest-file-source" placeholder="defaults to filename">
+          <small>Reusing a source name or filename replaces that source.</small>
         </div>
         <button class="btn" id="btn-ingest-file" onclick="doIngestFile()">🚀 Ingest File</button>
       </div>
@@ -1456,6 +1458,8 @@ footer a { color: var(--accent2); text-decoration: none; }
 
 <script>
 const API = '/api';
+const sourceTitles = new Map();
+const sourceTitle = id => sourceTitles.get(String(id)) || String(id);
 
 // ═══════════════════════════════════════
 //  XSS-SAFE ESCAPE + FETCH HELPERS
@@ -2272,7 +2276,9 @@ function renderIngestJob(job) {
       const titleHtml = (activeIngestJob.kind === 'url' || activeIngestJob.kind === 'file')
         ? ` — <span style="color:var(--muted)">${esc(job.result.extraction?.title || activeIngestJob.label)}</span>`
         : '';
-      result.innerHTML = `<div class="result-box success"><strong>✅ Ingested</strong>${titleHtml}<br><span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(job.result.nodes)}</span> <span style="color:var(--muted)">nodes</span> · <span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(job.result.edges)}</span> <span style="color:var(--muted)">edges</span></div>`;
+      result.innerHTML = job.result.unchanged
+        ? `<div class="result-box success"><strong>✅ Already up to date</strong>${titleHtml}</div>`
+        : `<div class="result-box success"><strong>✅ Ingested</strong>${titleHtml}<br><span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(job.result.nodes)}</span> <span style="color:var(--muted)">nodes</span> · <span style="font-family:'JetBrains Mono';font-size:1.3rem;color:var(--accent2)">${esc(job.result.edges)}</span> <span style="color:var(--muted)">edges</span></div>`;
       loadStats(); loadSources();
       if (!ws || ws.readyState !== 1) initForceGraph(currentSourceFilter);
     } else {
@@ -2405,7 +2411,7 @@ function contextChipsHtml(d) {
 
 function provenanceHtml(d) {
   if (!d || !d.source_docs || !d.source_docs.length) return '';
-  return `<div class="provenance"><div class="prov-label">Provenance</div>${d.source_docs.map(s=>`<span class="prov-tag">${esc(s)}</span>`).join(' ')}</div>`;
+  return `<div class="provenance"><div class="prov-label">Provenance</div>${d.source_docs.map(s=>`<span class="prov-tag">${esc(sourceTitle(s))}</span>`).join(' ')}</div>`;
 }
 
 async function doQuery() {
@@ -2570,6 +2576,11 @@ function connectWebSocket() {
       const msg = JSON.parse(event.data);
       if (msg.type === 'graph_update' && msg.nodes && msg.edges) {
         handleGraphUpdate(msg.nodes, msg.edges);
+        scheduleSourcesRefresh();
+        scheduleDuplicatesRefresh();
+      } else if (msg.type === 'graph_reset') {
+        // Published source versions replace nodes; refetch to remove stale IDs.
+        initForceGraph(currentSourceFilter);
         scheduleSourcesRefresh();
         scheduleDuplicatesRefresh();
       } else if (msg.type === 'graph_merge' && msg.removed_ids) {
@@ -2796,6 +2807,8 @@ async function loadSources() {
   try {
     const d = await apiFetch(API + '/sources');
     const sources = (d && d.sources) || [];
+    sourceTitles.clear();
+    sources.forEach(s => sourceTitles.set(String(s.source_doc), s.title || s.source_doc));
     listEl.dataset.loaded = '1';
     if (!sources.length) {
       listEl.innerHTML = '<p style="color:var(--muted);font-size:0.82rem">No sources ingested yet.</p>';
@@ -2804,7 +2817,7 @@ async function loadSources() {
     listEl.innerHTML = sources.map(s => `
       <div class="source-item" data-source="${esc(s.source_doc)}">
         <div>
-          <div class="source-item-name">${esc(s.source_doc)}</div>
+          <div class="source-item-name">${esc(s.title || s.source_doc)}</div>
           <div class="source-item-count">${esc(s.node_count)} nodes</div>
         </div>
         <div class="source-item-actions">
@@ -2866,7 +2879,7 @@ async function focusSource(sourceDoc) {
 async function deleteSource(sourceDoc) {
   const ok = await confirmDialog({
     title: 'Delete this source?',
-    body: `"${sourceDoc}" and all of its nodes will be removed from the graph. This cannot be undone.`,
+    body: `"${sourceTitle(sourceDoc)}" and all of its nodes will be removed from the graph. This cannot be undone.`,
     confirmLabel: 'Delete source',
     danger: true
   });
@@ -2923,7 +2936,7 @@ async function loadDuplicates() {
               <span class="type-badge" style="background:${tc(n.type)};color:${n.type==='Place'?'#333':'#fff'}">${esc(n.type)}</span>
               <span class="dup-member-label">${esc(n.label)}</span>
             </div>
-            <div class="dup-member-source">${esc((n.source_docs || []).join(', '))}</div>
+            <div class="dup-member-source">${esc((n.source_docs || []).map(sourceTitle).join(', '))}</div>
           </div>`).join('');
         return `
           <div class="dup-group">

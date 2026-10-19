@@ -58,6 +58,13 @@ Tools that need new dependencies/services get their own reviewed setup changes.
 
 ## M1 — Stable sources and correct retrieval
 
+Delivery status: implemented. See [M1_UPGRADE.md](M1_UPGRADE.md)
+for legacy metadata migration, rollback, re-embedding, compatibility and limits.
+Validation: 1,522 offline tests and all 31 disposable Neo4j 5.26 integration tests
+passed, plus Ruff and Chromium source-title/refetch/unchanged-state checks.
+Independent code/security reviewers approved the final diff, with exact-commit
+confirmation required before push. Provider behavior used mocks; no paid APIs ran.
+
 Scope:
 
 - Fix R1/R2: retrieve by entity ID, always include center summaries, and carry

@@ -5,6 +5,10 @@ review, not a penetration test or production certification. Three independent
 agents reviewed code/retrieval, security, and product capabilities; the coordinator
 checked their conclusions against the implementation and researched primary sources.
 
+Follow-up: R5 was addressed in the M0 lifecycle slice; R1–R4 are addressed by M1.
+The findings below remain as evidence of the reviewed baseline. See
+[M1_UPGRADE.md](M1_UPGRADE.md) for delivered behavior, migration and limits.
+
 The baseline's most recent validation was 1,462 passing offline tests, 14 integration
 tests deselected, and Ruff passing. That result predates these documentation files.
 Tests do not establish retrieval quality or security by themselves. No live Kimi,
