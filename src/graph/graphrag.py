@@ -5,9 +5,15 @@ import asyncio
 import logging
 
 from src.agent.nosana_client import NosanaClient, _is_finite_embedding
+from src.graph.citations import (
+    bounded_evidence,
+    citation_metadata,
+    evidence_unchanged,
+    validate_answer,
+)
 from src.graph.embedding_space import configured_embedding_space
 from src.graph.neo4j_client import Neo4jClient
-from src.ingestion.entity_parser import LLM_UNAVAILABLE_PREFIX, answer_query
+from src.ingestion.entity_parser import LLM_UNAVAILABLE_PREFIX, answer_with_citations
 
 log = logging.getLogger(__name__)
 
@@ -60,54 +66,58 @@ class GraphRAGEngine:
                         seen_ids.add(r["id"])
                         candidates.append(r)
 
-        if not candidates:
-            return {
-                "answer": "No relevant entities found in the knowledge graph. "
-                          "Try ingesting some data first!",
-                "context_nodes": [],
-                "sources": [],
-                "source_docs": [],
-                "status": "no_context",
-                "evidence": [],
-            }
-
-        # Step 2: Get neighborhood context for top candidates, fetched in parallel
+        # Excerpt search must run even when there are no matching entities.
         selected = candidates[:5]
         contexts = await asyncio.gather(
             *[self.neo4j.get_entity_context(candidate["id"], depth=2) for candidate in selected]
         )
-        evidence = [ctx for ctx in contexts if ctx.get("text")]
-        if not evidence:
-            return {
-                "answer": "No relevant entity context found in the knowledge graph.",
-                "context_nodes": [], "sources": [], "source_docs": [],
-                "status": "no_context", "evidence": [],
-            }
-        context = "\n\n".join(ctx["text"] for ctx in evidence)
-        # Preserve the historical label list for display, but never use labels
-        # as graph identities: two selected entities may share the same label.
+        graph_evidence = [ctx for ctx in contexts if ctx.get("text")]
         labels = list(dict.fromkeys(candidate["label"] for candidate in selected))
-        source_docs = list(dict.fromkeys(
-            source for ctx in evidence for source in ctx.get("source_docs", []) if source
+        chunks = bounded_evidence(await self.neo4j.search_evidence(
+            question, entity_ids=[candidate["id"] for candidate in selected], limit=6,
         ))
+        source_docs = list(dict.fromkeys(
+            [source for ctx in graph_evidence for source in ctx.get("source_docs", []) if source]
+            + [chunk["source_id"] for chunk in chunks]
+        ))
+        base = {
+            "context_nodes": labels, "sources": selected, "source_docs": source_docs,
+            "evidence": graph_evidence, "citations": [], "conflicts": [],
+            "retrieved_evidence": [citation_metadata(chunk) for chunk in chunks],
+        }
+        insufficient = {
+            **base, "status": "insufficient_evidence",
+            "answer": "Insufficient original source evidence to answer this question.",
+        }
+        if not chunks:
+            if not graph_evidence:
+                return {
+                    **base, "status": "no_context",
+                    "answer": "No relevant original source evidence found. "
+                              "Try ingesting data first.",
+                }
+            return insufficient
 
-        # Step 3: Reason with LLM using graph context
-        answer = await answer_query(question, context)
-
+        generated = await answer_with_citations(question, chunks)
+        if isinstance(generated, dict) and generated.get("error"):
+            return {
+                **base, "status": "llm_unavailable",
+                "answer": f"{LLM_UNAVAILABLE_PREFIX} The answer provider is unavailable.",
+            }
+        if not validate_answer(generated, chunks):
+            return insufficient
+        # Revalidate the complete supplied set after generation: existence alone
+        # cannot authorize evidence from a superseded or deleted source version.
+        current = await self.neo4j.validate_evidence_ids([chunk["id"] for chunk in chunks])
+        if not evidence_unchanged(chunks, current):
+            return insufficient
+        if generated["insufficient_evidence"]:
+            return {**insufficient, "conflicts": generated["conflicts"]}
+        by_id = {chunk["id"]: chunk for chunk in chunks}
         return {
-            "answer": answer,
-            "context_nodes": labels,
-            "sources": candidates[:5],
-            "source_docs": source_docs,
-            "evidence": evidence,
-            # `answer_query` returns a plain string; a failure notice is flagged by
-            # its fixed prefix so an "LLM unavailable" message is never presented
-            # as a real answer.
-            "status": (
-                "llm_unavailable"
-                if answer.startswith(LLM_UNAVAILABLE_PREFIX)
-                else "answered"
-            ),
+            **base, "answer": generated["answer"], "status": "answered",
+            "citations": [citation_metadata(by_id[key]) for key in generated["citations"]],
+            "conflicts": generated["conflicts"],
         }
 
     def _extract_search_terms(self, question: str) -> list[str]:

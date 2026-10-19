@@ -1,11 +1,13 @@
 """Graph writer — orchestrates ingestion into Neo4j."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from typing import Any
 
 from src.graph.neo4j_client import Neo4jClient
+from src.ingestion.chunks import MAX_DOCUMENT_CHARS, plan_chunks
 from src.ingestion.entity_parser import extract_entities
 
 log = logging.getLogger(__name__)
@@ -174,17 +176,8 @@ async def ingest_to_graph(
     """Full pipeline: extract entities → write to Neo4j."""
     log.info("Extracting entities from '%s' (%d chars)", source_doc, len(content))
 
-    expected_version = None
     if source is not None:
-        source_doc = source["id"]
-        current = await neo4j.get_source(source_doc)
-        expected_version = current.get("version") if current else None
-        if expected_version == source["version"]:
-            return {
-                "success": True, "source": source_doc, "source_metadata": source,
-                "nodes": 0, "edges": 0, "unchanged": True,
-                "version": source["version"],
-            }
+        return await _ingest_source(neo4j, content, source, model)
 
     # Step 1: Extract entities and relationships via Kimi
     graph_data = await extract_entities(content, model=model)
@@ -213,7 +206,7 @@ async def ingest_to_graph(
     # seeded ids are byte-identical to a live ingest of the same document.
     graph_data, _dropped_nodes, invalid_edges = sanitize_graph(graph_data)
     graph_data, dropped_edges = prefix_and_validate(
-        graph_data, source_doc, source["version"] if source is not None else None,
+        graph_data, source_doc,
     )
     dropped_edges += invalid_edges
     nodes = graph_data["nodes"]
@@ -227,19 +220,8 @@ async def ingest_to_graph(
             "edges": 0,
         }
 
-    # Step 2: Write to Neo4j
-    if source is None:
-        result = await neo4j.write_graph(graph_data, source_doc=source_doc)
-    else:
-        result = await neo4j.publish_source_graph(
-            graph_data, source=source, expected_version=expected_version,
-        )
-        if result.get("conflict"):
-            return {
-                "success": False, "source": source_doc, "conflict": True,
-                "error": "Source changed during extraction; retry ingestion",
-                "nodes": 0, "edges": 0,
-            }
+    # Step 2: Write legacy document-scoped graph.
+    result = await neo4j.write_graph(graph_data, source_doc=source_doc)
 
     log.info(
         "Ingestion complete: %d nodes, %d edges from '%s'",
@@ -248,12 +230,7 @@ async def ingest_to_graph(
         source_doc,
     )
 
-    metadata = ({
-        "source_metadata": source, "version": source["version"],
-        "unchanged": result.get("unchanged", False),
-    } if source is not None else {})
     return {
-        **metadata,
         "success": True,
         "source": source_doc,
         "nodes": result["nodes_written"],
@@ -261,4 +238,113 @@ async def ingest_to_graph(
         "extracted_nodes": len(nodes),
         "extracted_edges": len(valid_edges),
         "dropped_edges": dropped_edges,
+    }
+
+
+async def _ingest_source(
+    neo4j: Neo4jClient, content: str, source: dict, model: str | None,
+) -> dict[str, Any]:
+    """Extract every planned excerpt, then atomically publish a complete version."""
+    source = dict(source)
+    current = await neo4j.get_source(source["id"])
+    expected_version = current.get("version") if current else None
+    if expected_version == source["version"]:
+        return {
+            "success": True, "source": source["id"], "source_metadata": current,
+            "nodes": 0, "edges": 0, "unchanged": True, "version": source["version"],
+            "coverage": current.get("coverage", {}),
+        }
+    captured = min(len(content), MAX_DOCUMENT_CHARS)
+    chunks = plan_chunks(content, source["id"], source["version"])
+    gate = asyncio.Semaphore(2)
+
+    async def extract(chunk: dict) -> dict:
+        async with gate:
+            try:
+                data = await extract_entities(chunk["text"], model=model)
+                if not isinstance(data, dict):
+                    return {"error": "LLM returned a non-object payload"}
+                if not data.get("error") and (
+                    not isinstance(data.get("nodes"), list)
+                    or not isinstance(data.get("edges"), list)
+                ):
+                    return {"error": "LLM returned invalid graph collections"}
+                return data
+            except Exception:
+                log.exception("Chunk extraction failed for source %s", source["id"])
+                return {"error": "Source chunk extraction failed"}
+
+    results = await asyncio.gather(*(extract(chunk) for chunk in chunks))
+    failed = sum(bool(data.get("error")) for data in results)
+    processed = chunks[-1]["end"] if chunks else 0
+    coverage = {
+        "captured_chars": captured, "processed_chars": processed,
+        "skipped_chars": captured - processed, "planned_chunks": len(chunks),
+        "completed_chunks": len(chunks) - failed, "failed_chunks": failed,
+        "input_truncated": bool(source.get("input_truncated")) or len(content) > captured,
+        "partial": (processed < captured or len(content) > captured
+                    or bool(source.get("input_truncated"))),
+        "graph_capped": False,
+    }
+    if failed:
+        covered = 0
+        previous_end = 0
+        for chunk, data in zip(chunks, results, strict=True):
+            if not data.get("error"):
+                covered += chunk["end"] - max(chunk["start"], previous_end)
+                previous_end = chunk["end"]
+        coverage["processed_chars"] = covered
+        coverage["skipped_chars"] = captured - covered
+        coverage["partial"] = True
+        return {
+            "success": False, "source": source["id"], "nodes": 0, "edges": 0,
+            "error": "Source chunk extraction failed; previous version preserved",
+            "coverage": coverage,
+        }
+    nodes, edges = [], []
+    dropped_edges = 0
+    for chunk, data in zip(chunks, results, strict=True):
+        raw_nodes = data.get("nodes")
+        raw_edges = data.get("edges")
+        coverage["graph_capped"] |= (
+            isinstance(raw_nodes, list) and len(raw_nodes) > MAX_NODES
+        ) or (isinstance(raw_edges, list) and len(raw_edges) > MAX_EDGES)
+        data, _, invalid = sanitize_graph(data)
+        dropped_edges += invalid
+        # Model-provided IDs are local to one extraction, even when repeated
+        # across chunks. Never accept model-supplied evidence provenance.
+        namespace = f"c{chunk['ordinal']}_"
+        for node in data["nodes"]:
+            node["id"] = namespace + node["id"]
+            node["evidence_ids"] = [chunk["id"]]
+        for edge in data["edges"]:
+            edge["source"] = namespace + edge["source"]
+            edge["target"] = namespace + edge["target"]
+            edge["evidence_ids"] = [chunk["id"]]
+        nodes.extend(data["nodes"])
+        edges.extend(data["edges"])
+    coverage["graph_capped"] |= len(nodes) > MAX_NODES or len(edges) > MAX_EDGES
+    nodes = nodes[:MAX_NODES]
+    known = {node["id"] for node in nodes}
+    valid_edges = [e for e in edges if e["source"] in known and e["target"] in known]
+    dropped_edges += len(edges) - min(len(valid_edges), MAX_EDGES)
+    graph_data = {"nodes": nodes, "edges": valid_edges[:MAX_EDGES], "chunks": chunks}
+    graph_data, invalid = prefix_and_validate(graph_data, source["id"], source["version"])
+    dropped_edges += invalid
+    source["coverage"] = coverage
+    result = await neo4j.publish_source_graph(
+        graph_data, source=source, expected_version=expected_version,
+    )
+    if result.get("conflict"):
+        return {
+            "success": False, "source": source["id"], "conflict": True,
+            "error": "Source changed during extraction; retry ingestion", "nodes": 0, "edges": 0,
+            "coverage": coverage,
+        }
+    return {
+        "success": True, "source": source["id"], "source_metadata": source,
+        "version": source["version"], "unchanged": result.get("unchanged", False),
+        "nodes": result["nodes_written"], "edges": result["edges_written"],
+        "extracted_nodes": len(nodes), "extracted_edges": len(graph_data["edges"]),
+        "dropped_edges": dropped_edges, "coverage": coverage,
     }

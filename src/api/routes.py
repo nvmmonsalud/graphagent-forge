@@ -754,6 +754,36 @@ async def list_sources(request: Request):
     return {"sources": sources}
 
 
+@router.get("/evidence/{evidence_id}", dependencies=MUTATING_DEP)
+async def get_evidence(evidence_id: str, request: Request):
+    """Return a current original excerpt; configured API-key auth applies."""
+    if len(evidence_id) != 67 or not evidence_id.startswith("ev_") or any(
+        char not in "0123456789abcdef" for char in evidence_id[3:]
+    ):
+        raise HTTPException(status_code=404, detail="evidence not found")
+    try:
+        evidence = await request.app.state.neo4j.get_evidence(evidence_id)
+    except Exception:
+        log.exception("Failed to read evidence")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+    if evidence is None:
+        raise HTTPException(status_code=404, detail="evidence not found")
+    return evidence
+
+
+@router.get("/sources/{source_id}/evidence", dependencies=MUTATING_DEP)
+async def get_source_evidence(source_id: str, request: Request):
+    """Return at most twelve current excerpts for a source."""
+    if len(source_id) > 500:
+        raise HTTPException(status_code=404, detail="source not found")
+    try:
+        evidence = await request.app.state.neo4j.get_source_evidence(source_id)
+    except Exception:
+        log.exception("Failed to read source evidence")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+    return {"evidence": evidence}
+
+
 @router.delete("/sources", dependencies=MUTATING_DEP)
 async def delete_source(
     request: Request,
@@ -768,7 +798,7 @@ async def delete_source(
         log.exception("Failed to delete source %r", source_doc)
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
 
-    keys = ("deleted_nodes", "removed_memberships", "deleted_edges")
+    keys = ("deleted_nodes", "removed_memberships", "deleted_edges", "deleted_chunks")
     touched = sum(int(result.get(k, 0)) for k in keys)
     if touched == 0:
         raise HTTPException(status_code=404, detail="source not found")

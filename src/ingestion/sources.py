@@ -10,13 +10,14 @@ import json
 import os
 from urllib.parse import urlsplit, urlunsplit
 
+from src.ingestion.chunks import CHUNK_OVERLAP, CHUNK_SIZE, MAX_CHUNKS, MAX_DOCUMENT_CHARS
 from src.ingestion.entity_parser import (
     DEFAULT_KIMI_BASE_URL,
     EXTRACT_MAX_TOKENS,
     _resolve_model,
 )
 
-EXTRACTION_SCHEMA_VERSION = "graph-extraction-v1"
+EXTRACTION_SCHEMA_VERSION = "graph-extraction-v2-evidence"
 
 
 def _digest(value: object) -> str:
@@ -58,6 +59,7 @@ def build_source(
     extraction_version = _digest({
         "model": _resolve_model(model),
         "schema": EXTRACTION_SCHEMA_VERSION,
+        "chunk_policy": [CHUNK_SIZE, CHUNK_OVERLAP, MAX_CHUNKS, MAX_DOCUMENT_CHARS],
         "max_tokens": EXTRACT_MAX_TOKENS,
         # Store only a digest: a custom endpoint can contain credentials.
         "endpoint": _digest(os.getenv("KIMI_BASE_URL", DEFAULT_KIMI_BASE_URL)),

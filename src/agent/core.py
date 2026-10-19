@@ -11,6 +11,7 @@ from src.agent.daytona_exec import DaytonaExecutor
 from src.agent.nosana_client import NosanaClient
 from src.graph.graphrag import GraphRAGEngine
 from src.graph.neo4j_client import Neo4jClient
+from src.ingestion.chunks import MAX_DOCUMENT_CHARS
 from src.ingestion.entity_parser import _resolve_model
 from src.ingestion.extractor import extract_from_text, extract_from_url
 from src.ingestion.file_extractor import extract_from_file
@@ -102,7 +103,7 @@ class GraphAgent:
 
         # Extract content
         await self._report(progress, "fetching")
-        extraction = await extract_from_url(url)
+        extraction = await extract_from_url(url, max_chars=MAX_DOCUMENT_CHARS)
         if extraction.get("error"):
             return {"success": False, "error": extraction["error"]}
 
@@ -110,6 +111,7 @@ class GraphAgent:
         source = build_source(
             "url", url, extraction.get("title") or url, extraction["content"], model=model,
         )
+        source["input_truncated"] = extraction.get("input_truncated", False)
         # Write to graph
         await self._report(progress, "extracting")
         async with self._ingest_semaphore:
@@ -138,10 +140,11 @@ class GraphAgent:
         self, text: str, source: str = "manual", progress: ProgressCb | None = None
     ) -> dict[str, Any]:
         """Ingest raw text: extract → graph → store."""
-        extraction = extract_from_text(text, source)
+        extraction = extract_from_text(text, source, max_chars=MAX_DOCUMENT_CHARS)
         model = _resolve_model(None)
         source_metadata = build_source("text", source, source, extraction["content"], model=model)
 
+        source_metadata["input_truncated"] = extraction.get("input_truncated", False)
         await self._report(progress, "extracting")
         async with self._ingest_semaphore:
             result = await ingest_to_graph(
@@ -174,7 +177,9 @@ class GraphAgent:
         only then does the shared extract → graph → `_post_ingest` tail run.
         """
         await self._report(progress, "parsing")
-        extraction = await extract_from_file(data, filename, content_type, label=source)
+        extraction = await extract_from_file(
+            data, filename, content_type, label=source, max_chars=MAX_DOCUMENT_CHARS,
+        )
         if extraction.get("error"):
             return {"success": False, "error": extraction["error"]}
 
@@ -184,6 +189,7 @@ class GraphAgent:
             "file", source_name, extraction.get("title") or source_name, extraction["content"],
             model=model,
         )
+        source_metadata["input_truncated"] = extraction.get("input_truncated", False)
         source_doc = source_metadata["id"]
 
         await self._report(progress, "extracting")

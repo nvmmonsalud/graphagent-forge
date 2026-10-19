@@ -1,6 +1,6 @@
 """Contract tests for GraphRAGEngine.query's `status` field.
 
-`status` is one of "answered" | "no_context" | "llm_unavailable" — the
+`status` is one of answered, no_context, llm_unavailable, insufficient_evidence; the
 frontend uses it to distinguish a real (if underwhelming) answer from a
 plumbing failure, instead of guessing from the answer text.
 """
@@ -26,6 +26,7 @@ def _mock_nosana(method: str = "local_hash_fallback") -> AsyncMock:
 async def test_no_candidates_yields_no_context_status() -> None:
     neo4j = AsyncMock()
     neo4j.search_nodes.return_value = []
+    neo4j.search_evidence.return_value = []
     engine = GraphRAGEngine(neo4j=neo4j, nosana=_mock_nosana())
 
     result = await engine.query("What is the meaning of life?")
@@ -49,6 +50,10 @@ async def test_candidates_but_missing_kimi_key_yields_llm_unavailable_status(
         "text": "Test Entity (Concept): a thing", "source_docs": ["doc1"],
         "entity_ids": ["n1"], "nodes": [], "edges": [],
     }
+    neo4j.search_evidence.return_value = [{
+        "id": "ev_one", "source_id": "doc1", "version": "v1",
+        "text": "Original", "start": 0, "end": 8,
+    }]
     engine = GraphRAGEngine(neo4j=neo4j, nosana=_mock_nosana())
 
     result = await engine.query("Tell me about the test entity")
@@ -59,11 +64,14 @@ async def test_candidates_but_missing_kimi_key_yields_llm_unavailable_status(
 
 
 @pytest.mark.asyncio
-async def test_status_field_is_one_of_the_three_literals() -> None:
+async def test_status_field_is_one_of_the_four_literals() -> None:
     neo4j = AsyncMock()
     neo4j.search_nodes.return_value = []
+    neo4j.search_evidence.return_value = []
     engine = GraphRAGEngine(neo4j=neo4j, nosana=_mock_nosana())
 
     result = await engine.query("anything")
 
-    assert result["status"] in {"answered", "no_context", "llm_unavailable"}
+    assert result["status"] in {
+        "answered", "no_context", "llm_unavailable", "insufficient_evidence",
+    }

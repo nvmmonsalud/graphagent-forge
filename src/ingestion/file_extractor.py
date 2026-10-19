@@ -124,7 +124,7 @@ def _parse_text(data: bytes) -> tuple[str, dict[str, Any]]:
     return _decode(data), {"pages": None}
 
 
-def _parse_pdf(data: bytes) -> tuple[str, dict[str, Any]]:
+def _parse_pdf(data: bytes, max_chars: int = MAX_CHARS) -> tuple[str, dict[str, Any]]:
     """Extract text from a PDF. CPU-bound; only ever called in a worker thread."""
     if not HAS_PYPDF:
         raise _ParseError(ERR_NO_PYPDF)
@@ -144,14 +144,14 @@ def _parse_pdf(data: bytes) -> tuple[str, dict[str, Any]]:
     for page in reader.pages:
         # Stop as soon as we have more than we would ever keep — mirrors
         # _read_capped_body's "never materialize more than the cap" rule.
-        if total > MAX_CHARS:
+        if total > max_chars:
             break
         chunk = page.extract_text() or ""
         parts.append(chunk)
         total += len(chunk)
 
     # `pages` is the true page count even when the loop broke early.
-    return "\n".join(parts), {"pages": pages}
+    return "\n".join(parts), {"pages": pages, "input_truncated": len(parts) < pages}
 
 
 @dataclass(frozen=True)
@@ -263,9 +263,10 @@ def _file_envelope(
     )
 
 
-def _run_parse(data: bytes, ext: str) -> tuple[str, dict[str, Any]]:
+def _run_parse(data: bytes, ext: str, max_chars: int = MAX_CHARS) -> tuple[str, dict[str, Any]]:
     """All CPU work for one upload: parse + clean. Runs in a worker thread."""
-    raw_text, extras = FORMATS[ext].parse(data)
+    raw_text, extras = (_parse_pdf(data, max_chars) if ext == ".pdf"
+                        else FORMATS[ext].parse(data))
     return _clean_text(raw_text), extras
 
 
@@ -285,19 +286,19 @@ def _limit_child_resources() -> None:  # pragma: no cover - runs in the child
         pass  # macOS doesn't enforce RLIMIT_AS; the CPU cap and timeout still apply
 
 
-def _pdf_child_main() -> None:  # pragma: no cover - runs in the child
+def _pdf_child_main(max_chars: int = MAX_CHARS) -> None:  # pragma: no cover - runs in the child
     """Child entry point: PDF bytes on stdin, one JSON result on stdout."""
     _limit_child_resources()
     data = sys.stdin.buffer.read()
     try:
-        text, extras = _run_parse(data, ".pdf")
+        text, extras = _run_parse(data, ".pdf", max_chars)
         out = {"text": text, "extras": extras}
     except _ParseError as e:
         out = {"error": e.message, "extras": e.extras}
     sys.stdout.write(json.dumps(out))
 
 
-async def _run_pdf_isolated(data: bytes) -> tuple[str, dict[str, Any]]:
+async def _run_pdf_isolated(data: bytes, max_chars: int = MAX_CHARS) -> tuple[str, dict[str, Any]]:
     """Parse a PDF in a killable child process. Raises _ParseError on failure."""
     if not HAS_PYPDF:
         raise _ParseError(ERR_NO_PYPDF)
@@ -308,7 +309,7 @@ async def _run_pdf_isolated(data: bytes) -> tuple[str, dict[str, Any]]:
 
     code = (
         f"import sys; sys.path.insert(0, {_REPO_ROOT!r}); "
-        "from src.ingestion.file_extractor import _pdf_child_main; _pdf_child_main()"
+        f"from src.ingestion.file_extractor import _pdf_child_main; _pdf_child_main({max_chars})"
     )
     async with _pdf_gate:
         proc = await asyncio.create_subprocess_exec(
@@ -352,6 +353,7 @@ async def extract_from_file(
     content_type: str | None = None,
     *,
     label: str | None = None,
+    max_chars: int | None = None,
 ) -> dict[str, Any]:
     """Extract clean text from an uploaded file's bytes.
 
@@ -384,7 +386,8 @@ async def extract_from_file(
     # go to a killable, resource-limited child process (see _run_pdf_isolated).
     try:
         if ext == ".pdf":
-            text, extras = await _run_pdf_isolated(data)
+            text, extras = (await _run_pdf_isolated(data) if max_chars is None
+                            else await _run_pdf_isolated(data, max_chars))
         else:
             text, extras = await asyncio.to_thread(_run_parse, data, ext)
     except TimeoutError:
@@ -409,11 +412,12 @@ async def extract_from_file(
         error = ERR_PDF_NO_TEXT if ext == ".pdf" else ERR_NO_TEXT
         return _file_envelope(title=title, filename=name, error=error, fmt=ext, pages=pages)
 
-    body_truncated = len(text) > MAX_CHARS
+    limit = MAX_CHARS if max_chars is None else max_chars
+    body_truncated = len(text) > limit or bool(extras.get("input_truncated"))
     if body_truncated:
-        text = text[:MAX_CHARS] + TRUNCATION_SUFFIX
+        text = text[:limit] + (TRUNCATION_SUFFIX if max_chars is None else "")
 
-    return _file_envelope(
+    result = _file_envelope(
         title=title,
         filename=name,
         content=text,
@@ -422,3 +426,6 @@ async def extract_from_file(
         body_truncated=body_truncated,
         pages=pages,
     )
+    if max_chars is not None:
+        result["input_truncated"] = body_truncated
+    return result

@@ -188,8 +188,19 @@ with tab_query:
                             "LLM unavailable (KIMI_API_KEY missing or the request failed); "
                             "no answer generated."
                         )
+                    elif result.get("status") == "insufficient_evidence":
+                        st.warning(
+                            "Insufficient current original source evidence. Reingest or rerun."
+                        )
                     else:
                         st.text(result.get("answer", "No answer generated"))
+                    if result.get("conflicts"):
+                        st.warning("Conflicting evidence was found.")
+                        st.json(result["conflicts"])
+                    if result.get("citations"):
+                        with st.expander("Original evidence references"):
+                            st.json(result["citations"])
+                            st.caption("Open the primary web UI to inspect current excerpts.")
 
                     # Context nodes
                     nodes = result.get("context_nodes", [])

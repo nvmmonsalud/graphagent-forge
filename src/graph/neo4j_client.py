@@ -1,8 +1,10 @@
 """Neo4j graph client — connection, schema, and queries."""
 from __future__ import annotations
 
+import json
 import logging
 import math
+import re
 import uuid
 from typing import Any
 
@@ -10,6 +12,7 @@ from neo4j import AsyncGraphDatabase
 
 from src.graph.embedding_space import configured_embedding_space
 from src.graph.normalize import normalize_label
+from src.ingestion.chunks import CHUNK_SIZE, MAX_CHUNKS, MAX_DOCUMENT_CHARS, chunk_id
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +28,10 @@ _NODE_FIELDS = (
 _NODE_PROJECTION = "{.id, .label, .type, .summary, .source_docs}"
 
 _MIGRATE_BATCH = 500
+_EVIDENCE_STOPWORDS = frozenset(
+    "what which when where why how is are was were does do did the an and or "
+    "of to in for from with about please tell me".split()
+)
 
 
 class Neo4jClient:
@@ -53,8 +60,12 @@ class Neo4jClient:
         queries = [
             "CREATE CONSTRAINT IF NOT EXISTS FOR (n:Entity) REQUIRE n.id IS UNIQUE",
             "CREATE CONSTRAINT source_id IF NOT EXISTS FOR (s:Source) REQUIRE s.id IS UNIQUE",
+            "CREATE CONSTRAINT evidence_id IF NOT EXISTS "
+            "FOR (c:EvidenceChunk) REQUIRE c.id IS UNIQUE",
             "CREATE CONSTRAINT graph_state_id IF NOT EXISTS "
             "FOR (s:GraphState) REQUIRE s.id IS UNIQUE",
+            "CREATE INDEX evidence_source_id IF NOT EXISTS "
+            "FOR (c:EvidenceChunk) ON (c.source_id)",
             "CREATE INDEX IF NOT EXISTS FOR (n:Entity) ON (n.label)",
             "CREATE INDEX IF NOT EXISTS FOR (n:Entity) ON (n.type)",
             # Legacy scalar-provenance index: kept so pre-migration graphs stay
@@ -196,6 +207,7 @@ class Neo4jClient:
         # Legacy seeders retain their historical graph IDs. Revive existing
         # reservations/tombstones and invalidate any extraction started before
         # this direct write. New legacy IDs remain eligible for explicit migration.
+        await Neo4jClient._invalidate_source_evidence(tx, source_doc)
         await tx.run("""
             MATCH (s:Source {id: $id})
             SET s = {id: $id, title: $id, kind: 'legacy', version: $version,
@@ -222,26 +234,161 @@ class Neo4jClient:
         source = dict(row["source"]) if row else {}
         if source.get("_placeholder"):
             return None
-        return {k: v for k, v in source.items() if not k.startswith("_")}
+        source = {k: v for k, v in source.items() if not k.startswith("_")}
+        if "coverage" in source:
+            source["coverage"] = json.loads(source["coverage"])
+        return source
+
+    @staticmethod
+    def _prepare_chunks(graph_data: dict, source: dict) -> list[dict]:
+        """Validate server-assigned identities and Unicode offsets before any mutation."""
+        chunks = graph_data.get("chunks", [])
+        if not isinstance(chunks, list) or len(chunks) > MAX_CHUNKS:
+            raise ValueError("Invalid evidence chunk count")
+        prepared = []
+        seen = set()
+        for ordinal, chunk in enumerate(chunks):
+            if not isinstance(chunk, dict):
+                raise ValueError("Invalid evidence chunk")
+            text = chunk.get("text")
+            start, end = chunk.get("start"), chunk.get("end")
+            if (not isinstance(text, str) or not 0 < len(text) <= CHUNK_SIZE
+                    or type(start) is not int or type(end) is not int
+                    or not 0 <= start < end <= MAX_DOCUMENT_CHARS
+                    or end - start != len(text)
+                    or type(chunk.get("ordinal")) is not int or chunk["ordinal"] != ordinal
+                    or chunk.get("source_id") != source["id"]
+                    or chunk.get("version") != source["version"]):
+                raise ValueError("Invalid evidence chunk offsets or source version")
+            expected = chunk_id(source["id"], source["version"], ordinal, text)
+            if chunk.get("id") != expected or expected in seen:
+                raise ValueError("Invalid evidence chunk identity")
+            seen.add(expected)
+            prepared.append({key: chunk[key] for key in
+                             ("id", "source_id", "version", "ordinal", "start", "end", "text")})
+        return prepared
+
+    @staticmethod
+    async def _invalidate_source_evidence(tx, source_id):
+        # Strip references even on entities retained by another source's assertion.
+        # Keep deletion and reference cleanup in the same mutation transaction.
+        result = await tx.run("""
+            MATCH (c:EvidenceChunk {source_id: $source_id})
+            RETURN collect(c.id) AS ids
+            """, source_id=source_id)
+        row = await result.single()
+        ids = row["ids"] if row else []
+        if ids:
+            await tx.run("""
+                MATCH (n:Entity) WHERE any(id IN coalesce(n.evidence_ids, []) WHERE id IN $ids)
+                SET n.evidence_ids = [id IN n.evidence_ids WHERE NOT id IN $ids]
+                """, ids=ids)
+            await tx.run("""
+                MATCH ()-[r:RELATES_TO]->()
+                WHERE any(id IN coalesce(r.evidence_ids, []) WHERE id IN $ids)
+                SET r.evidence_ids = [id IN r.evidence_ids WHERE NOT id IN $ids]
+                """, ids=ids)
+        await tx.run("MATCH (c:EvidenceChunk {source_id: $source_id}) DETACH DELETE c",
+                     source_id=source_id)
+
+    async def _read_evidence(self, query: str, **params) -> list[dict]:
+        # Coordinate even read-only excerpts with refresh/delete/clear: Neo4j's
+        # read-committed isolation alone does not guarantee repeatable reads.
+        async with self.driver.session() as session:
+            tx = await session.begin_transaction()
+            try:
+                await self._lock_graph(tx)
+                result = await tx.run(query, **params)
+                rows = [dict(row["chunk"]) async for row in result]
+                await tx.commit()
+                return rows
+            except BaseException:
+                await tx.rollback()
+                raise
+
+    async def get_evidence(self, evidence_id: str) -> dict | None:
+        rows = await self.validate_evidence_ids([evidence_id])
+        return rows[0] if rows else None
+
+    async def validate_evidence_ids(self, ids: list[str]) -> list[dict]:
+        """Return exact, currently published excerpts, bounded independently of caller."""
+        if (not isinstance(ids, list) or len(ids) > 36
+                or any(not isinstance(value, str) or len(value) > 80 for value in ids)):
+            raise ValueError("Invalid evidence IDs")
+        if not ids:
+            return []
+        return await self._read_evidence("""
+            UNWIND $ids AS id
+            MATCH (s:Source)-[:HAS_CHUNK]->(c:EvidenceChunk {id: id})
+            WHERE c.source_id = s.id AND c.version = s.version
+              AND NOT coalesce(s._deleted, false) AND NOT coalesce(s._placeholder, false)
+            RETURN DISTINCT c {.*, title: s.title, uri: s.uri} AS chunk
+            LIMIT 36
+            """, ids=list(dict.fromkeys(ids)))
+
+    async def get_source_evidence(self, source_id: str) -> list[dict]:
+        return await self._read_evidence("""
+            MATCH (s:Source {id: $id})-[:HAS_CHUNK]->(c:EvidenceChunk)
+            WHERE c.source_id = s.id AND c.version = s.version
+              AND NOT coalesce(s._deleted, false) AND NOT coalesce(s._placeholder, false)
+            RETURN c {.*, title: s.title, uri: s.uri} AS chunk
+            ORDER BY c.ordinal LIMIT 12
+            """, id=source_id)
+
+    async def search_evidence(self, question: str, entity_ids=None, limit: int = 6) -> list[dict]:
+        """Rank current original excerpts in Cypher; transfer only bounded top hits."""
+        terms = list(dict.fromkeys(
+            term for term in re.findall(r"[^\W_]{2,}", question[:4000].lower())
+            if term not in _EVIDENCE_STOPWORDS
+        ))[:32]
+        selected = list(dict.fromkeys(entity_ids or []))[:1000]
+        limit = max(1, min(int(limit), 12))
+        return await self._read_evidence("""
+            MATCH (s:Source)-[:HAS_CHUNK]->(c:EvidenceChunk)
+            WHERE c.source_id = s.id AND c.version = s.version
+              AND NOT coalesce(s._deleted, false) AND NOT coalesce(s._placeholder, false)
+            WITH s, c, reduce(score = 0, term IN $terms |
+                score + CASE WHEN toLower(c.text) CONTAINS term THEN 1 ELSE 0 END) AS lexical,
+                EXISTS { MATCH (n:Entity) WHERE n.id IN $entity_ids
+                         AND c.id IN coalesce(n.evidence_ids, []) } AS linked
+            WHERE lexical > 0 OR linked
+            WITH s, c, lexical, linked
+            ORDER BY lexical DESC, linked DESC, s.id, c.ordinal LIMIT $limit
+            RETURN c {.*, title: s.title, uri: s.uri} AS chunk
+            """, terms=terms, entity_ids=selected, limit=limit)
 
     async def publish_source_graph(self, graph_data: dict, *, source: dict,
                                    expected_version: str | None) -> dict:
         """Publish a complete source refresh atomically with optimistic concurrency."""
         sid = source["id"]
+        chunks = self._prepare_chunks(graph_data, source)
+        valid_evidence = {c["id"] for c in chunks}
+
+        def evidence_ids(item):
+            refs = item.get("evidence_ids", [])
+            if (not isinstance(refs, list) or len(refs) > MAX_CHUNKS
+                    or any(not isinstance(ref, str) or ref not in valid_evidence for ref in refs)):
+                raise ValueError("Graph contains invalid evidence references")
+            return list(dict.fromkeys(refs))
+
         nodes = [{"id": n["id"], "label": n.get("label", ""),
                   "type": n.get("type", "Unknown"),
                   "summary": n.get("properties", {}).get("summary", ""),
-                  "norm_label": normalize_label(n.get("label", ""))}
+                  "norm_label": normalize_label(n.get("label", "")),
+                  "evidence_ids": evidence_ids(n)}
                  for n in graph_data.get("nodes", [])]
         edges = [{"source": e["source"], "target": e["target"],
                   "type": e.get("relationship", "RELATES_TO"),
-                  "context": e.get("properties", {}).get("context", "")}
+                  "context": e.get("properties", {}).get("context", ""),
+                  "evidence_ids": evidence_ids(e)}
                  for e in graph_data.get("edges", [])]
         ids = {n["id"] for n in nodes}
         if any(e["source"] not in ids or e["target"] not in ids for e in edges):
             raise ValueError("Source graph contains missing edge endpoints")
         metadata = {k: source[k] for k in ("id", "title", "kind", "uri", "content_hash",
                                           "version", "extraction_version") if k in source}
+        metadata["coverage"] = (json.dumps(source["coverage"], allow_nan=False)
+                                if "coverage" in source else None)
         async with self.driver.session() as session:
             tx = await session.begin_transaction()
             try:
@@ -265,6 +412,7 @@ class Neo4jClient:
                     MERGE (n:Entity {id: node.id})
                     SET n.label = node.label, n.type = node.type, n.summary = node.summary,
                         n.norm_label = node.norm_label,
+                        n.evidence_ids = node.evidence_ids,
                         n.source_docs = CASE WHEN $sid IN coalesce(n.source_docs, [])
                           THEN n.source_docs ELSE coalesce(n.source_docs, []) + $sid END,
                         n.updated_at = datetime()
@@ -273,8 +421,17 @@ class Neo4jClient:
                     UNWIND $edges AS edge
                     MATCH (a:Entity {id: edge.source}), (b:Entity {id: edge.target})
                     MERGE (a)-[r:RELATES_TO {type: edge.type, source_doc: $sid}]->(b)
-                    SET r.context = edge.context, r.updated_at = datetime()
+                    SET r.context = edge.context,
+                        r.evidence_ids = reduce(u = coalesce(r.evidence_ids, []),
+                          id IN edge.evidence_ids | CASE WHEN id IN u THEN u ELSE u + id END),
+                        r.updated_at = datetime()
                     """, edges=edges, sid=sid)
+                await tx.run("""
+                    MATCH (s:Source {id: $sid})
+                    UNWIND $chunks AS chunk
+                    CREATE (c:EvidenceChunk) SET c = chunk
+                    CREATE (s)-[:HAS_CHUNK]->(c)
+                    """, sid=sid, chunks=chunks)
                 await tx.run("MATCH (s:Source {id: $sid}) SET s += $metadata, "
                              "s.updated_at = datetime() "
                              "REMOVE s._placeholder, s._deleted, s._migration",
@@ -288,6 +445,7 @@ class Neo4jClient:
 
     @staticmethod
     async def _remove_source_graph(tx, source_doc):
+        await Neo4jClient._invalidate_source_evidence(tx, source_doc)
         result = await tx.run("""
             MATCH ()-[r:RELATES_TO]->() WHERE r.source_doc = $source_doc
             WITH collect(r) AS rels, count(r) AS deleted,
@@ -819,12 +977,16 @@ class Neo4jClient:
         OPTIONAL MATCH (s:Source {id: id})
         RETURN id AS source_doc, node_count, updated_at,
                coalesce(s.title, id) AS title, coalesce(s.kind, 'legacy') AS kind,
-               s.uri AS uri, s.version AS version
+               s.uri AS uri, s.version AS version, s.coverage AS coverage
         ORDER BY node_count DESC, source_doc
         """
         async with self.driver.session() as session:
             result = await session.run(query)
-            return [dict(record) async for record in result]
+            sources = [dict(record) async for record in result]
+            for source in sources:
+                if source.get("coverage") is not None:
+                    source["coverage"] = json.loads(source["coverage"])
+            return sources
 
     async def delete_source(self, source_doc: str) -> dict:
         async with self.driver.session() as session:
@@ -853,6 +1015,7 @@ class Neo4jClient:
                     FOREACH (n IN nodes | DETACH DELETE n) RETURN deleted
                     """)
                 row = await result.single()
+                await tx.run("MATCH (c:EvidenceChunk) DETACH DELETE c")
                 await tx.run("MATCH (s:Source) "
                              "SET s = {id: s.id, version: $version, _deleted: true}",
                              version="deleted_" + uuid.uuid4().hex)
@@ -1082,6 +1245,8 @@ class Neo4jClient:
         ON CREATE SET nr.context = r.context,
                       nr.source_doc = r.source_doc,
                       nr.updated_at = r.updated_at
+        SET nr.evidence_ids = reduce(u = coalesce(nr.evidence_ids, []),
+            id IN coalesce(r.evidence_ids, []) | CASE WHEN id IN u THEN u ELSE u + id END)
         DELETE r
         """
         repoint_in_query = """
@@ -1094,6 +1259,8 @@ class Neo4jClient:
         ON CREATE SET nr.context = r.context,
                       nr.source_doc = r.source_doc,
                       nr.updated_at = r.updated_at
+        SET nr.evidence_ids = reduce(u = coalesce(nr.evidence_ids, []),
+            id IN coalesce(r.evidence_ids, []) | CASE WHEN id IN u THEN u ELSE u + id END)
         DELETE r
         """
         absorb_query = """
@@ -1101,6 +1268,8 @@ class Neo4jClient:
         OPTIONAL MATCH (d:Entity) WHERE d.id IN $dup_ids
         WITH c, [x IN collect(d) WHERE x IS NOT NULL] AS dups
         WITH c, dups,
+             coalesce(c.evidence_ids, [])
+               + reduce(acc = [], d IN dups | acc + coalesce(d.evidence_ids, [])) AS raw_evidence,
              coalesce(c.source_docs, [])
                + reduce(acc = [], d IN dups | acc + coalesce(d.source_docs, [])) AS raw_docs,
              coalesce(c.aliases, [])
@@ -1110,12 +1279,15 @@ class Neo4jClient:
                CASE WHEN size(coalesce(d.summary, '')) > size(best)
                     THEN coalesce(d.summary, '') ELSE best END) AS best_summary
         WITH c, dups, best_summary,
+             reduce(u = [], id IN raw_evidence |
+               CASE WHEN id IN u THEN u ELSE u + id END) AS evidence_ids,
              reduce(u = [], s IN raw_docs |
                CASE WHEN s IS NULL OR s IN u THEN u ELSE u + s END) AS source_docs,
              reduce(u = [], s IN raw_aliases |
                CASE WHEN s IS NULL OR s = '' OR s = c.label OR s IN u
                     THEN u ELSE u + s END) AS aliases
-        SET c.source_docs = source_docs,
+        SET c.evidence_ids = evidence_ids,
+            c.source_docs = source_docs,
             c.aliases = aliases,
             c.summary = best_summary,
             c.updated_at = datetime()
