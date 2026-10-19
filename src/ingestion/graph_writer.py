@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+from contextvars import ContextVar
 from typing import Any
 
 from src.graph.neo4j_client import Neo4jClient
@@ -11,6 +12,15 @@ from src.ingestion.chunks import MAX_DOCUMENT_CHARS, plan_chunks
 from src.ingestion.entity_parser import extract_entities
 
 log = logging.getLogger(__name__)
+
+# Per-task private command checkpoint; concurrent ingests never share identity.
+ingestion_authorization: ContextVar[Any] = ContextVar("ingestion_authorization", default=None)
+
+
+async def _authorization_checkpoint():
+    check = ingestion_authorization.get()
+    if check is not None:
+        await check()
 
 
 # Bounds on what one LLM extraction may write. The model is steerable by the
@@ -247,6 +257,7 @@ async def _ingest_source(
     *, operation_id: str | None = None,
 ) -> dict[str, Any]:
     """Extract every planned excerpt, then atomically publish a complete version."""
+    await _authorization_checkpoint()
     source = dict(source)
     if operation_id is not None:
         receipt = await neo4j.get_ingest_operation(operation_id)
@@ -279,6 +290,7 @@ async def _ingest_source(
 
     async def extract(chunk: dict) -> dict:
         async with gate:
+            await _authorization_checkpoint()
             try:
                 data = await extract_entities(chunk["text"], model=model)
                 if not isinstance(data, dict):
@@ -293,7 +305,14 @@ async def _ingest_source(
                 log.exception("Chunk extraction failed for source %s", source["id"])
                 return {"error": "Source chunk extraction failed"}
 
-    results = await asyncio.gather(*(extract(chunk) for chunk in chunks))
+    tasks = [asyncio.create_task(extract(chunk)) for chunk in chunks]
+    try:
+        results = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     failed = sum(bool(data.get("error")) for data in results)
     processed = chunks[-1]["end"] if chunks else 0
     coverage = {
@@ -351,6 +370,7 @@ async def _ingest_source(
     graph_data, invalid = prefix_and_validate(graph_data, source["id"], source["version"])
     dropped_edges += invalid
     source["coverage"] = coverage
+    await _authorization_checkpoint()
     result = await neo4j.publish_source_graph(
         graph_data, source=source, expected_version=expected_version,
         **({"operation_id": operation_id} if operation_id is not None else {}),

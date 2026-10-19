@@ -154,6 +154,10 @@ remove stored payloads consistently. Preserve current public response envelopes.
 
 ## M4 — Private workspaces
 
+Delivery status: implemented as opt-in private mode; validation and independent
+security approval are recorded in the M4 PR. See [M4_UPGRADE.md](M4_UPGRADE.md)
+for identity, namespace enforcement, sessions, deletion and deployment limits.
+
 Scope:
 
 - Authenticate principals and WebSocket subscriptions; authorize graph reads,

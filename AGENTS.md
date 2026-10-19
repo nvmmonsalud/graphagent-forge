@@ -107,6 +107,18 @@ into reload; memory state is lost, while durable mode recovers bounded jobs/hist
 - Keep Kimi model selection in `_resolve_model`, preserve reasoning-token budgets
   and structured truncation errors, and do not send a `temperature` parameter.
 
+## Private workspace contracts
+
+- AUTH_MODE=private must fail closed without valid identity configuration and
+  durable state. Local/unscoped resources must never be selected in private mode.
+- Route resources come from request.state.resources after membership/role checks.
+  Preserve all-label/type/index namespace enforcement and bounded traversal.
+- Inject workspace broadcast managers; authenticate/recheck every private socket
+  send. Recheck queued command submitter before work/chunk launch/publication.
+- Keep opaque cookies, CSRF/Origin checks, credential rotation and browser cache
+  fencing. Never put private credentials/history in localStorage or token URLs.
+- Read docs/M4_CONTRACT.md and docs/M4_UPGRADE.md before auth/scoping changes.
+
 ## Security and frontend changes
 
 - Preserve URL SSRF defenses: HTTP(S) only, all DNS records validated, redirects

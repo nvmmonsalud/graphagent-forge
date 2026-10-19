@@ -455,6 +455,8 @@ class DurableJobManager:
 
     async def _execute(self, row):
         from src.agent.commands import validate_command
+        from src.security.workspaces import WorkspaceAccessRevoked
+
         job_id, token = row["id"], row["lease_token"]
         task = None
         started = time.monotonic()
@@ -484,6 +486,11 @@ class DurableJobManager:
                     else:
                         await self._finish(job_id, token, status="succeeded", result=result)
                     return
+        except WorkspaceAccessRevoked:
+            if task is not None and not task.done():
+                await self._cleanup(task, job_id, token)
+            await self._finish(job_id, token, status="cancelled")
+            return
         except RetryableJobError:
             if task is not None and not task.done():
                 await self._cleanup(task, job_id, token)

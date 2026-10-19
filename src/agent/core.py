@@ -15,7 +15,7 @@ from src.ingestion.chunks import MAX_DOCUMENT_CHARS
 from src.ingestion.entity_parser import _resolve_model
 from src.ingestion.extractor import extract_from_text, extract_from_url
 from src.ingestion.file_extractor import extract_from_file
-from src.ingestion.graph_writer import ingest_to_graph
+from src.ingestion.graph_writer import _authorization_checkpoint, ingest_to_graph
 from src.ingestion.sources import build_source
 
 log = logging.getLogger(__name__)
@@ -30,8 +30,9 @@ class GraphAgent:
     #: Max concurrent embedding calls issued while embedding a document's nodes.
     EMBED_CONCURRENCY = 4
 
-    def __init__(self, neo4j: Neo4jClient):
+    def __init__(self, neo4j: Neo4jClient, ws_manager=None):
         self.neo4j = neo4j
+        self._ws_manager = ws_manager
         self.nosana = NosanaClient()
         # Reuse connections; embedding metadata is returned per call.
         self.graphrag = GraphRAGEngine(neo4j, nosana=self.nosana)
@@ -40,6 +41,8 @@ class GraphAgent:
 
     def _get_ws_manager(self):
         """Get the WebSocket connection manager from app state (late-binding)."""
+        if self._ws_manager is not None:
+            return self._ws_manager
         # Lazy import to avoid circular dependency
         try:
             from src.main import ws_manager
@@ -324,6 +327,7 @@ class GraphAgent:
             if not text:
                 return None
             async with semaphore:
+                await _authorization_checkpoint()
                 try:
                     embedding_result = await self.nosana.get_embedding_result(text)
                 except Exception as exc:
@@ -337,11 +341,19 @@ class GraphAgent:
                 "expected_summary": node.get("summary") or "",
             }
 
-        results = await asyncio.gather(*(embed_one(n) for n in nodes))
+        tasks = [asyncio.create_task(embed_one(n)) for n in nodes]
+        try:
+            results = await asyncio.gather(*tasks)
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         items = [item for item in results if item]
 
         stored = 0
         if items:
+            await _authorization_checkpoint()
             stored = await self.neo4j.set_node_embeddings(items)
             if methods is not None:
                 methods.update(item["method"] for item in items)
@@ -355,6 +367,7 @@ class GraphAgent:
         """Merge duplicate entities into one canonical node, then re-embed and broadcast."""
         ids = list(dict.fromkeys(node_ids))
 
+        await _authorization_checkpoint()
         res = await self.neo4j.merge_nodes(ids, canonical_id)
         if not res["ok"]:
             return {"error": "not_found", "missing": res["missing"]}
@@ -367,6 +380,7 @@ class GraphAgent:
             summary = (canonical.get("summary") or "").strip()
             text = f"{label}: {summary}" if (label and summary) else (label or summary)
             if text:
+                await _authorization_checkpoint()
                 embedding_result = await self.nosana.get_embedding_result(text)
                 if embedding_result.get("embedding"):
                     await self.neo4j.set_node_embeddings(

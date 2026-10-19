@@ -22,6 +22,13 @@ def validate_command(command: Any) -> dict:
     """
     if type(command) is not dict or type(command.get("version")) is not int:
         raise ValueError("Invalid ingestion command")
+    private_fields = {"_principal_id", "_workspace_id"}
+    present = set(command) & private_fields
+    if present and (present != private_fields or any(
+        type(command[key]) is not str or not command[key] or len(command[key]) > 48
+        for key in private_fields
+    )):
+        raise ValueError("Invalid command authorization context")
     kind = command.get("kind")
     fields = {
         "url": {"version", "kind", "url"},
@@ -29,7 +36,7 @@ def validate_command(command: Any) -> dict:
         "file": {"version", "kind", "data_b64", "filename", "content_type", "source"},
     }
     if (command["version"] != 1 or type(kind) is not str or kind not in fields
-            or set(command) != fields[kind]):
+            or set(command) - private_fields != fields[kind]):
         raise ValueError("Invalid ingestion command")
     if kind == "url":
         url = command["url"]

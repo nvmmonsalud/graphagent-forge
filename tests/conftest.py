@@ -19,6 +19,11 @@ def _isolated_env(monkeypatch):
         "DAYTONA_API_KEY",
         "API_KEY",
         "STATE_DB_PATH",
+        "AUTH_MODE",
+        "AUTH_CONFIG_PATH",
+        "AUTH_COOKIE_SECURE",
+        "GRAPHAGENT_TOKEN",
+        "GRAPHAGENT_WORKSPACE",
         "INGEST_ATTEMPT_BUDGET",
     ):
         monkeypatch.delenv(var, raising=False)
