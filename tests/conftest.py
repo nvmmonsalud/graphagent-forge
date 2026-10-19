@@ -18,6 +18,8 @@ def _isolated_env(monkeypatch):
         "NOSANA_EMBEDDING_URL",
         "DAYTONA_API_KEY",
         "API_KEY",
+        "STATE_DB_PATH",
+        "INGEST_ATTEMPT_BUDGET",
     ):
         monkeypatch.delenv(var, raising=False)
     yield

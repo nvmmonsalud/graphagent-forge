@@ -172,12 +172,13 @@ async def ingest_to_graph(
     model: str | None = None,
     *,
     source: dict | None = None,
+    operation_id: str | None = None,
 ) -> dict[str, Any]:
     """Full pipeline: extract entities → write to Neo4j."""
     log.info("Extracting entities from '%s' (%d chars)", source_doc, len(content))
 
     if source is not None:
-        return await _ingest_source(neo4j, content, source, model)
+        return await _ingest_source(neo4j, content, source, model, operation_id=operation_id)
 
     # Step 1: Extract entities and relationships via Kimi
     graph_data = await extract_entities(content, model=model)
@@ -243,12 +244,30 @@ async def ingest_to_graph(
 
 async def _ingest_source(
     neo4j: Neo4jClient, content: str, source: dict, model: str | None,
+    *, operation_id: str | None = None,
 ) -> dict[str, Any]:
     """Extract every planned excerpt, then atomically publish a complete version."""
     source = dict(source)
+    if operation_id is not None:
+        receipt = await neo4j.get_ingest_operation(operation_id)
+        if receipt is not None:
+            return receipt
     current = await neo4j.get_source(source["id"])
     expected_version = current.get("version") if current else None
     if expected_version == source["version"]:
+        if operation_id is not None:
+            result = await neo4j.publish_source_graph(
+                {"nodes": [], "edges": [], "chunks": []}, source=current,
+                expected_version=expected_version, operation_id=operation_id,
+            )
+            if result.get("success"):
+                return result
+            if result.get("conflict"):
+                return {"success": False, "conflict": True, "nodes": 0, "edges": 0,
+                        "error": "Source changed during extraction; retry ingestion"}
+            return {"success": True, "source": result.get("source", source["id"]),
+                    "version": result.get("version", source["version"]), "unchanged": True,
+                    "nodes": result["nodes_written"], "edges": result["edges_written"]}
         return {
             "success": True, "source": source["id"], "source_metadata": current,
             "nodes": 0, "edges": 0, "unchanged": True, "version": source["version"],
@@ -334,7 +353,14 @@ async def _ingest_source(
     source["coverage"] = coverage
     result = await neo4j.publish_source_graph(
         graph_data, source=source, expected_version=expected_version,
+        **({"operation_id": operation_id} if operation_id is not None else {}),
     )
+    if result.get("success") and "nodes_written" not in result:
+        return result
+    if operation_id is not None and result.get("unchanged") and not result.get("conflict"):
+        return {"success": True, "source": result.get("source", source["id"]),
+                "version": result.get("version", source["version"]), "unchanged": True,
+                "nodes": result["nodes_written"], "edges": result["edges_written"]}
     if result.get("conflict"):
         return {
             "success": False, "source": source["id"], "conflict": True,

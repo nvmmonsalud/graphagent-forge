@@ -89,8 +89,9 @@ def test_saved_limit_conflict_renders_dedicated_toast(html: str) -> None:
 
 def test_empty_state_copy_is_honest(html: str) -> None:
     assert (
-        "No answers yet. Server history resets when the server restarts; "
-        "this browser keeps a local copy." in html
+        "No answers yet. Durable mode retains server history across restarts; "
+        "memory mode resets it. "
+        "This browser keeps a local copy." in html
     )
 
 

@@ -34,3 +34,9 @@ logs/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Private durable workflow state
+/data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

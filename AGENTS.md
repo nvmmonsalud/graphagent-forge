@@ -16,7 +16,9 @@ sandboxed verification/analytics; Nosana provides optional semantic embeddings.
   ingestion submission, graph tools, analytics, and query-history endpoints.
 - `src/agent/core.py`: ingestion/query orchestration and progress reporting.
 - `src/agent/jobs.py`: bounded async job queue; `history.py`: bounded synchronous
-  query-history store. Both are in-memory, per-process, and reset on restart.
+  query-history store. These remain the default memory adapters. Optional
+  `state.py`, `durable_jobs.py`, `durable_history.py` and `commands.py` implement
+  SQLite-backed state when STATE_DB_PATH is set; see docs/M3_CONTRACT.md.
 - `src/agent/daytona_exec.py`: verification, fan-out, sweep, and structural
   analytics execution; `nosana_client.py`: embeddings and fallback reporting.
 - `src/ingestion/`: guarded URL fetching, file validation/extraction, Kimi calls,
@@ -55,7 +57,7 @@ the venv; its API base is `GRAPHAGENT_API`.
 Configure local settings using `.env.example`; never overwrite an existing `.env`
 or commit credentials. The app boots without keys or a reachable Neo4j, but graph
 operations need Neo4j and live extraction/answers need Kimi. `DEV_RELOAD=1` opts
-into reload; it restarts the process and loses in-flight jobs and history.
+into reload; memory state is lost, while durable mode recovers bounded jobs/history.
 
 ## Implementation contracts
 
@@ -97,7 +99,11 @@ into reload; it restarts the process and loses in-flight jobs and history.
   (`truncated`, totals, `limit`) and the distinction between incremental graph
   updates, merge updates, and job/verification telemetry on `/ws/graph`.
 - Preserve bounded queue/history behavior and public schemas. History recording
-  must not break an answer; saved entries remain in memory, not durable storage.
+  must not break an answer. Durable adapters preserve the public schemas, fence
+  lease writes, and remove private commands on terminal transitions. Receipt and
+  source publication must stay in the same Neo4j transaction; replay receipts
+  survive refresh/delete/clear. Do not claim multi-API-worker or monetary-budget
+  support; see docs/M3_UPGRADE.md for deployment and remaining M3 scope.
 - Keep Kimi model selection in `_resolve_model`, preserve reasoning-token budgets
   and structured truncation errors, and do not send a `temperature` parameter.
 

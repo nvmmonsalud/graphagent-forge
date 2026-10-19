@@ -126,6 +126,12 @@ result. Real-provider human claim-support evaluation remains follow-up work.
 
 ## M3 — Durable research workflows
 
+Delivery status: durable single-host foundation implemented. See
+[M3_UPGRADE.md](M3_UPGRADE.md) and [M3_ADR.md](M3_ADR.md). SQLite commands, history,
+leases, event replay, attempt budgets, cancellation and Neo4j publication receipts
+are covered. Full M3 remains in progress: provider token/dollar accounting, shared
+ask/sandbox quotas and multi-API-worker event/rate delivery remain follow-up work.
+
 Scope:
 
 - Introduce repository interfaces and serializable job commands instead of trying

@@ -97,8 +97,14 @@ class GraphAgent:
         except Exception as exc:
             log.warning("Progress callback failed for stage %s: %s", stage, exc)
 
-    async def ingest_url(self, url: str, progress: ProgressCb | None = None) -> dict[str, Any]:
+    async def ingest_url(
+        self, url: str, progress: ProgressCb | None = None, *, operation_id: str | None = None,
+    ) -> dict[str, Any]:
         """Ingest a URL: extract → graph → store."""
+        if operation_id is not None:
+            receipt = await self.neo4j.get_ingest_operation(operation_id)
+            if receipt is not None:
+                return receipt
         log.info("Ingesting URL")
 
         # Extract content
@@ -121,6 +127,7 @@ class GraphAgent:
                 source_doc=source["id"],
                 source=source,
                 model=model,
+                **({"operation_id": operation_id} if operation_id is not None else {}),
             )
 
         result["extraction"] = {
@@ -137,9 +144,14 @@ class GraphAgent:
         )
 
     async def ingest_text(
-        self, text: str, source: str = "manual", progress: ProgressCb | None = None
+        self, text: str, source: str = "manual", progress: ProgressCb | None = None,
+        *, operation_id: str | None = None,
     ) -> dict[str, Any]:
         """Ingest raw text: extract → graph → store."""
+        if operation_id is not None:
+            receipt = await self.neo4j.get_ingest_operation(operation_id)
+            if receipt is not None:
+                return receipt
         extraction = extract_from_text(text, source, max_chars=MAX_DOCUMENT_CHARS)
         model = _resolve_model(None)
         source_metadata = build_source("text", source, source, extraction["content"], model=model)
@@ -153,6 +165,7 @@ class GraphAgent:
                 source_doc=source_metadata["id"],
                 source=source_metadata,
                 model=model,
+                **({"operation_id": operation_id} if operation_id is not None else {}),
             )
 
         return await self._post_ingest(
@@ -169,6 +182,7 @@ class GraphAgent:
         content_type: str | None = None,
         source: str | None = None,
         progress: ProgressCb | None = None,
+        *, operation_id: str | None = None,
     ) -> dict[str, Any]:
         """Ingest an uploaded file: parse → extract → graph → store.
 
@@ -176,6 +190,10 @@ class GraphAgent:
         parsed into plain text first (and rejected here on any parse failure), and
         only then does the shared extract → graph → `_post_ingest` tail run.
         """
+        if operation_id is not None:
+            receipt = await self.neo4j.get_ingest_operation(operation_id)
+            if receipt is not None:
+                return receipt
         await self._report(progress, "parsing")
         extraction = await extract_from_file(
             data, filename, content_type, label=source, max_chars=MAX_DOCUMENT_CHARS,
@@ -200,6 +218,7 @@ class GraphAgent:
                 source_doc=source_doc,
                 source=source_metadata,
                 model=model,
+                **({"operation_id": operation_id} if operation_id is not None else {}),
             )
 
         result["extraction"] = {

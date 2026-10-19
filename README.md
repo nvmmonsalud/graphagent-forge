@@ -121,6 +121,16 @@ until they have compatible per-result model metadata. See the [M2 evidence
 guide](docs/M2_UPGRADE.md) for reingestion, excerpt storage, coverage limits and
 citation validation. Legacy summaries alone cannot produce a cited answer.
 
+## Durable workflows (optional)
+
+Set `STATE_DB_PATH=data/state.sqlite3` to retain queued/terminal ingest jobs,
+progress events and saved answers across restarts. Memory mode remains the default.
+The primary UI resumes retained job progress and can request cancellation.
+Read the [M3 deployment/recovery guide](docs/M3_UPGRADE.md) first: queued document
+inputs are stored privately until terminal state, replay can resume provider work,
+and this release supports one API process on local disk. The shared attempt
+budget is separate from provider dollar/token accounting.
+
 ## 📁 Project Structure
 
 ```

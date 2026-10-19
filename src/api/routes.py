@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import csv
+import inspect
 import io
 import ipaddress
 import logging
@@ -28,6 +30,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 from src.agent.daytona_exec import SWEEP_ERROR_UNAVAILABLE
+from src.agent.durable_jobs import DurableJobManager, IdempotencyConflict
 from src.agent.jobs import JobQueueFull
 from src.ingestion.file_extractor import MAX_UPLOAD_BYTES, check_upload_shape, safe_filename
 
@@ -296,6 +299,35 @@ async def health(request: Request):
     }
 
 
+async def _store_call(method, *args, **kwargs):
+    """Support synchronous memory adapters and asynchronous durable adapters."""
+    try:
+        value = method(*args, **kwargs)
+        return await value if inspect.isawaitable(value) else value
+    except Exception:
+        log.exception("Workflow store operation failed")
+        raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
+
+
+async def _durable_read_auth(request: Request):
+    if getattr(request.app.state, "storage_mode", "memory") == "sqlite":
+        await require_api_key(request.headers.get("X-API-Key"))
+
+
+async def _submit_ingest(jobs, kind, params, run, command, request):
+    if isinstance(jobs, DurableJobManager):
+        try:
+            return await jobs.submit_command(
+                kind, params, command,
+                idempotency_key=request.headers.get("Idempotency-Key"),
+            )
+        except IdempotencyConflict:
+            raise HTTPException(status_code=409, detail="idempotency key conflict") from None
+        except ValueError:
+            raise HTTPException(status_code=422, detail="invalid job command or key") from None
+    return jobs.submit(kind, params, run)
+
+
 @router.post("/ingest/url", status_code=202, dependencies=INGEST_DEP)
 async def ingest_url(req: IngestURLRequest, request: Request, wait: bool = Query(default=False)):
     """Submit a URL ingest job. Returns 202 with a job id, or the ingest
@@ -310,7 +342,12 @@ async def ingest_url(req: IngestURLRequest, request: Request, wait: bool = Query
         return await agent.ingest_url(url, progress=progress)
 
     try:
-        record = jobs.submit("url", {"url": url}, run)
+        record = await _submit_ingest(
+            jobs, "url", {"url": url}, run,
+            {"version": 1, "kind": "url", "url": url}, request,
+        )
+    except HTTPException:
+        raise
     except JobQueueFull:
         raise HTTPException(status_code=429, detail="job queue full") from None
     except Exception:
@@ -319,6 +356,8 @@ async def ingest_url(req: IngestURLRequest, request: Request, wait: bool = Query
 
     if not wait:
         content = {"job_id": record["id"], "status": record["status"]}
+        if isinstance(jobs, DurableJobManager):
+            content["cancel_supported"] = True
         return JSONResponse(status_code=202, content=content)
 
     try:
@@ -347,7 +386,12 @@ async def ingest_text(req: IngestTextRequest, request: Request, wait: bool = Que
     try:
         # The raw text must NOT go into the job's public params — only a
         # length hint, so job listings stay small and don't leak content.
-        record = jobs.submit("text", {"source": source, "text_chars": len(text)}, run)
+        record = await _submit_ingest(
+            jobs, "text", {"source": source, "text_chars": len(text)}, run,
+            {"version": 1, "kind": "text", "text": text, "source": source}, request,
+        )
+    except HTTPException:
+        raise
     except JobQueueFull:
         raise HTTPException(status_code=429, detail="job queue full") from None
     except Exception:
@@ -356,6 +400,8 @@ async def ingest_text(req: IngestTextRequest, request: Request, wait: bool = Que
 
     if not wait:
         content = {"job_id": record["id"], "status": record["status"]}
+        if isinstance(jobs, DurableJobManager):
+            content["cancel_supported"] = True
         return JSONResponse(status_code=202, content=content)
 
     try:
@@ -438,9 +484,15 @@ if HAS_MULTIPART:
             # Job params carry only filename/content_type/size_bytes — never
             # the bytes themselves, since the record is public via GET
             # /api/jobs.
-            record = jobs.submit(
-                "file", {"filename": name, "content_type": declared, "size_bytes": len(data)}, run
+            record = await _submit_ingest(
+                jobs, "file",
+                {"filename": name, "content_type": declared, "size_bytes": len(data)}, run,
+                {"version": 1, "kind": "file", "filename": name,
+                 "content_type": declared, "source": source,
+                 "data_b64": base64.b64encode(data).decode("ascii")}, request,
             )
+        except HTTPException:
+            raise
         except JobQueueFull:
             raise HTTPException(status_code=429, detail="job queue full") from None
         except Exception:
@@ -449,6 +501,8 @@ if HAS_MULTIPART:
 
         if not wait:
             content = {"job_id": record["id"], "status": record["status"]}
+            if isinstance(jobs, DurableJobManager):
+                content["cancel_supported"] = True
             return JSONResponse(status_code=202, content=content)
 
         try:
@@ -464,24 +518,51 @@ if HAS_MULTIPART:
 # ------------------------------------------------------------------
 # Job queue — read endpoints
 #
-# Deliberately NO dependencies: in-memory only (nothing to gate on Neo4j
-# availability), must keep working in degraded mode, and must not consume
-# the shared per-IP rate bucket that ingest/ask polling would otherwise
-# starve. Unauthenticated like every other GET read in this file.
+# No graph or rate-limit dependency: polling must work in degraded mode.
+# Durable mode enforces the configured API key for persisted job reads.
 # ------------------------------------------------------------------
 @router.get("/jobs")
 async def list_jobs(request: Request, limit: int = Query(default=20, ge=1, le=100)):
     """List submitted jobs, newest first."""
-    return {"jobs": request.app.state.jobs.list(limit=limit)}
+    await _durable_read_auth(request)
+    result = {"jobs": await _store_call(request.app.state.jobs.list, limit=limit)}
+    if isinstance(request.app.state.jobs, DurableJobManager):
+        result["durable"] = True
+    return result
 
 
 @router.get("/jobs/{job_id}")
 async def get_job(job_id: str, request: Request):
     """Fetch a single job's status/result by id."""
-    record = request.app.state.jobs.get(job_id)
+    await _durable_read_auth(request)
+    record = await _store_call(request.app.state.jobs.get, job_id)
     if record is None:
         raise HTTPException(status_code=404, detail="job not found")
     return record
+
+
+@router.post("/jobs/{job_id}/cancel", dependencies=[Depends(require_api_key)])
+async def cancel_job(job_id: str, request: Request):
+    jobs = request.app.state.jobs
+    if not isinstance(jobs, DurableJobManager):
+        raise HTTPException(status_code=409, detail="cancellation requires durable mode")
+    record = await _store_call(jobs.cancel, job_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return record
+
+
+@router.get("/jobs/{job_id}/events", dependencies=[Depends(require_api_key)])
+async def job_events(
+    job_id: str, request: Request,
+    after: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=100),
+):
+    jobs = request.app.state.jobs
+    if not isinstance(jobs, DurableJobManager):
+        raise HTTPException(status_code=409, detail="event replay requires durable mode")
+    if await _store_call(jobs.get, job_id) is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return {"events": await _store_call(jobs.events, job_id, after=after, limit=limit)}
 
 
 @router.post("/ask", dependencies=ASK_DEP)
@@ -504,7 +585,7 @@ async def ask(req: AskRequest, request: Request):
     store = getattr(request.app.state, "history", None)
     if store is not None:
         try:
-            store.record(
+            await _store_call(store.record,
                 question=req.question,
                 response=result,
                 duration_ms=int(round((time.perf_counter() - started) * 1000)),
@@ -940,9 +1021,10 @@ HISTORY_DEP = [Depends(require_api_key)]
 async def list_history(request: Request, limit: int = Query(default=20, ge=1, le=100)):
     """List answered questions, newest first, with store-wide counts."""
     store = request.app.state.history
-    counts = store.counts()
+    await _durable_read_auth(request)
+    counts = await _store_call(store.counts)
     return {
-        "entries": store.list(limit=limit),
+        "entries": await _store_call(store.list, limit=limit),
         "total": counts["total"],
         "saved_count": counts["saved_count"],
     }
@@ -952,7 +1034,7 @@ async def list_history(request: Request, limit: int = Query(default=20, ge=1, le
 async def save_history_entry(entry_id: str, request: Request):
     """Pin an entry so history eviction can never drop it."""
     store = request.app.state.history
-    entry = store.set_saved(entry_id, True)
+    entry = await _store_call(store.set_saved, entry_id, True)
     if entry is None:
         raise HTTPException(status_code=404, detail="history entry not found")
     # `set_saved` refuses past the saved cap by returning the entry unchanged.
@@ -967,7 +1049,7 @@ async def save_history_entry(entry_id: str, request: Request):
 async def unsave_history_entry(entry_id: str, request: Request):
     """Unpin an entry, returning it to the normal eviction window."""
     store = request.app.state.history
-    entry = store.set_saved(entry_id, False)
+    entry = await _store_call(store.set_saved, entry_id, False)
     if entry is None:
         raise HTTPException(status_code=404, detail="history entry not found")
     return entry
@@ -977,6 +1059,6 @@ async def unsave_history_entry(entry_id: str, request: Request):
 async def delete_history_entry(entry_id: str, request: Request):
     """Drop a single entry from the history store."""
     store = request.app.state.history
-    if not store.delete(entry_id):
+    if not await _store_call(store.delete, entry_id):
         raise HTTPException(status_code=404, detail="history entry not found")
     return {"deleted": entry_id}

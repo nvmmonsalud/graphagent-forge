@@ -62,6 +62,10 @@ class Neo4jClient:
             "CREATE CONSTRAINT source_id IF NOT EXISTS FOR (s:Source) REQUIRE s.id IS UNIQUE",
             "CREATE CONSTRAINT evidence_id IF NOT EXISTS "
             "FOR (c:EvidenceChunk) REQUIRE c.id IS UNIQUE",
+            "CREATE CONSTRAINT ingest_operation_id IF NOT EXISTS "
+            "FOR (o:IngestOperation) REQUIRE o.id IS UNIQUE",
+            "CREATE INDEX ingest_operation_created IF NOT EXISTS "
+            "FOR (o:IngestOperation) ON (o.created_at)",
             "CREATE CONSTRAINT graph_state_id IF NOT EXISTS "
             "FOR (s:GraphState) REQUIRE s.id IS UNIQUE",
             "CREATE INDEX evidence_source_id IF NOT EXISTS "
@@ -76,6 +80,7 @@ class Neo4jClient:
         async with self.driver.session() as session:
             for q in queries:
                 await session.run(q)
+            await self._prune_ingest_operations(session)
 
         await self._migrate_source_docs()
         await self._backfill_norm_labels()
@@ -357,9 +362,49 @@ class Neo4jClient:
             RETURN c {.*, title: s.title, uri: s.uri} AS chunk
             """, terms=terms, entity_ids=selected, limit=limit)
 
+    @staticmethod
+    def _validate_operation_id(operation_id):
+        if (not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 128
+                or any(not 33 <= ord(c) <= 126 for c in operation_id)):
+            raise ValueError("Invalid ingestion operation ID")
+
+    @staticmethod
+    async def _prune_ingest_operations(runner):
+        await runner.run("MATCH (o:IngestOperation) "
+                         "WHERE o.created_at <= datetime() - duration('P7D') DELETE o")
+
+    @staticmethod
+    async def _read_ingest_operation(runner, operation_id):
+        result = await runner.run("""
+            MATCH (o:IngestOperation {id: $operation_id})
+            WHERE o.created_at > datetime() - duration('P7D')
+            RETURN o.source AS source, o.version AS version,
+                   o.nodes AS nodes, o.edges AS edges
+            """, operation_id=operation_id)
+        row = await result.single()
+        return {"success": True, **dict(row), "unchanged": True} if row else None
+
+    async def get_ingest_operation(self, operation_id: str) -> dict | None:
+        """Private publication checkpoint; independent of current source existence."""
+        self._validate_operation_id(operation_id)
+        async with self.driver.session() as session:
+            await self._prune_ingest_operations(session)
+            return await self._read_ingest_operation(session, operation_id)
+
+    @staticmethod
+    async def _write_ingest_operation(tx, operation_id, source, nodes, edges):
+        await tx.run("""
+            CREATE (o:IngestOperation {id: $operation_id, source: $source,
+              version: $version, nodes: $nodes, edges: $edges, created_at: datetime()})
+            """, operation_id=operation_id, source=source["id"], version=source["version"],
+                     nodes=nodes, edges=edges)
+
     async def publish_source_graph(self, graph_data: dict, *, source: dict,
-                                   expected_version: str | None) -> dict:
+                                   expected_version: str | None,
+                                   operation_id: str | None = None) -> dict:
         """Publish a complete source refresh atomically with optimistic concurrency."""
+        if operation_id is not None:
+            self._validate_operation_id(operation_id)
         sid = source["id"]
         chunks = self._prepare_chunks(graph_data, source)
         valid_evidence = {c["id"] for c in chunks}
@@ -393,6 +438,14 @@ class Neo4jClient:
             tx = await session.begin_transaction()
             try:
                 await self._lock_graph(tx)
+                if operation_id is not None:
+                    await self._prune_ingest_operations(tx)
+                    prior = await self._read_ingest_operation(tx, operation_id)
+                    if prior is not None:
+                        await tx.commit()
+                        return dict(nodes_written=prior["nodes"], edges_written=prior["edges"],
+                                    source=prior["source"], version=prior["version"],
+                                    unchanged=True, conflict=False)
                 result = await tx.run("""
                     MERGE (s:Source {id: $id})
                     SET s._lock = coalesce(s._lock, 0) + 1
@@ -401,6 +454,11 @@ class Neo4jClient:
                 row = await result.single()
                 current = row["version"] if row else None
                 if current == source["version"]:
+                    if operation_id is not None:
+                        await self._write_ingest_operation(tx, operation_id, source, 0, 0)
+                        await tx.commit()
+                        return dict(nodes_written=0, edges_written=0, unchanged=True,
+                                    conflict=False, source=sid, version=current)
                     await tx.rollback()
                     return dict(nodes_written=0, edges_written=0, unchanged=True, conflict=False)
                 if current != expected_version:
@@ -436,12 +494,18 @@ class Neo4jClient:
                              "s.updated_at = datetime() "
                              "REMOVE s._placeholder, s._deleted, s._migration",
                              sid=sid, metadata=metadata)
+                if operation_id is not None:
+                    await self._write_ingest_operation(tx, operation_id, source,
+                                                       len(nodes), len(edges))
                 await tx.commit()
             except BaseException:
                 await tx.rollback()
                 raise
-        return dict(nodes_written=len(nodes), edges_written=len(edges),
-                    unchanged=False, conflict=False)
+        result = dict(nodes_written=len(nodes), edges_written=len(edges),
+                      unchanged=False, conflict=False)
+        if operation_id is not None:
+            result.update(source=sid, version=source["version"])
+        return result
 
     @staticmethod
     async def _remove_source_graph(tx, source_doc):

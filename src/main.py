@@ -153,24 +153,43 @@ async def lifespan(app: FastAPI):
     app.state.agent = GraphAgent(neo4j)
     app.state.ws_manager = ws_manager
 
-    # Background ingest queue. In-memory and per-process: jobs are lost on
-    # restart, and every job_update is pushed over the same /ws/graph socket.
-    jobs = JobManager(broadcast=ws_manager.broadcast)
-    jobs.start()
-    app.state.jobs = jobs
-
-    # Answer history. Same contract as the job registry: in-memory, per-process,
-    # lost on restart. Purely synchronous — no I/O, so nothing to start or drain
-    # (hence no shutdown hook for it in the `finally` below).
-    app.state.history = QueryHistory()
-
+    # Durable state is opt-in. Initialization failure must stop startup rather
+    # than silently replacing persisted work with an empty memory store.
+    app.state.storage_mode = "memory"
+    app.state.jobs = None
     try:
+        state_path = os.getenv("STATE_DB_PATH", "").strip()
+        if state_path:
+            from src.agent.commands import command_handler
+            from src.agent.durable_history import SQLiteQueryHistory
+            from src.agent.durable_jobs import DurableJobManager
+            from src.agent.state import StateDatabase
+
+            database = StateDatabase(state_path)
+            await database.initialize()
+            history = SQLiteQueryHistory(database)
+            await history.initialize()
+            jobs = DurableJobManager(
+                database, command_handler(app.state.agent), broadcast=ws_manager.broadcast,
+                attempt_budget=int(os.getenv("INGEST_ATTEMPT_BUDGET", "100")),
+            )
+            app.state.jobs = jobs
+            await jobs.initialize()
+            await jobs.start()
+            app.state.history = history
+            app.state.storage_mode = "sqlite"
+        else:
+            jobs = JobManager(broadcast=ws_manager.broadcast)
+            app.state.jobs = jobs
+            jobs.start()
+            app.state.history = QueryHistory()
         yield
     finally:
         # Drain jobs FIRST: in-flight work still holds the Neo4j driver and the
         # shared httpx clients, so this has to finish before they are closed.
         try:
-            await app.state.jobs.shutdown()
+            if app.state.jobs is not None:
+                await app.state.jobs.shutdown()
         except Exception:
             log.exception("Error while shutting down the ingest job queue")
         # Close whenever a driver object was actually created — `connect()` can

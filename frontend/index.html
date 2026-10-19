@@ -1365,7 +1365,7 @@ footer a { color: var(--accent2); text-decoration: none; }
       <div class="ingest-card" id="ingest-file-card" style="grid-column:1/-1">
         <div class="icon">📄</div>
         <h3>From File</h3>
-        <p>Upload a PDF, .txt or .md — original file bytes are discarded; bounded text excerpts are stored</p>
+        <p>Upload a PDF, .txt or .md — bounded text excerpts are stored; durable mode also retains queued file bytes until the job finishes</p>
         <div class="file-drop" id="ingest-file-drop">
           <label class="btn" for="ingest-file-input">📎 Choose file</label>
           <span id="ingest-file-name" class="file-name">no file selected</span>
@@ -2199,12 +2199,12 @@ function startJobPoll(id) {
       const job = await apiFetch(API + '/jobs/' + encodeURIComponent(id));
       consecutiveErrors = 0;
       renderIngestJob(job);
-      if (job && (job.status === 'succeeded' || job.status === 'failed')) stopJobPoll();
+      if (job && (job.status === 'succeeded' || job.status === 'failed' || job.status === 'cancelled')) stopJobPoll();
     } catch (e) {
       // 404 = the registry lost the job (restart); nothing more will ever arrive.
       // Release the UI instead of leaving the ingest buttons disabled forever.
       if (e && e.status === 404) {
-        abandonIngestJob('Lost track of this job — the server restarted. Check the graph for what landed.');
+        abandonIngestJob('This job is no longer retained. Check the graph for what landed.');
         return;
       }
       if (++consecutiveErrors >= 5) {
@@ -2262,17 +2262,40 @@ function coverageHtml(coverage) {
   return notices.length ? `<div class="result-box notice">${notices.join('<br>')}</div>` : '';
 }
 
+function cancelJobButton() {
+  return activeIngestJob?.cancel_supported ? '<button type="button" class="mini-btn" data-cancel-job>Cancel job</button>' : '';
+}
+
+document.getElementById('ingest-result').addEventListener('click', async event => {
+  const button = event.target.closest('[data-cancel-job]');
+  if (!button || !activeIngestJob) return;
+  button.disabled = true;
+  try {
+    const job = await apiFetch(API + '/jobs/' + encodeURIComponent(activeIngestJob.id) + '/cancel', {method:'POST'});
+    renderIngestJob(job);
+    toast('Cancellation requested. Waiting for cleanup.', 'notice');
+  } catch (error) {
+    toast(errorMessage(error), 'error');
+    button.disabled = false;
+  }
+});
+
 function renderIngestJob(job) {
   if (!activeIngestJob || !job || job.id !== activeIngestJob.id) return;
   const result = document.getElementById('ingest-result');
   result.style.display = 'block';
 
   if (job.status === 'queued') {
-    result.innerHTML = `<div class="result-box"><span class="loader"></span> Queued…</div>`;
+    result.innerHTML = `<div class="result-box"><span class="loader"></span> Queued…${cancelJobButton()}</div>`;
     return;
   }
   if (job.status === 'running') {
-    result.innerHTML = `<div class="result-box"><span class="loader"></span> Running — ${esc(job.stage || 'starting')}</div>`;
+    result.innerHTML = `<div class="result-box"><span class="loader"></span> Running — ${esc(job.stage || 'starting')}${cancelJobButton()}</div>`;
+    return;
+  }
+  if (job.status === 'cancelled') {
+    result.innerHTML = '<div class="result-box notice">Cancelled. A graph publication completed before cancellation may remain.</div>';
+    finishIngestJob();
     return;
   }
   if (job.status === 'failed') {
@@ -2309,7 +2332,7 @@ async function doIngestURL() {
   stopJobPoll();
   try {
     const d = await apiFetch(API+'/ingest/url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
-    activeIngestJob = { id: d.job_id, kind: 'url', label: url };
+    activeIngestJob = { id: d.job_id, kind: 'url', label: url, cancel_supported: !!d.cancel_supported };
     renderIngestJob({ id: d.job_id, status: 'queued' });
     startJobPoll(d.job_id);
   } catch(e) {
@@ -2330,7 +2353,7 @@ async function doIngestText() {
   stopJobPoll();
   try {
     const d = await apiFetch(API+'/ingest/text',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,source})});
-    activeIngestJob = { id: d.job_id, kind: 'text', label: source };
+    activeIngestJob = { id: d.job_id, kind: 'text', label: source, cancel_supported: !!d.cancel_supported };
     renderIngestJob({ id: d.job_id, status: 'queued' });
     startJobPoll(d.job_id);
   } catch(e) {
@@ -2400,7 +2423,7 @@ async function doIngestFile() {
     const src = document.getElementById('ingest-file-source').value.trim();
     if (src) fd.append('source', src);
     const d = await apiFetch(API+'/ingest/file', {method:'POST', body: fd});
-    activeIngestJob = { id: d.job_id, kind: 'file', label: selectedIngestFile.name };
+    activeIngestJob = { id: d.job_id, kind: 'file', label: selectedIngestFile.name, cancel_supported: !!d.cancel_supported };
     renderIngestJob({ id: d.job_id, status: 'queued' });
     startJobPoll(d.job_id);
   } catch(e) {
@@ -3807,7 +3830,7 @@ function renderHistoryRow(entry, i) {
   </div>`;
 }
 
-const HISTORY_EMPTY_HTML = '<div class="result-box notice">No answers yet. Server history resets when the server restarts; this browser keeps a local copy.</div>';
+const HISTORY_EMPTY_HTML = '<div class="result-box notice">No answers yet. Durable mode retains server history across restarts; memory mode resets it. This browser keeps a local copy.</div>';
 
 async function loadQueryHistory() {
   const panel = document.getElementById('query-history');
@@ -3917,6 +3940,20 @@ document.getElementById('query-history')?.addEventListener('click', async (evt) 
 // Self-boot: populate the panel (and its localStorage mirror) on page load
 // so restored entries from a previous session are visible immediately.
 loadQueryHistory().catch(() => {});
+
+// Reattach progress after a page/server restart without resubmitting work.
+(async function resumeDurableIngest() {
+  try {
+    const response = await apiFetch(API + '/jobs?limit=20');
+    if (!response.durable || activeIngestJob || !response.jobs?.length) return;
+    const job = response.jobs.find(j => j.status === 'queued' || j.status === 'running') || response.jobs[0];
+    activeIngestJob = {id:job.id, kind:job.kind, cancel_supported:true,
+      label:job.params?.filename || job.params?.source || job.params?.url || job.kind};
+    renderIngestJob(job);
+    if (activeIngestJob) { setIngestButtonsBusy('btn-ingest-' + job.kind); startJobPoll(job.id); }
+  } catch { /* The next explicit action still surfaces auth/network errors. */ }
+})();
+
 
 // Enter key handlers
 document.getElementById('query-input').addEventListener('keydown', e => { if(e.key==='Enter') doQuery(); });
