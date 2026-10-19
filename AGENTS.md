@@ -86,6 +86,12 @@ into reload; it restarts the process and loses in-flight jobs and history.
   mutation lock; Source version compare-and-swap prevents conflicting refreshes.
   Retain tombstones against stale work. Legacy provenance strings remain valid
   keys; see docs/M1_UPGRADE.md for explicit migration and rollback.
+- M2 original excerpts use `:EvidenceChunk`, linked to current Source versions;
+  they are separate from graph summaries. Preserve server-assigned `evidence_ids`,
+  atomic replacement/deletion, and exact sent/current citation validation. Bound
+  extraction to 12 chunks with concurrency two and final answers to three chunks.
+  See docs/M2_CONTRACT.md and docs/M2_UPGRADE.md for offsets, coverage and privacy.
+  Never include raw chunk text in job/WebSocket/public graph projections.
 - Every returned edge must reference nodes included in the same graph response,
   including capped reads and per-source boundary nodes. Preserve graph metadata
   (`truncated`, totals, `limit`) and the distinction between incremental graph

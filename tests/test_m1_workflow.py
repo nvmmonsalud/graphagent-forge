@@ -98,11 +98,13 @@ async def test_publication_receives_pre_extraction_version_and_namespaces(
     monkeypatch.setattr(writer, "extract_entities", AsyncMock(return_value=extracted_graph))
     result = await writer.ingest_to_graph(neo4j, "new", source=source)
     call = neo4j.publish_source_graph.await_args
-    assert call.kwargs == {"source": source, "expected_version": "old"}
+    assert call.kwargs["expected_version"] == "old"
+    published_source = call.kwargs["source"]
+    assert published_source == {**source, "coverage": result["coverage"]}
     graph = call.args[0]
     assert len(graph["nodes"][0]["id"].split("_")[0]) == 64
     assert graph["edges"][0]["source"] == graph["nodes"][0]["id"]
-    assert result["source_metadata"] == source
+    assert result["source_metadata"] == published_source
     neo4j.write_graph.assert_not_awaited()
 
 

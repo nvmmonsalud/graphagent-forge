@@ -1365,7 +1365,7 @@ footer a { color: var(--accent2); text-decoration: none; }
       <div class="ingest-card" id="ingest-file-card" style="grid-column:1/-1">
         <div class="icon">📄</div>
         <h3>From File</h3>
-        <p>Upload a PDF, .txt or .md — parsed in memory, never stored</p>
+        <p>Upload a PDF, .txt or .md — original file bytes are discarded; bounded text excerpts are stored</p>
         <div class="file-drop" id="ingest-file-drop">
           <label class="btn" for="ingest-file-input">📎 Choose file</label>
           <span id="ingest-file-name" class="file-name">no file selected</span>
@@ -2253,6 +2253,15 @@ function finishIngestJob() {
   setIngestButtonsBusy(null);
 }
 
+function coverageHtml(coverage) {
+  if (!coverage) return '';
+  const notices = [];
+  if (coverage.partial) notices.push(`Partial coverage (${esc(coverage.processed_chars)} characters processed; ${esc(coverage.skipped_chars)} skipped)`);
+  if (coverage.input_truncated) notices.push('Input truncated: original document may contain additional text');
+  if (coverage.graph_capped) notices.push('Graph limit reached: some extracted entities or relationships were omitted');
+  return notices.length ? `<div class="result-box notice">${notices.join('<br>')}</div>` : '';
+}
+
 function renderIngestJob(job) {
   if (!activeIngestJob || !job || job.id !== activeIngestJob.id) return;
   const result = document.getElementById('ingest-result');
@@ -2284,6 +2293,7 @@ function renderIngestJob(job) {
     } else {
       result.innerHTML = `<div class="result-box error">❌ ${esc(job.result?.error || 'Failed')}</div>`;
     }
+    result.innerHTML += coverageHtml(job.result && job.result.coverage);
     finishIngestJob();
   }
 }
@@ -2414,6 +2424,31 @@ function provenanceHtml(d) {
   return `<div class="provenance"><div class="prov-label">Provenance</div>${d.source_docs.map(s=>`<span class="prov-tag">${esc(sourceTitle(s))}</span>`).join(' ')}</div>`;
 }
 
+function citationsHtml(d) {
+  const citations = Array.isArray(d.citations) ? d.citations.slice() : [];
+  const conflicts = Array.isArray(d.conflicts) ? d.conflicts : [];
+  const conflictIds = new Set(conflicts.flatMap(c => c.evidence_ids || []));
+  for (const c of (d.retrieved_evidence || [])) {
+    if (conflictIds.has(c.id) && !citations.some(existing => existing.id === c.id)) citations.push(c);
+  }
+  return (conflicts.length ? `<div class="result-box notice"><strong>Conflicting evidence</strong>${conflicts.map(c => `<p>${esc(c.description)} (${(c.evidence_ids || []).map(esc).join(', ')})</p>`).join('')}</div>` : '')
+    + (citations.length ? `<div class="provenance"><div class="prov-label">Original evidence</div>${citations.map(c => `<button type="button" class="mini-btn" data-evidence-id="${esc(c.id)}">${esc(c.title || c.source_id)} · ${esc(c.start)}–${esc(c.end)}</button>`).join(' ')}</div><div id="evidence-detail" aria-live="polite"></div>` : '');
+}
+
+document.getElementById('query-result').addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-evidence-id]');
+  if (!button) return;
+  const detail = document.getElementById('evidence-detail');
+  if (!detail) return;
+  detail.textContent = 'Loading current excerpt…';
+  try {
+    const c = await apiFetch(API + '/evidence/' + encodeURIComponent(button.dataset.evidenceId));
+    detail.innerHTML = `<div class="result-box"><strong>${esc(c.title || c.source_id)}</strong><div>Version: ${esc(c.version)}</div><div>Normalized text offsets: ${esc(c.start)}–${esc(c.end)}</div><div>${esc(c.uri || '')}</div><pre style="white-space:pre-wrap;overflow-wrap:anywhere">${esc(c.text)}</pre></div>`;
+  } catch (error) {
+    detail.textContent = error.status === 404 ? 'This evidence was deleted or replaced. Re-run the question.' : errorMessage(error);
+  }
+});
+
 async function doQuery() {
   const btn = document.getElementById('btn-query');
   const result = document.getElementById('query-result');
@@ -2433,11 +2468,13 @@ async function doQuery() {
     } else if (status === 'llm_unavailable') {
       const n = (d.context_nodes || []).length;
       result.innerHTML = `<div class="result-box notice">No LLM configured — set <code>KIMI_API_KEY</code> for a written answer. GraphRAG still retrieved <strong>${esc(n)}</strong> ${n === 1 ? 'entity' : 'entities'}:${ctx}${prov}</div>`;
+    } else if (status === 'insufficient_evidence') {
+      result.innerHTML = `<div class="result-box notice">Insufficient current original evidence to answer. Ingest supporting sources or re-run after a refresh.${citationsHtml(d)}${ctx}${prov}</div>`;
     } else if (!d || !d.answer) {
       result.innerHTML = '<div class="result-box error">❌ No answer returned.</div>';
     } else {
       const answerHtml = esc(d.answer).replace(/\n/g, '<br>');
-      result.innerHTML=`<div class="result-box success"><div style="white-space:pre-wrap">${answerHtml}</div>${ctx}${prov}</div>`;
+      result.innerHTML=`<div class="result-box success"><div style="white-space:pre-wrap">${answerHtml}</div>${citationsHtml(d)}${ctx}${prov}</div>`;
     }
   } catch(e) { result.innerHTML=`<div class="result-box error">❌ ${esc(errorMessage(e))}</div>`; }
   btn.disabled=false; btn.innerHTML='🧠 Ask';
@@ -2818,7 +2855,7 @@ async function loadSources() {
       <div class="source-item" data-source="${esc(s.source_doc)}">
         <div>
           <div class="source-item-name">${esc(s.title || s.source_doc)}</div>
-          <div class="source-item-count">${esc(s.node_count)} nodes</div>
+          <div class="source-item-count">${esc(s.node_count)} nodes${coverageHtml(s.coverage)}</div>
         </div>
         <div class="source-item-actions">
           <button type="button" class="mini-btn" data-action="focus">Focus</button>
@@ -3714,12 +3751,13 @@ function writeHistoryLocal(entries) {
 function historyStatusLabel(status) {
   if (status === 'answered') return 'Answered';
   if (status === 'no_context') return 'No context';
+  if (status === 'insufficient_evidence') return 'Insufficient evidence';
   if (status === 'llm_unavailable') return 'LLM unavailable';
   return 'Unknown';
 }
 
 function historyStatusClass(status) {
-  return (status === 'answered' || status === 'no_context' || status === 'llm_unavailable') ? status : 'unknown';
+  return (status === 'answered' || status === 'no_context' || status === 'llm_unavailable' || status === 'insufficient_evidence') ? status : 'unknown';
 }
 
 function historyContextCount(entry) {
@@ -3738,6 +3776,7 @@ function renderHistoryPanel(bodyHtml) {
       <span class="history-header-title">Recent queries</span>
       <button type="button" class="mini-btn" data-action="clear-local">Clear local</button>
     </div>
+    <div class="result-box notice">Historical answers may use outdated evidence. Re-run a question to validate current sources.</div>
     <div class="history-list">${bodyHtml}</div>`;
 }
 
@@ -3762,7 +3801,7 @@ function renderHistoryRow(entry, i) {
     <div class="history-row-meta">
       <span>${esc(historyContextCount(entry))} nodes</span>
       <span>${esc((entry && entry.duration_ms) ?? 0)} ms</span>
-      ${restored ? '<span class="history-restored-badge">restored</span>' : ''}
+      ${restored ? '<span class="history-restored-badge">restored · re-run to validate current evidence</span>' : ''}
     </div>
     <div class="history-row-actions">${actionsHtml}</div>
   </div>`;

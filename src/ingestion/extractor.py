@@ -295,7 +295,7 @@ def _client_guard_error(url: str, detail: str) -> str:
     return ERR_DEST_BLOCKED
 
 
-def _parse_html(html: str) -> tuple[str, str]:
+def _parse_html(html: str, max_chars: int | None = None) -> tuple[str, str]:
     """Parse + clean HTML. CPU-bound; always call via asyncio.to_thread."""
     soup = BeautifulSoup(html, "html.parser")
 
@@ -314,7 +314,7 @@ def _parse_html(html: str) -> tuple[str, str]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     clean_text = "\n".join(lines)
 
-    if len(clean_text) > MAX_CHARS:
+    if max_chars is None and len(clean_text) > MAX_CHARS:
         clean_text = clean_text[:MAX_CHARS] + TRUNCATION_SUFFIX
 
     return title.strip(), clean_text
@@ -348,7 +348,7 @@ def _decode(raw: bytes, response: httpx.Response) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-async def extract_from_url(url: str) -> dict[str, Any]:
+async def extract_from_url(url: str, *, max_chars: int | None = None) -> dict[str, Any]:
     """Fetch a URL and extract clean text content."""
     try:
         domain = urlparse(url).netloc
@@ -420,7 +420,10 @@ async def extract_from_url(url: str) -> dict[str, Any]:
         )
 
     # BeautifulSoup + text cleanup is CPU-bound — keep it off the event loop.
-    title, clean_text = await asyncio.to_thread(_parse_html, html)
+    title, clean_text = await asyncio.to_thread(_parse_html, html, max_chars)
+    input_truncated = body_truncated or (max_chars is not None and len(clean_text) > max_chars)
+    if max_chars is not None:
+        clean_text = clean_text[:max_chars]
 
     return _envelope(
         url,
@@ -430,17 +433,22 @@ async def extract_from_url(url: str) -> dict[str, Any]:
         error=None,
         final_url=current,
         body_truncated=body_truncated,
+        **({"input_truncated": input_truncated} if max_chars is not None else {}),
     )
 
 
-def extract_from_text(text: str, source: str = "manual") -> dict[str, Any]:
+def extract_from_text(
+    text: str, source: str = "manual", *, max_chars: int | None = None,
+) -> dict[str, Any]:
     """Wrap raw text input in the standard extraction format."""
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     clean_text = "\n".join(lines)
     # Same cap as URL and file ingests: the route accepts up to 200k chars, and
     # without this one text ingest cost ~4x a URL ingest in Kimi tokens.
-    if len(clean_text) > MAX_CHARS:
-        clean_text = clean_text[:MAX_CHARS] + TRUNCATION_SUFFIX
+    input_truncated = len(clean_text) > (MAX_CHARS if max_chars is None else max_chars)
+    if input_truncated:
+        clean_text = (clean_text[:MAX_CHARS] + TRUNCATION_SUFFIX if max_chars is None
+                      else clean_text[:max_chars])
 
     return {
         "url": None,
@@ -449,4 +457,5 @@ def extract_from_text(text: str, source: str = "manual") -> dict[str, Any]:
         "content": clean_text,
         "char_count": len(clean_text),
         "error": None,
+        **({"input_truncated": input_truncated} if max_chars is not None else {}),
     }

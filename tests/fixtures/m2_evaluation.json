@@ -1,0 +1,17 @@
+{
+  "scope": "Curated offline orchestration and identifier validity, not provider answer quality, entailment, or measured search relevance.",
+  "sources": [
+    {"source_id": "long", "version": "v1", "prefix_chars": 60000, "text": "The remote station opened in 2031.", "evidence_id": "ev_long"},
+    {"source_id": "unicode", "version": "v1", "prefix": "東京🌸 café\n", "text": "温度は二十度です。", "evidence_id": "ev_unicode"},
+    {"source_id": "opposing", "version": "v1", "text": "The remote station opened in 2032.", "evidence_id": "ev_opposing"},
+    {"source_id": "unretrieved", "version": "v1", "text": "An unrelated fact in the database.", "evidence_id": "ev_unsent"}
+  ],
+  "cases": [
+    {"name": "fact_after_50000_without_entities", "question": "When did the remote station open?", "retrieved": ["ev_long"], "citations": ["ev_long"], "expected_status": "answered", "expected_start": 60000},
+    {"name": "unicode_character_offsets", "question": "温度は？", "retrieved": ["ev_unicode"], "citations": ["ev_unicode"], "expected_status": "answered", "expected_start": 9},
+    {"name": "valid_database_id_not_sent", "question": "When did the remote station open?", "retrieved": ["ev_long"], "citations": ["ev_unsent"], "expected_status": "insufficient_evidence"},
+    {"name": "refresh_during_generation", "question": "When did the remote station open?", "retrieved": ["ev_long"], "citations": ["ev_long"], "refresh": "ev_long", "expected_status": "insufficient_evidence"},
+    {"name": "opposing_sources_exposed", "question": "When did the remote station open?", "retrieved": ["ev_long", "ev_opposing"], "citations": ["ev_long", "ev_opposing"], "conflicts": [{"description": "The sources disagree on the opening year.", "evidence_ids": ["ev_long", "ev_opposing"]}], "expected_status": "answered"},
+    {"name": "absent_evidence", "question": "An unrepresented question", "retrieved": [], "citations": [], "expected_status": "no_context"}
+  ]
+}

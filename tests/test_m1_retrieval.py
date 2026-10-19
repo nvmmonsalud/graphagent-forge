@@ -29,6 +29,7 @@ def _context(entity_id, sources, summary):
 @pytest.mark.asyncio
 async def test_duplicate_labels_retrieve_exact_ids_and_all_traversed_sources():
     graph = AsyncMock()
+    graph.search_evidence.return_value = []
     graph.search_nodes.return_value = [
         {"id": "a", "label": "Mercury", "source_docs": ["planet"]},
         {"id": "b", "label": "Mercury", "source_docs": ["element"]},
@@ -40,28 +41,40 @@ async def test_duplicate_labels_retrieve_exact_ids_and_all_traversed_sources():
     graph.get_entity_context.side_effect = lambda entity_id, depth: contexts[entity_id]
     nosana = AsyncMock()
     nosana.get_embedding_result.return_value = _embedding()
-    with patch("src.graph.graphrag.answer_query", new_callable=AsyncMock) as answer:
-        answer.return_value = "Both senses have supporting evidence."
+    excerpts = [
+        {"id": "ev_p", "source_id": "planet", "version": "v1",
+         "text": "Mercury is a planet", "start": 0, "end": 19},
+        {"id": "ev_e", "source_id": "element", "version": "v1",
+         "text": "Mercury is an element", "start": 0, "end": 21},
+    ]
+    graph.search_evidence.return_value = excerpts
+    graph.validate_evidence_ids.return_value = excerpts
+    with patch("src.graph.graphrag.answer_with_citations", new_callable=AsyncMock) as answer:
+        answer.return_value = {"answer": "Both senses have supporting evidence.",
+                               "citations": ["ev_p", "ev_e"],
+                               "insufficient_evidence": False, "conflicts": []}
         result = await GraphRAGEngine(graph, nosana).query("Mercury")
     assert [call.args[0] for call in graph.get_entity_context.await_args_list] == ["a", "b"]
     graph.get_node_context.assert_not_called()
     assert result["source_docs"] == ["planet", "orbit", "element"]
     assert result["evidence"] == [contexts["a"], contexts["b"]]
-    assert "planet" in answer.call_args.args[1] and "element" in answer.call_args.args[1]
+    assert answer.call_args.args[1] == excerpts
     assert result["status"] == "answered"
 
 
 @pytest.mark.asyncio
-async def test_isolated_entity_summary_is_answer_context():
+async def test_isolated_entity_summary_is_diagnostic_without_original_evidence():
     graph = AsyncMock()
+    graph.search_evidence.return_value = []
     graph.search_nodes.return_value = [{"id": "solo", "label": "Solo"}]
     graph.get_entity_context.return_value = _context("solo", ["source"], "Isolated summary")
     nosana = AsyncMock()
     nosana.get_embedding_result.return_value = _embedding()
-    with patch("src.graph.graphrag.answer_query", new_callable=AsyncMock) as answer:
+    with patch("src.graph.graphrag.answer_with_citations", new_callable=AsyncMock) as answer:
         answer.return_value = "Grounded answer"
         result = await GraphRAGEngine(graph, nosana).query("Solo")
-    assert answer.call_args.args[1] == "Isolated summary"
+    answer.assert_not_called()
+    assert result["status"] == "insufficient_evidence"
     assert result["evidence"][0]["edges"] == []
     assert result["source_docs"] == ["source"]
 
@@ -69,11 +82,12 @@ async def test_isolated_entity_summary_is_answer_context():
 @pytest.mark.asyncio
 async def test_disappeared_candidates_return_no_context_without_llm():
     graph = AsyncMock()
+    graph.search_evidence.return_value = []
     graph.search_nodes.return_value = [{"id": "gone", "label": "Gone"}]
     graph.get_entity_context.return_value = _context("gone", [], "")
     nosana = AsyncMock()
     nosana.get_embedding_result.return_value = _embedding()
-    with patch("src.graph.graphrag.answer_query", new_callable=AsyncMock) as answer:
+    with patch("src.graph.graphrag.answer_with_citations", new_callable=AsyncMock) as answer:
         result = await GraphRAGEngine(graph, nosana).query("Gone")
     answer.assert_not_called()
     assert result["status"] == "no_context"
@@ -87,6 +101,7 @@ async def test_disappeared_candidates_return_no_context_without_llm():
 ])
 async def test_incompatible_embedding_never_queries_semantic_index(changes):
     graph = AsyncMock()
+    graph.search_evidence.return_value = []
     graph.search_nodes.return_value = []
     nosana = AsyncMock()
     nosana.get_embedding_result.return_value = {**_embedding("nosana"), **changes}
@@ -99,6 +114,7 @@ async def test_incompatible_embedding_never_queries_semantic_index(changes):
 @pytest.mark.asyncio
 async def test_semantic_search_supplies_active_model_version():
     graph = AsyncMock()
+    graph.search_evidence.return_value = []
     graph.search_nodes.return_value = []
     graph.vector_search.return_value = []
     nosana = AsyncMock()

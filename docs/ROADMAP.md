@@ -90,6 +90,14 @@ and rollback pass on a disposable database with legacy data, not just an empty D
 
 ## M2 — Evidence-backed document answers
 
+Delivery status: bounded implementation delivered; release validation and
+independent code/security review results are recorded in the M2 PR. See
+[M2_UPGRADE.md](M2_UPGRADE.md) for migration, storage/privacy and concrete limits.
+The bounded policy captures up to 200,000 normalized characters and processes
+at most the first 91,600 through 12 overlapping chunks; PDF locations use text
+offsets rather than page references. Legacy graphs require deliberate reingestion
+for original excerpts; startup does not run paid extraction or a text backfill.
+
 Scope:
 
 - Store bounded chunks and source-version lineage with text offsets or PDF page
@@ -105,11 +113,16 @@ Scope:
 Exit criteria: a fact after character 50,000 can be found within configured limits;
 each displayed citation resolves to retrieved evidence in the current source/access
 scope (cross-principal workspace enforcement is added in M4);
-page/offset references survive rendering; deletion/version replacement invalidates
+normalized-text offset references survive rendering; deletion/version replacement invalidates
 stale citations; malicious instructions in documents stay untrusted data. Measure
 retrieval recall@k and citation validity on the fixed corpus; assess claim support
 with human-reviewed samples. Any numeric release threshold must be set from the
 baseline before implementation, not invented after seeing the result.
+
+Delivered evaluation: real Neo4j source recall@3 is 1.000 on five predeclared
+synthetic questions (six expected source hits across eight sources). This is a
+small contract fixture with distractors, not a general precision or answer-quality
+result. Real-provider human claim-support evaluation remains follow-up work.
 
 ## M3 — Durable research workflows
 

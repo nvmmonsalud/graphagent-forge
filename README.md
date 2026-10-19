@@ -111,12 +111,15 @@ pytest -m integration      # extra tests against a live Neo4j (reads NEO4J_* env
 
 New URL sources have stable IDs separate from page titles. Reusing a text source
 name or upload filename refreshes that source atomically; unchanged versions skip
-extraction. Answers include graph evidence retrieved by entity ID, including
-isolated entity summaries and traversed source provenance.
+extraction. Answers use bounded original text excerpts with validated source/version citations.
+Click a citation in the primary UI to inspect its current excerpt and normalized
+text offsets. Ingestion reports partial coverage when document limits apply.
 
 Before upgrading an existing graph, follow the [M1 migration and re-embedding
 guide](docs/M1_UPGRADE.md). Legacy embeddings are excluded from semantic search
-until they have compatible per-result model metadata.
+until they have compatible per-result model metadata. See the [M2 evidence
+guide](docs/M2_UPGRADE.md) for reingestion, excerpt storage, coverage limits and
+citation validation. Legacy summaries alone cannot produce a cited answer.
 
 ## 📁 Project Structure
 
