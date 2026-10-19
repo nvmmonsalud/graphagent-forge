@@ -13,6 +13,7 @@ COPY src/ ./src/
 COPY frontend/ ./frontend/
 
 RUN useradd --create-home --uid 1000 appuser \
+    && mkdir -p /app/data && chmod 700 /app/data \
     && chown -R appuser:appuser /app
 USER appuser
 

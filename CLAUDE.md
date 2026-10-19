@@ -92,3 +92,18 @@ Progress reaches the executor through an injected `on_event` sink (the route wra
 - Tests are offline by default (mocked LLM/Neo4j); Neo4j-dependent tests are marked `integration` and skip without `NEO4J_URI`/`NEO4J_USER`/`NEO4J_PASSWORD`.
 - Versioned SHA-256 namespaces isolate new source graphs; legacy seeded IDs retain their md5 prefix; cross-document duplicates are handled by the suggest-only merge feature (see Entity dedup/merge above).
 - New Source identities are separate from titles. URL IDs hash the full canonical URL, while durable display URIs omit query values. Atomic source/version publication, tombstones, explicit legacy migration and semantic re-embedding are documented in `docs/M1_UPGRADE.md`. Legacy title collisions cannot be reconstructed.
+
+
+## Optional durable workflows (M3)
+
+`STATE_DB_PATH` enables local SQLite adapters; unset keeps the legacy memory
+queue/history. HTTP routes accept sync or async store methods. Commands are
+strict versioned JSON; private text/file payloads never enter public job params
+or event metadata, and are purged at terminal state. Claims reserve shared slots
+and attempts transactionally; progress/results require the current lease token.
+Cancellation awaits cleanup before releasing the slot. Neo4j IngestOperation
+receipts commit with publication and prevent crash recovery from republishing
+an old command after a later refresh/delete. Source versions remain in Neo4j.
+Read docs/M3_CONTRACT.md, docs/M3_ADR.md and docs/M3_UPGRADE.md before changing
+recovery, retention or deployment. Supported topology is one API process and
+local disk; token/dollar budgets and shared API event/rate delivery remain open.
