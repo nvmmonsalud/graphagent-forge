@@ -26,6 +26,8 @@ from src.agent.history import QueryHistory  # noqa: E402
 from src.agent.jobs import JobManager  # noqa: E402
 from src.api.routes import install_exception_handlers, router  # noqa: E402
 from src.graph.neo4j_client import Neo4jClient  # noqa: E402
+from src.security.auth_routes import router as auth_router  # noqa: E402
+from src.security.middleware import WorkspaceMiddleware  # noqa: E402
 
 
 # ------------------------------------------------------------------
@@ -124,6 +126,56 @@ async def lifespan(app: FastAPI):
     Neo4j failures are non-fatal: the app still boots in a degraded mode where
     `/api/health` reports the outage and graph-touching routes answer 503.
     """
+    mode = os.getenv("AUTH_MODE", "local")
+    if mode not in ("local", "private"):
+        raise ValueError("AUTH_MODE must be local or private")
+    app.state.auth_mode = mode
+    if mode == "private":
+        import ipaddress
+
+        secure_setting = os.getenv("AUTH_COOKIE_SECURE", "1")
+        if secure_setting not in ("0", "1") or not ALLOWED_ORIGINS:
+            raise ValueError("invalid private origin or cookie settings")
+        for origin in ALLOWED_ORIGINS:
+            parsed = urlparse(origin)
+            if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                    or parsed.username or parsed.password or parsed.path
+                    or parsed.query or parsed.fragment or "*" in origin):
+                raise ValueError("private mode requires exact HTTP(S) origins")
+            if secure_setting == "0":
+                try:
+                    local = ipaddress.ip_address(parsed.hostname).is_loopback
+                except ValueError:
+                    local = parsed.hostname == "localhost"
+                if parsed.scheme != "http" or not local:
+                    raise ValueError("insecure cookies are limited to HTTP loopback development")
+        from src.agent.state import StateDatabase
+        from src.security.identity import IdentityStore
+        from src.security.workspaces import WorkspaceRuntime
+
+        path = os.getenv("STATE_DB_PATH", "").strip()
+        config = os.getenv("AUTH_CONFIG_PATH", "").strip()
+        if not path or not config:
+            raise ValueError("private mode requires STATE_DB_PATH and AUTH_CONFIG_PATH")
+        database = StateDatabase(path)
+        await database.initialize()
+        identity = IdentityStore(
+            database, config, ALLOWED_ORIGINS,
+            secure=os.getenv("AUTH_COOKIE_SECURE", "1") != "0",
+        )
+        await identity.initialize()
+        runtime = WorkspaceRuntime(identity, path)
+        app.state.identity = identity
+        app.state.workspace_runtime = runtime
+        app.state.neo4j_available = False
+        try:
+            yield
+        finally:
+            await runtime.shutdown()
+            from src.ingestion.extractor import aclose_client
+            await aclose_client()
+        return
+
     if not os.getenv("API_KEY"):
         log.warning(
             "API_KEY is not set: ingest, ask, delete/clear and the Daytona sandbox "
@@ -371,14 +423,17 @@ ALLOWED_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=os.getenv("AUTH_MODE", "local") == "private",
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+app.add_middleware(WorkspaceMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 # Added last so it is the outermost middleware and runs before anything reads the body.
 app.add_middleware(BodySizeLimitMiddleware)
 
+app.include_router(auth_router)
 app.include_router(router, prefix="/api")
 # Flattens FastAPI's list-of-dicts 422 body into a plain string so the
 # frontend's String(detail) never renders "[object Object]".
@@ -411,6 +466,15 @@ def _ws_origin_allowed(websocket: WebSocket) -> bool:
 @app.websocket("/ws/graph")
 async def websocket_graph(websocket: WebSocket):
     """Push real-time graph updates to connected frontend clients."""
+    socket_app = websocket.scope.get("app")
+    socket_state = socket_app.state if socket_app is not None else None
+    if getattr(socket_state, "auth_mode", os.getenv("AUTH_MODE", "local")) == "private":
+        runtime = getattr(socket_state, "workspace_runtime", None)
+        if runtime is None:
+            await websocket.close(code=1008)
+        else:
+            await runtime.websocket(websocket)
+        return
     # Browsers always send Origin on a WebSocket handshake and CORS does not
     # apply to WebSockets, so without this any website could subscribe to job
     # and graph broadcasts. Non-browser clients (no Origin) are allowed.

@@ -72,7 +72,7 @@ async def require_graph(request: Request) -> None:
     `neo4j_available` is set by the lifespan hook in `src.main`; the app boots
     even when the database is down so /health and the frontend stay usable.
     """
-    if not getattr(request.app.state, "neo4j_available", False):
+    if not getattr(_resources(request), "neo4j_available", False):
         raise HTTPException(status_code=503, detail="graph database unavailable")
 
 
@@ -85,6 +85,10 @@ async def require_api_key(
     skipped entirely. Read at request time so the key can be rotated (or set in
     tests) without re-importing the module.
     """
+    from src.security.identity import private_authorized
+
+    if private_authorized.get():
+        return
     expected = os.getenv("API_KEY")
     if not expected:
         return
@@ -291,12 +295,22 @@ class SweepRequest(BaseModel):
 @router.get("/health")
 async def health(request: Request):
     """Always 200 — the body reports whether the graph backend is usable."""
-    available = bool(getattr(request.app.state, "neo4j_available", False))
+    available = bool(getattr(_resources(request), "neo4j_available", False))
     return {
         "status": "ok" if available else "degraded",
         "service": "graphagent-forge",
         "neo4j": available,
     }
+
+
+def _resources(request: Request):
+    resources = getattr(request.state, "resources", None)
+    if resources is not None:
+        return resources
+    if (getattr(request.app.state, "auth_mode", "local") == "private"
+            and request.url.path != "/api/health"):
+        raise HTTPException(status_code=503, detail="private workspace unavailable")
+    return request.app.state
 
 
 async def _store_call(method, *args, **kwargs):
@@ -310,12 +324,16 @@ async def _store_call(method, *args, **kwargs):
 
 
 async def _durable_read_auth(request: Request):
-    if getattr(request.app.state, "storage_mode", "memory") == "sqlite":
+    if getattr(_resources(request), "storage_mode", "memory") == "sqlite":
         await require_api_key(request.headers.get("X-API-Key"))
 
 
 async def _submit_ingest(jobs, kind, params, run, command, request):
     if isinstance(jobs, DurableJobManager):
+        auth = getattr(request.state, "auth", None)
+        if auth is not None:
+            command = {**command, "_principal_id": auth["principal_id"],
+                       "_workspace_id": request.state.workspace_id}
         try:
             return await jobs.submit_command(
                 kind, params, command,
@@ -333,8 +351,8 @@ async def ingest_url(req: IngestURLRequest, request: Request, wait: bool = Query
     """Submit a URL ingest job. Returns 202 with a job id, or the ingest
     result synchronously (200) when `wait=true`.
     """
-    agent = request.app.state.agent
-    jobs = request.app.state.jobs
+    agent = _resources(request).agent
+    jobs = _resources(request).jobs
     # HttpUrl is a pydantic object — the agent expects a plain string.
     url = str(req.url)
 
@@ -375,8 +393,8 @@ async def ingest_text(req: IngestTextRequest, request: Request, wait: bool = Que
     """Submit a text ingest job. Returns 202 with a job id, or the ingest
     result synchronously (200) when `wait=true`.
     """
-    agent = request.app.state.agent
-    jobs = request.app.state.jobs
+    agent = _resources(request).agent
+    jobs = _resources(request).jobs
     text = req.text
     source = req.source
 
@@ -448,8 +466,8 @@ if HAS_MULTIPART:
         """Submit a file ingest job. Returns 202 with a job id, or the ingest
         result synchronously (200) when `wait=true`.
         """
-        agent = request.app.state.agent
-        jobs = request.app.state.jobs
+        agent = _resources(request).agent
+        jobs = _resources(request).jobs
 
         # Validation before reading bytes — reject cheaply on filename/type
         # before paying for the (capped) body read.
@@ -525,8 +543,8 @@ if HAS_MULTIPART:
 async def list_jobs(request: Request, limit: int = Query(default=20, ge=1, le=100)):
     """List submitted jobs, newest first."""
     await _durable_read_auth(request)
-    result = {"jobs": await _store_call(request.app.state.jobs.list, limit=limit)}
-    if isinstance(request.app.state.jobs, DurableJobManager):
+    result = {"jobs": await _store_call(_resources(request).jobs.list, limit=limit)}
+    if isinstance(_resources(request).jobs, DurableJobManager):
         result["durable"] = True
     return result
 
@@ -535,7 +553,7 @@ async def list_jobs(request: Request, limit: int = Query(default=20, ge=1, le=10
 async def get_job(job_id: str, request: Request):
     """Fetch a single job's status/result by id."""
     await _durable_read_auth(request)
-    record = await _store_call(request.app.state.jobs.get, job_id)
+    record = await _store_call(_resources(request).jobs.get, job_id)
     if record is None:
         raise HTTPException(status_code=404, detail="job not found")
     return record
@@ -543,7 +561,7 @@ async def get_job(job_id: str, request: Request):
 
 @router.post("/jobs/{job_id}/cancel", dependencies=[Depends(require_api_key)])
 async def cancel_job(job_id: str, request: Request):
-    jobs = request.app.state.jobs
+    jobs = _resources(request).jobs
     if not isinstance(jobs, DurableJobManager):
         raise HTTPException(status_code=409, detail="cancellation requires durable mode")
     record = await _store_call(jobs.cancel, job_id)
@@ -557,7 +575,7 @@ async def job_events(
     job_id: str, request: Request,
     after: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=100),
 ):
-    jobs = request.app.state.jobs
+    jobs = _resources(request).jobs
     if not isinstance(jobs, DurableJobManager):
         raise HTTPException(status_code=409, detail="event replay requires durable mode")
     if await _store_call(jobs.get, job_id) is None:
@@ -568,7 +586,7 @@ async def job_events(
 @router.post("/ask", dependencies=ASK_DEP)
 async def ask(req: AskRequest, request: Request):
     """Ask a question — GraphRAG retrieves from graph + reasons with Kimi."""
-    agent = request.app.state.agent
+    agent = _resources(request).agent
     started = time.perf_counter()
     try:
         result = await agent.ask(req.question)
@@ -582,7 +600,7 @@ async def ask(req: AskRequest, request: Request):
     # Best-effort: a history failure must never fail an answer. `getattr`
     # because an app assembled without the lifespan hook (bare-app tests, an
     # embedder mounting just the router) has no `state.history` at all.
-    store = getattr(request.app.state, "history", None)
+    store = getattr(_resources(request), "history", None)
     if store is not None:
         try:
             await _store_call(store.record,
@@ -598,7 +616,7 @@ async def ask(req: AskRequest, request: Request):
 @router.get("/graph/stats", dependencies=GRAPH_DEP)
 async def graph_stats(request: Request):
     """Get knowledge graph statistics."""
-    agent = request.app.state.agent
+    agent = _resources(request).agent
     try:
         return await agent.get_graph_stats()
     except Exception:
@@ -616,7 +634,7 @@ async def graph_data(
     limit: int = Query(default=500, ge=1, le=5000),
 ):
     """Get graph data (nodes + edges) for visualization, optionally per source."""
-    neo4j = request.app.state.neo4j
+    neo4j = _resources(request).neo4j
     try:
         if source_doc:
             return await neo4j.get_graph_data_by_source(source_doc)
@@ -629,7 +647,7 @@ async def graph_data(
 @router.post("/graph/search", dependencies=GRAPH_DEP)
 async def graph_search(req: SearchRequest, request: Request):
     """Search entities in the graph."""
-    agent = request.app.state.agent
+    agent = _resources(request).agent
     try:
         return await agent.search_graph(req.query)
     except Exception:
@@ -644,8 +662,8 @@ async def graph_verify(request: Request):
     Fetches the latest graph data from Neo4j, validates every edge's
     source/target exist as node IDs, and computes quality metrics.
     """
-    neo4j = request.app.state.neo4j
-    agent = request.app.state.agent
+    neo4j = _resources(request).neo4j
+    agent = _resources(request).agent
     try:
         graph_data = await neo4j.get_all_graph_data(limit=None)
         return await agent.daytona.verify_graph(graph_data)
@@ -671,9 +689,9 @@ async def graph_verify_fanout(request: Request, limit: int = Query(default=6, ge
     per-source failure story is the executor's: one source failing yields an
     item with `ok: false` and never a 500.
     """
-    neo4j = request.app.state.neo4j
-    agent = request.app.state.agent
-    manager = getattr(request.app.state, "ws_manager", None)
+    neo4j = _resources(request).neo4j
+    agent = _resources(request).agent
+    manager = getattr(_resources(request), "ws_manager", None)
 
     async def _on_event(event: dict) -> None:
         # Injected sink, mirroring the job queue: broadcast failures must never
@@ -720,9 +738,9 @@ async def graph_verify_sweep(request: Request, req: SweepRequest | None = None):
     produced a verdict comes back `ok: false` with no `results` key and never a
     500 — same precedent as the fan-out route.
     """
-    neo4j = request.app.state.neo4j
-    agent = request.app.state.agent
-    manager = getattr(request.app.state, "ws_manager", None)
+    neo4j = _resources(request).neo4j
+    agent = _resources(request).agent
+    manager = getattr(_resources(request), "ws_manager", None)
 
     async def _on_event(event: dict) -> None:
         if manager is not None:
@@ -765,7 +783,7 @@ async def graph_verify_sweep(request: Request, req: SweepRequest | None = None):
 @router.post("/graph/path", dependencies=GRAPH_DEP)
 async def graph_path(req: PathRequest, request: Request):
     """Find shortest path between two entities."""
-    agent = request.app.state.agent
+    agent = _resources(request).agent
     try:
         path = await agent.find_path(req.from_label, req.to_label)
         return {"path": path}
@@ -777,7 +795,7 @@ async def graph_path(req: PathRequest, request: Request):
 @router.get("/graph/duplicates", dependencies=GRAPH_DEP)
 async def graph_duplicates(request: Request, limit: int = Query(default=20, ge=1, le=100)):
     """Find candidate duplicate entity groups for merge review."""
-    agent = request.app.state.agent
+    agent = _resources(request).agent
     try:
         return await agent.find_duplicates(limit=limit)
     except Exception:
@@ -795,7 +813,7 @@ async def graph_analytics(request: Request, top: int = Query(default=10, ge=1, l
     when the run could not happen (same precedent as `tier2_reason` on
     `/graph/duplicates`), never a 500.
     """
-    agent = request.app.state.agent
+    agent = _resources(request).agent
     try:
         return await agent.get_analytics(top=top)
     except Exception:
@@ -806,7 +824,7 @@ async def graph_analytics(request: Request, top: int = Query(default=10, ge=1, l
 @router.post("/graph/merge", dependencies=MUTATING_DEP)
 async def graph_merge(req: MergeRequest, request: Request):
     """Merge a set of duplicate entity nodes into one canonical node."""
-    agent = request.app.state.agent
+    agent = _resources(request).agent
     try:
         result = await agent.merge_entities(req.node_ids, req.canonical_id)
     except Exception:
@@ -826,7 +844,7 @@ async def graph_merge(req: MergeRequest, request: Request):
 @router.get("/sources", dependencies=GRAPH_DEP)
 async def list_sources(request: Request):
     """List ingested source documents with their entity counts."""
-    neo4j = request.app.state.neo4j
+    neo4j = _resources(request).neo4j
     try:
         sources = await neo4j.get_sources()
     except Exception:
@@ -843,7 +861,7 @@ async def get_evidence(evidence_id: str, request: Request):
     ):
         raise HTTPException(status_code=404, detail="evidence not found")
     try:
-        evidence = await request.app.state.neo4j.get_evidence(evidence_id)
+        evidence = await _resources(request).neo4j.get_evidence(evidence_id)
     except Exception:
         log.exception("Failed to read evidence")
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
@@ -858,7 +876,7 @@ async def get_source_evidence(source_id: str, request: Request):
     if len(source_id) > 500:
         raise HTTPException(status_code=404, detail="source not found")
     try:
-        evidence = await request.app.state.neo4j.get_source_evidence(source_id)
+        evidence = await _resources(request).neo4j.get_source_evidence(source_id)
     except Exception:
         log.exception("Failed to read source evidence")
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
@@ -872,7 +890,7 @@ async def delete_source(
     source_doc: str = Query(..., min_length=1, max_length=500),
 ):
     """Delete every entity that came from one source document."""
-    neo4j = request.app.state.neo4j
+    neo4j = _resources(request).neo4j
     try:
         result = await neo4j.delete_source(source_doc)
     except Exception:
@@ -889,7 +907,7 @@ async def delete_source(
 @router.post("/graph/clear", dependencies=MUTATING_DEP)
 async def clear_graph(request: Request):
     """Delete every entity in the graph."""
-    neo4j = request.app.state.neo4j
+    neo4j = _resources(request).neo4j
     try:
         result = await neo4j.clear_graph()
     except Exception:
@@ -931,7 +949,7 @@ async def graph_export(
     fmt: str = Query(default="json", alias="format", pattern="^(json|csv)$"),
 ):
     """Download the whole graph as JSON (nodes + edges) or CSV (edge list)."""
-    neo4j = request.app.state.neo4j
+    neo4j = _resources(request).neo4j
     try:
         data = await neo4j.get_all_graph_data(limit=None)
     except Exception:
@@ -1020,7 +1038,7 @@ HISTORY_DEP = [Depends(require_api_key)]
 @router.get("/history")
 async def list_history(request: Request, limit: int = Query(default=20, ge=1, le=100)):
     """List answered questions, newest first, with store-wide counts."""
-    store = request.app.state.history
+    store = _resources(request).history
     await _durable_read_auth(request)
     counts = await _store_call(store.counts)
     return {
@@ -1033,7 +1051,7 @@ async def list_history(request: Request, limit: int = Query(default=20, ge=1, le
 @router.post("/history/{entry_id}/save", dependencies=HISTORY_DEP)
 async def save_history_entry(entry_id: str, request: Request):
     """Pin an entry so history eviction can never drop it."""
-    store = request.app.state.history
+    store = _resources(request).history
     entry = await _store_call(store.set_saved, entry_id, True)
     if entry is None:
         raise HTTPException(status_code=404, detail="history entry not found")
@@ -1048,7 +1066,7 @@ async def save_history_entry(entry_id: str, request: Request):
 @router.delete("/history/{entry_id}/save", dependencies=HISTORY_DEP)
 async def unsave_history_entry(entry_id: str, request: Request):
     """Unpin an entry, returning it to the normal eviction window."""
-    store = request.app.state.history
+    store = _resources(request).history
     entry = await _store_call(store.set_saved, entry_id, False)
     if entry is None:
         raise HTTPException(status_code=404, detail="history entry not found")
@@ -1058,7 +1076,7 @@ async def unsave_history_entry(entry_id: str, request: Request):
 @router.delete("/history/{entry_id}", dependencies=HISTORY_DEP)
 async def delete_history_entry(entry_id: str, request: Request):
     """Drop a single entry from the history store."""
-    store = request.app.state.history
+    store = _resources(request).history
     if not await _store_call(store.delete, entry_id):
         raise HTTPException(status_code=404, detail="history entry not found")
     return {"deleted": entry_id}

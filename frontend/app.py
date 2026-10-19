@@ -7,6 +7,10 @@ import streamlit as st
 API_BASE = os.getenv("GRAPHAGENT_API", "http://localhost:8000") + "/api"
 # Matches the server's API_KEY when it is set; sent on ingest/ask calls.
 HEADERS = {"X-API-Key": k} if (k := os.getenv("GRAPHAGENT_API_KEY")) else {}
+if token := os.getenv("GRAPHAGENT_TOKEN"):
+    HEADERS = {"Authorization": f"Bearer {token}"}
+if workspace := os.getenv("GRAPHAGENT_WORKSPACE"):
+    HEADERS["X-Workspace-ID"] = workspace
 
 
 def md_escape(value) -> str:
@@ -39,7 +43,7 @@ with st.sidebar:
 
     # Graph stats
     try:
-        stats = httpx.get(f"{API_BASE}/graph/stats", timeout=5).json()
+        stats = httpx.get(f"{API_BASE}/graph/stats", timeout=5, headers=HEADERS).json()
         st.metric("Nodes", stats.get("nodes", 0))
         st.metric("Edges", stats.get("edges", 0))
         types = stats.get("entity_types", [])
@@ -235,6 +239,7 @@ with tab_search:
                 results = httpx.post(
                     f"{API_BASE}/graph/search",
                     json={"query": search_query},
+                    headers=HEADERS,
                     timeout=30,
                 ).json()
 

@@ -1454,10 +1454,32 @@ footer a { color: var(--accent2); text-decoration: none; }
     </div>
   </div>
 </div>
+<section id="private-login" hidden style="position:fixed;inset:0;z-index:10000;background:var(--bg,#10111a);display:none;align-items:center;justify-content:center">
+  <form id="private-login-form" class="ingest-card" style="width:min(90vw,440px)">
+    <h2>Private workspace</h2><p>Enter your operator-issued access token.</p>
+    <label for="private-token">Access token</label>
+    <input id="private-token" type="password" autocomplete="off" required style="width:100%">
+    <button class="btn" type="submit">Sign in</button>
+    <p id="private-login-error" role="alert"></p>
+  </form>
+</section>
+<div id="private-session" hidden style="position:sticky;top:0;z-index:100;background:var(--bg,#10111a);padding:12px">
+  <label for="private-workspace">Workspace</label> <select id="private-workspace"></select>
+  <span id="private-role"></span> <button id="private-logout" class="mini-btn">Sign out</button>
+  <p id="private-disclosure">Extraction and answers send text to the configured Kimi endpoint. Semantic embeddings send text to Nosana when configured. Verification and analytics send graph data to Daytona when configured; local fallback may be used. Excerpts, jobs and history persist on this server. Ask your operator about configured destinations and retention before ingestion.</p>
+</div>
 <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
 
 <script>
 const API = '/api';
+// Unknown mode remains gated until the public status response succeeds.
+let privateMode = true, authReady = false, activeWorkspace = null;
+let authTransition = 0;
+let authRequestQueue = Promise.resolve();
+let workspaceGeneration = 0, workspaceAbort = new AbortController();
+const discardedWorkspaceResponse = () => new Promise(() => {});
+function readerMode() { return privateMode && activeWorkspace?.role !== 'editor'; }
+
 const sourceTitles = new Map();
 const sourceTitle = id => sourceTitles.get(String(id)) || String(id);
 
@@ -1470,17 +1492,42 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt
 // prompt only appears once per browser; a 401 re-prompts and retries once.
 const API_KEY_STORAGE = 'graphagent_api_key';
 function storedApiKey() {
+  if (privateMode) return '';
   try { return localStorage.getItem(API_KEY_STORAGE) || ''; } catch { return ''; }
 }
 
 async function apiFetch(url, opts, retried) {
-  const reqOpts = { ...(opts || {}) };
+  if (!authReady) throw new Error('Sign in to a workspace first.');
+  const generation = workspaceGeneration;
+  const reqOpts = { ...(opts || {}), credentials:'same-origin' };
+  if (privateMode) {
+    reqOpts.signal = workspaceAbort.signal;
+    reqOpts.headers = {...(reqOpts.headers || {}), 'X-Workspace-ID':activeWorkspace.id};
+    const method = (reqOpts.method || 'GET').toUpperCase();
+    const path = new URL(url, location.href).pathname;
+    const readPost = ['/api/ask', '/api/graph/search', '/api/graph/path'].includes(path);
+    if (readerMode() && ((method !== 'GET' && !(method === 'POST' && readPost)) ||
+        path.startsWith('/api/graph/verify') || path === '/api/graph/analytics')) {
+      throw new Error('This action requires an editor role.');
+    }
+  }
   const key = storedApiKey();
   if (key) reqOpts.headers = { ...(reqOpts.headers || {}), 'X-API-Key': key };
-  const res = await fetch(url, reqOpts);
+  let res;
+  try { res = await fetch(url, reqOpts); }
+  catch (error) {
+    if (generation !== workspaceGeneration) return discardedWorkspaceResponse();
+    throw error;
+  }
+  if (generation !== workspaceGeneration) return discardedWorkspaceResponse();
   let body = null;
   try { body = await res.json(); } catch {}
-  if (res.status === 401 && !retried) {
+  if (generation !== workspaceGeneration) return discardedWorkspaceResponse();
+  if (privateMode && (res.status === 401 || res.status === 403)) {
+    showPrivateLogin('Access expired or changed. Sign in again.');
+    return discardedWorkspaceResponse();
+  }
+  if (res.status === 401 && !privateMode && !retried) {
     const entered = await confirmDialog({
       title: 'API key required',
       body: 'This server has API_KEY set. Enter it to continue; it is stored in this browser only.',
@@ -2162,19 +2209,21 @@ document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
 // ═══════════════════════════════════════
 async function loadStats() {
   try {
-    const d = await fetch(API+'/graph/stats').then(r=>r.json());
+    const d = await apiFetch(API+'/graph/stats');
     animNum('hero-nodes', d.nodes||0);
     animNum('hero-edges', d.edges||0);
     animNum('hero-types', (d.entity_types||[]).length);
   } catch {}
 }
 function animNum(id, target) {
+  const generation = workspaceGeneration;
   const el = document.getElementById(id);
   const start = parseInt(el.textContent)||0;
   const diff = target - start;
   if (!diff) return;
   const t0 = Date.now();
   (function tick() {
+    if (generation !== workspaceGeneration) return;
     const p = Math.min((Date.now()-t0)/800, 1);
     el.textContent = Math.round(start + diff * (1-Math.pow(1-p,3)));
     if (p<1) requestAnimationFrame(tick);
@@ -2601,7 +2650,8 @@ function debounce(fn, ms) {
   let timer = null;
   return function () {
     clearTimeout(timer);
-    timer = setTimeout(() => { timer = null; fn(); }, ms);
+    const generation = workspaceGeneration;
+    timer = setTimeout(() => { timer = null; if (generation === workspaceGeneration && authReady) fn(); }, ms);
   };
 }
 
@@ -2622,16 +2672,20 @@ function setConnStatus(live) {
 }
 
 function connectWebSocket() {
+  if (!authReady) return;
+  const generation = workspaceGeneration;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws/graph`);
 
   ws.onopen = () => {
+    if (generation !== workspaceGeneration) return;
     setConnStatus(true);
     // Send periodic pings to keep alive
     wsPingInterval = setInterval(() => { if (ws.readyState === 1) ws.send('ping'); }, 30000);
   };
 
   ws.onmessage = (event) => {
+    if (generation !== workspaceGeneration || !authReady) return;
     try {
       const msg = JSON.parse(event.data);
       if (msg.type === 'graph_update' && msg.nodes && msg.edges) {
@@ -2673,9 +2727,10 @@ function connectWebSocket() {
   };
 
   ws.onclose = () => {
+    if (generation !== workspaceGeneration || !authReady) return;
     setConnStatus(false);
     if (wsPingInterval) { clearInterval(wsPingInterval); wsPingInterval = null; }
-    setTimeout(connectWebSocket, 3000);
+    setTimeout(() => { if (generation === workspaceGeneration && authReady) connectWebSocket(); }, 3000);
   };
 
   ws.onerror = () => { ws.close(); };
@@ -3740,12 +3795,11 @@ document.getElementById('btn-analytics')?.addEventListener('click', () => { load
 // ═══════════════════════════════════════
 //  INIT
 // ═══════════════════════════════════════
-loadStats();
-initForceGraph();
-loadSources();
-loadDuplicates();
-connectWebSocket();
-setInterval(() => { if (!document.hidden) loadStats(); }, 60000);
+function bootWorkspace() {
+  loadStats(); initForceGraph(); loadSources(); loadDuplicates(); connectWebSocket();
+  loadQueryHistory().catch(() => {}); resumeDurableIngest();
+}
+setInterval(() => { if (authReady && !document.hidden) loadStats(); }, 60000);
 
 // ═══════════════════════════════════════
 //  QUERY HISTORY (server list + localStorage mirror)
@@ -3757,6 +3811,7 @@ const HISTORY_STORAGE_CAP = 50;
 let queryHistoryEntries = [];
 
 function readHistoryLocal() {
+  if (privateMode) return [];
   try {
     const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
     if (!raw) return [];
@@ -3766,6 +3821,7 @@ function readHistoryLocal() {
 }
 
 function writeHistoryLocal(entries) {
+  if (privateMode) return;
   try {
     localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify((entries || []).slice(0, HISTORY_STORAGE_CAP)));
   } catch {}
@@ -3797,7 +3853,7 @@ function truncateHistoryQuestion(q) {
 function renderHistoryPanel(bodyHtml) {
   return `<div class="history-header">
       <span class="history-header-title">Recent queries</span>
-      <button type="button" class="mini-btn" data-action="clear-local">Clear local</button>
+      ${privateMode ? '' : '<button type="button" class="mini-btn" data-action="clear-local">Clear local</button>'}
     </div>
     <div class="result-box notice">Historical answers may use outdated evidence. Re-run a question to validate current sources.</div>
     <div class="history-list">${bodyHtml}</div>`;
@@ -3850,7 +3906,7 @@ async function loadQueryHistory() {
     queryHistoryEntries = merged;
     panel.dataset.loaded = '1';
     panel.innerHTML = renderHistoryPanel(
-      merged.length ? merged.map((entry, i) => renderHistoryRow(entry, i)).join('') : HISTORY_EMPTY_HTML
+      merged.length ? merged.map((entry, i) => renderHistoryRow(entry, i)).join('') : (privateMode ? '<div class="result-box notice">No answers in this workspace.</div>' : HISTORY_EMPTY_HTML)
     );
     writeHistoryLocal(serverEntries.concat(localOnly));
   } catch (e) {
@@ -3858,7 +3914,7 @@ async function loadQueryHistory() {
     queryHistoryEntries = localEntries.map(en => Object.assign({}, en, { __restored: true }));
     const listHtml = queryHistoryEntries.length
       ? queryHistoryEntries.map((entry, i) => renderHistoryRow(entry, i)).join('')
-      : HISTORY_EMPTY_HTML;
+      : (privateMode ? '<div class="result-box notice">No answers in this workspace.</div>' : HISTORY_EMPTY_HTML);
     panel.innerHTML = renderHistoryPanel(
       listHtml + `<div class="result-box error" style="margin-top:0.6rem">❌ ${esc(errorMessage(e))}</div>`
     );
@@ -3872,6 +3928,7 @@ document.getElementById('query-history')?.addEventListener('click', async (evt) 
   const btn = evt.target.closest('[data-action]');
   if (!btn || btn.disabled) return;
   const action = btn.dataset.action;
+  if (readerMode() && action !== 'rerun') return;
 
   if (action === 'clear-local') {
     const ok = await confirmDialog({
@@ -3885,6 +3942,7 @@ document.getElementById('query-history')?.addEventListener('click', async (evt) 
     return;
   }
 
+  const actionGeneration = workspaceGeneration;
   const idx = parseInt(btn.dataset.entry, 10);
   const entry = queryHistoryEntries[idx];
   if (!entry) return;
@@ -3905,7 +3963,7 @@ document.getElementById('query-history')?.addEventListener('click', async (evt) 
       confirmLabel: 'Delete',
       danger: true
     });
-    if (!ok) return;
+    if (!ok || actionGeneration !== workspaceGeneration) return;
     try {
       await withButtonBusy(btn, 'Deleting...', async () => {
         await apiFetch(API + '/history/' + encodeURIComponent(entry.id), { method: 'DELETE' });
@@ -3939,10 +3997,10 @@ document.getElementById('query-history')?.addEventListener('click', async (evt) 
 
 // Self-boot: populate the panel (and its localStorage mirror) on page load
 // so restored entries from a previous session are visible immediately.
-loadQueryHistory().catch(() => {});
+// Workspace boot loads authorized history.
 
 // Reattach progress after a page/server restart without resubmitting work.
-(async function resumeDurableIngest() {
+async function resumeDurableIngest() {
   try {
     const response = await apiFetch(API + '/jobs?limit=20');
     if (!response.durable || activeIngestJob || !response.jobs?.length) return;
@@ -3952,7 +4010,7 @@ loadQueryHistory().catch(() => {});
     renderIngestJob(job);
     if (activeIngestJob) { setIngestButtonsBusy('btn-ingest-' + job.kind); startJobPoll(job.id); }
   } catch { /* The next explicit action still surfaces auth/network errors. */ }
-})();
+}
 
 
 // Enter key handlers
@@ -3961,6 +4019,131 @@ document.getElementById('search-input').addEventListener('keydown', e => { if(e.
 document.getElementById('ingest-url-input').addEventListener('keydown', e => { if(e.key==='Enter') doIngestURL(); });
 document.getElementById('path-from').addEventListener('keydown', e => { if(e.key==='Enter') document.getElementById('path-to').focus(); });
 document.getElementById('path-to').addEventListener('keydown', e => { if(e.key==='Enter') doFindPath(); });
+
+function clearWorkspaceView() {
+  workspaceGeneration++; authReady = false;
+  workspaceAbort.abort(); workspaceAbort = new AbortController();
+  if (closeActiveDialog) closeActiveDialog(false);
+  if (ws) { ws.onclose = null; ws.onmessage = null; ws.close(); ws = null; }
+  if (wsPingInterval) clearInterval(wsPingInterval);
+  if (jobPollInterval) clearInterval(jobPollInterval);
+  wsPingInterval = null; jobPollInterval = null; activeIngestJob = null;
+  if (simulation) { simulation.stop(); simulation = null; }
+  gLinks = null; gNodes = null; gLabels = null;
+  nodeById.clear(); adjacency.clear(); activeLegendTypes.clear(); nodeMetricScores.clear();
+  nodeSizeMetric = null;
+  graphMeta = {truncated:false,total_nodes:0,total_edges:0,limit:null};
+  document.getElementById('tooltip').classList.remove('visible');
+  for (const id of ['tt-type','tt-label','tt-summary','tt-aliases']) document.getElementById(id).textContent = '';
+  graphData = {nodes:[],edges:[]}; currentSourceFilter = null;
+  sourceTitles.clear(); queryHistoryEntries = []; fanoutRows.clear(); sweepRows.clear();
+  selectedIngestFile = null; duplicateGroups = []; analyticsData = null; sweepMeta = null;
+  currentPathNodeIds.clear(); currentPathEdgeKeys.clear(); pathActive = false;
+  setIngestButtonsBusy(null);
+  document.querySelectorAll('button').forEach(button => {
+    button.disabled = false;
+    if (button.querySelector('.loader')) button.textContent = 'Run';
+  });
+  document.getElementById('force-graph').replaceChildren();
+  for (const id of ['sources-list','duplicates-list','query-result','query-history','ingest-result',
+      'search-results','path-result','verify-result','fanout-result','fanout-list','sweep-result',
+      'sweep-chart','analytics-list','legend-bar','toast-stack']) {
+    const el = document.getElementById(id); if (el) { el.replaceChildren(); delete el.dataset.loaded; }
+  }
+  for (const id of ['query-input','search-input','ingest-url-input','ingest-text-input',
+      'ingest-source','ingest-file-source','ingest-file-input','path-from','path-to']) {
+    const el = document.getElementById(id); if (el) el.value = '';
+  }
+  document.getElementById('ingest-file-name').textContent = 'no file selected';
+  for (const id of ['hero-nodes','hero-edges','hero-types']) document.getElementById(id).textContent = '0';
+  document.getElementById('vis-counts').textContent = '0 nodes · 0 edges';
+  document.getElementById('modal-overlay')?.classList.remove('visible');
+  try { localStorage.removeItem(API_KEY_STORAGE); localStorage.removeItem(HISTORY_STORAGE_KEY); } catch {}
+}
+function showPrivateLogin(message = '') {
+  clearWorkspaceView(); activeWorkspace = null;
+  document.getElementById('private-session').hidden = true;
+  const login = document.getElementById('private-login'); login.hidden = false; login.style.display = 'flex';
+  document.getElementById('private-login-error').textContent = message;
+}
+function applyReaderControls() {
+  const readOnly = readerMode();
+  const selector = '#ingest button, #ingest input, #ingest textarea, #btn-clear-graph, #btn-verify, #btn-fanout, #btn-sweep, #btn-analytics, [data-action="save"], [data-action="delete"], [data-source-delete], [data-merge], [data-action="merge"]';
+  document.querySelectorAll(selector).forEach(el => {
+    if (readOnly) { el.disabled = true; el.dataset.roleDisabled = '1'; }
+    else if (el.dataset.roleDisabled) { el.disabled = false; delete el.dataset.roleDisabled; }
+  });
+}
+function usePrivateWorkspace(data) {
+  clearWorkspaceView(); activeWorkspace = data.workspace;
+  if (!activeWorkspace) { showPrivateLogin('No authorized workspace.'); return; }
+  const select = document.getElementById('private-workspace');
+  select.replaceChildren(...(data.workspaces || []).map(w => {
+    const option = document.createElement('option'); option.value = w.id;
+    option.textContent = w.title; option.selected = w.id === activeWorkspace.id; return option;
+  }));
+  document.getElementById('private-role').textContent = activeWorkspace.role;
+  document.getElementById('private-session').hidden = false;
+  document.getElementById('private-login').hidden = true;
+  document.getElementById('private-login').style.display = 'none';
+  authReady = true; applyReaderControls(); bootWorkspace();
+}
+async function authCall(path, options = {}) {
+  const transition = authTransition;
+  const execute = async () => {
+    const response = await fetch(API + '/auth/' + path, {...options, credentials:'same-origin',
+      headers:{'Content-Type':'application/json', ...(options.headers || {})}, cache:'no-store'});
+    return {response, data:await response.json()};
+  };
+  // Serialize cookie mutations: browsers apply Set-Cookie before JavaScript can
+  // discard stale JSON. Logout must revoke any earlier completed login cookie.
+  const mutating = options.method && options.method !== 'GET';
+  const pending = mutating ? authRequestQueue.then(execute) : execute();
+  if (mutating) authRequestQueue = pending.catch(() => {});
+  const {response, data} = await pending;
+  if (transition !== authTransition) return discardedWorkspaceResponse();
+  if (!response.ok) throw new Error('Unable to authorize this session or workspace.');
+  return data;
+}
+document.getElementById('private-login-form').addEventListener('submit', async event => {
+  event.preventDefault(); authTransition++; const input = document.getElementById('private-token');
+  const token = input.value; input.value = '';
+  try { usePrivateWorkspace(await authCall('session', {method:'POST',body:JSON.stringify({token})})); }
+  catch (error) { showPrivateLogin(error.message); }
+});
+document.getElementById('private-workspace').addEventListener('change', async event => {
+  authTransition++; const workspace_id = event.target.value; clearWorkspaceView();
+  try { usePrivateWorkspace(await authCall('workspace', {method:'POST',body:JSON.stringify({workspace_id})})); }
+  catch (error) { showPrivateLogin(error.message); }
+});
+document.getElementById('private-logout').addEventListener('click', async () => {
+  authTransition++; showPrivateLogin();
+  try { await authCall('session', {method:'DELETE'}); }
+  catch { document.getElementById('private-login-error').textContent = 'Sign-out failed. Close this browser and contact your operator.'; }
+});
+document.addEventListener('click', event => {
+  const control = event.target.closest('button, input, textarea');
+  if (readerMode() && control?.matches('#ingest *, #btn-clear-graph, #btn-verify, #btn-fanout, #btn-sweep, #btn-analytics, [data-action="save"], [data-action="delete"], [data-action="merge"]')) {
+    event.preventDefault(); event.stopImmediatePropagation(); applyReaderControls();
+  }
+}, true);
+new MutationObserver(() => { if (privateMode) applyReaderControls(); })
+  .observe(document.body, {childList:true,subtree:true});
+(async function bootAuthentication() {
+  try {
+    const status = await authCall('status'); privateMode = status.private;
+    if (privateMode) {
+      const destinations = Object.entries(status.providers || {})
+        .map(([name, origin]) => name + ': ' + (origin || 'not configured')).join(' · ');
+      document.getElementById('private-disclosure').appendChild(document.createTextNode(
+        destinations ? ' Configured destinations: ' + destinations : ''));
+    }
+    if (!privateMode) { authReady = true; bootWorkspace(); return; }
+    clearWorkspaceView();
+    try { usePrivateWorkspace(await authCall('workspaces')); }
+    catch { showPrivateLogin(); }
+  } catch { showPrivateLogin('Unable to check server authentication. Reload to retry.'); }
+})();
 </script>
 </body>
 </html>

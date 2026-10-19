@@ -10,6 +10,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
+COPY scripts/ ./scripts/
 COPY frontend/ ./frontend/
 
 RUN useradd --create-home --uid 1000 appuser \

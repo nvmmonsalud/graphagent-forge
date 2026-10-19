@@ -131,6 +131,13 @@ inputs are stored privately until terminal state, replay can resume provider wor
 and this release supports one API process on local disk. The shared attempt
 budget is separate from provider dollar/token accounting.
 
+## Private workspaces (optional)
+
+M4 adds principal sessions, reader/editor roles and isolated graph, job, history,
+evidence and WebSocket resources. Set `AUTH_MODE=private` with durable state and
+an operator-managed identity config. See the [M4 setup and deletion guide](docs/M4_UPGRADE.md)
+before enabling it. Local mode remains explicit and separate from private data.
+
 ## 📁 Project Structure
 
 ```

@@ -107,3 +107,14 @@ an old command after a later refresh/delete. Source versions remain in Neo4j.
 Read docs/M3_CONTRACT.md, docs/M3_ADR.md and docs/M3_UPGRADE.md before changing
 recovery, retention or deployment. Supported topology is one API process and
 local disk; token/dollar budgets and shared API event/rate delivery remain open.
+
+
+## Private workspaces (M4)
+
+AUTH_MODE=private uses IdentityStore sessions/membership checks before workspace
+resource lookup. Routes resolve request.state.resources; root resources remain
+only for explicit local mode. WorkspaceNeo4jClient scopes static owned Cypher
+labels/types/indexes and traversal intermediates. Each workspace owns SQLite
+jobs/history and an injected broadcast manager; principal membership is rechecked
+before sends and durable command stages/chunks/publication. See M4_CONTRACT and
+M4_UPGRADE for cookie/CSRF, revocation, provider disclosure and offline purge.
