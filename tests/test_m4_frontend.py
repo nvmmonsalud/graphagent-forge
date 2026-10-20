@@ -9,7 +9,7 @@ def test_private_boot_is_gated_before_research_requests():
     assert "let privateMode = true, authReady = false" in HTML
     assert "const status = await authCall('status')" in HTML
     assert "if (!authReady) throw new Error" in HTML
-    assert "if (!privateMode) { authReady = true; bootWorkspace(); return; }" in HTML
+    assert "if (!privateMode) { authReady = true; applyReaderControls(); bootWorkspace();" in HTML
     assert "await apiFetch(API+'/graph/stats')" in HTML
 
 
