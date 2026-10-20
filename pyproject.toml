@@ -11,6 +11,7 @@ asyncio_mode = "auto"
 pythonpath = ["."]
 markers = [
     "integration: requires a live Neo4j",
+    "browser: opt-in Chromium frontend regressions (use --browser)",
 ]
 addopts = "-m 'not integration'"
 testpaths = ["tests"]

@@ -19,7 +19,21 @@ jobs:
         run: pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Lint
-        run: ruff check src/ tests/
+        run: ruff check src/ scripts/ tests/
 
       - name: Test
         run: pytest -q
+
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install browser test dependencies
+        run: pip install pytest pytest-asyncio -r requirements-browser.txt
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+      - name: Browser regressions (synthetic transport only)
+        run: python -m pytest --browser tests/browser -q

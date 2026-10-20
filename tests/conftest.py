@@ -28,3 +28,11 @@ def _isolated_env(monkeypatch):
     ):
         monkeypatch.delenv(var, raising=False)
     yield
+
+
+def pytest_addoption(parser):
+    parser.addoption('--browser', action='store_true', help='Run opt-in Chromium regressions')
+
+
+def pytest_ignore_collect(collection_path, config):
+    return 'browser' in collection_path.parts and not config.getoption('--browser')

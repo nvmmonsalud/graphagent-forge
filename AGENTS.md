@@ -40,7 +40,7 @@ create one with `python3.11 -m venv .venv`.
 ```bash
 .venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python -m src.main                  # FastAPI on port 8000
-.venv/bin/ruff check src/ scripts/ tests/     # make lint; CI checks src/ tests/
+.venv/bin/ruff check src/ scripts/ tests/     # make lint; same scope in CI
 .venv/bin/python -m pytest -q                # make test; offline suite
 .venv/bin/python -m pytest -q tests/test_jobs.py  # focused example
 .venv/bin/python -m pytest -q -m integration  # live Neo4j; explicit opt-in

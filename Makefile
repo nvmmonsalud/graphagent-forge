@@ -6,6 +6,7 @@ RUFF ?= .venv/bin/ruff
 help:
 	@echo "make lint        — ruff over src/, scripts/, tests/"
 	@echo "make test        — offline pytest suite (no keys, no Neo4j)"
+	@echo "make test-browser — opt-in Chromium regressions (see docs/M6_BROWSER_TESTS.md)"
 	@echo "make seed-dry    — validate seed/graph.json and print the write plan (no connection)"
 	@echo "make seed        — idempotent upsert of the seed corpus into Neo4j"
 	@echo "make seed-reset  — drop the seed's three sources, then re-seed"
@@ -32,3 +33,8 @@ seed-clear:
 
 demo: seed-reset
 	$(PY) -m src.main
+
+# Install requirements-browser.txt and Chromium once; see docs/M6_BROWSER_TESTS.md.
+.PHONY: test-browser
+test-browser:
+	$(PY) -m pytest --browser tests/browser -q
