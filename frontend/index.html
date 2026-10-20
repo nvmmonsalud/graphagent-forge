@@ -4329,7 +4329,7 @@ new MutationObserver(() => { if (privateMode) applyReaderControls(); })
       document.getElementById('private-disclosure').appendChild(document.createTextNode(
         destinations ? ' Configured destinations: ' + destinations : ''));
     }
-    if (!privateMode) { authReady = true; bootWorkspace(); return; }
+    if (!privateMode) { authReady = true; applyReaderControls(); bootWorkspace(); return; }
     clearWorkspaceView();
     try { usePrivateWorkspace(await authCall('workspaces')); }
     catch { showPrivateLogin(); }
