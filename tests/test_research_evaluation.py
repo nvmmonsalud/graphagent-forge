@@ -47,6 +47,21 @@ def test_incomplete_unknown_and_scope_leaking_rankings_fail(mutate):
         score(CORPUS, rows)
 
 
+def test_source_leak_beyond_scoring_cutoff_is_rejected():
+    rows = {case['id']: [] for case in CORPUS['cases']}
+    rows['source_filter'] = ['planet', 'element']
+    with pytest.raises(ValueError, match='leaked another source'):
+        score(CORPUS, rows, k=1)
+
+
+def test_recorded_baseline_metrics_match_supplied_rankings():
+    baseline = json.loads((Path(__file__).parents[1] / 'docs/research_baseline.json').read_text())
+    assert baseline['corpus_version'] == CORPUS['version']
+    measured = score(CORPUS, baseline['rankings'], k=baseline['k'])
+    for metric in ('macro_source_recall', 'mean_reciprocal_rank', 'unsupported_empty_rate'):
+        assert measured[metric] == baseline[metric]
+
+
 @pytest.mark.parametrize('k', [0, -1, 101, True, 1.5])
 def test_invalid_cutoff_fails(k):
     with pytest.raises(ValueError):

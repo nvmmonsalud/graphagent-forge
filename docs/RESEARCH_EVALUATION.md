@@ -36,6 +36,14 @@ The output records all per-question rankings and aggregate metrics. The expanded
 corpus has no invented numeric pass threshold: commit the first measured baseline
 before agreeing a future quality gate. Existing M2/M5 fixture gates remain intact.
 
+The first actual run on 2026-10-21 used Neo4j Community 5.26.0, Python 3.11.15
+and driver 6.4.1 against a fresh loopback database. Its supplied source rankings
+and reproducible scores are in [research_baseline.json](research_baseline.json):
+macro source recall@3 was 1.0 across eight positive questions, MRR@3 was 0.9375,
+and the single unsupported question returned no hits. The near-duplicate ranked
+ahead of the relevant planet source; perfect recall does not imply perfect
+ranking, precision or answer quality. No answer provider ran.
+
 No representative-document or live-provider answer-quality claim follows from
 these synthetic tests. Semantic retrieval, human claim support, injection
 resistance, real-world recall and cost remain unmeasured here. This slice changes

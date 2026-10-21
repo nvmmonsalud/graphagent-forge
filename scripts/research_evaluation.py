@@ -31,9 +31,9 @@ def score(corpus: dict, rankings: dict[str, list[str]], *, k: int = 3) -> dict:
             not isinstance(sid, str) or sid not in source_ids for sid in ranked
         ):
             raise ValueError("rankings must contain known source IDs")
-        selected = list(dict.fromkeys(ranked))[:k]
-        if case.get("source_id") and any(sid != case["source_id"] for sid in selected):
+        if case.get("source_id") and any(sid != case["source_id"] for sid in ranked):
             raise ValueError("source-filtered retrieval leaked another source")
+        selected = list(dict.fromkeys(ranked))[:k]
         row = {"id": case["id"], "retrieved_sources": selected}
         if expected:
             recall = len(expected.intersection(selected)) / len(expected)

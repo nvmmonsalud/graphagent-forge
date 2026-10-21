@@ -23,9 +23,9 @@ No branch calls paid APIs, creates remote sandboxes, reads private documents or
 modifies an existing database to validate its changes. Tests use invented public
 fixtures. Browser stubs establish frontend behavior, not backend authentication
 or live-provider correctness. Integration CI must create its own database and
-refuse external credentials/destinations. Research retrieval thresholds are
-recorded before running the expanded corpus; measurements are never inferred
-from mocked candidates.
+refuse external credentials/destinations. Relevant sources are declared before
+running the expanded corpus; record its first measured baseline before agreeing
+future quality thresholds. Measurements are never inferred from mocked candidates.
 
 ## Integration and review
 
