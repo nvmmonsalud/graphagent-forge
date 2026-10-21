@@ -8,6 +8,8 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
+from src.agent.usage import record_completion
+
 log = logging.getLogger(__name__)
 
 DEFAULT_KIMI_MODEL = os.getenv("KIMI_MODEL", "kimi-k2.7-code-highspeed")
@@ -123,9 +125,11 @@ Rules:
             response_format={"type": "json_object"},
         )
     except Exception as e:
+        await record_completion()
         log.error("Kimi extract_entities request failed: %s", e)
         return {"nodes": [], "edges": [], "error": f"LLM request failed: {type(e).__name__}"}
 
+    await record_completion(response)
     choice = response.choices[0]
     if choice.finish_reason == "length":
         # Reasoning + output overran the budget; the JSON is cut mid-stream and
@@ -181,9 +185,11 @@ async def answer_query(question: str, context: str, model: str | None = None) ->
             timeout=120,
         )
     except Exception as e:
+        await record_completion()
         log.error("Kimi answer_query request failed: %s", e)
         return f"{LLM_UNAVAILABLE_PREFIX} LLM request failed ({type(e).__name__})."
 
+    await record_completion(response)
     choice = response.choices[0]
     content = choice.message.content or ""
     if not content:
@@ -215,6 +221,7 @@ async def answer_with_citations(
     payload = json.dumps([
         {key: chunk[key] for key in ("id", "text")} for chunk in excerpts
     ], ensure_ascii=False)
+    response = None
     try:
         response = await get_kimi_client().chat.completions.create(
             model=_resolve_model(model),
@@ -239,6 +246,7 @@ async def answer_with_citations(
             max_tokens=ANSWER_MAX_TOKENS, timeout=120,
             response_format={"type": "json_object"},
         )
+        await record_completion(response)
         choice = response.choices[0]
         if choice.finish_reason == "length":
             return {**failure, "error": "LLM answer output truncated"}
@@ -246,6 +254,8 @@ async def answer_with_citations(
     except json.JSONDecodeError:
         return failure
     except Exception:
+        if response is None:
+            await record_completion()
         log.exception("Kimi cited answer request failed")
         return {**failure, "error": "LLM answer request failed"}
     if not validate_answer(value, excerpts):

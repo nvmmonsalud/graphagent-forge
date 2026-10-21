@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 from src.agent.daytona_exec import SWEEP_ERROR_UNAVAILABLE
 from src.agent.durable_jobs import DurableJobManager, IdempotencyConflict
 from src.agent.jobs import JobQueueFull
+from src.agent.usage import QuotaExceeded, UsageConfig, usage_scope
 from src.ingestion.file_extractor import MAX_UPLOAD_BYTES, check_upload_shape, safe_filename
 
 log = logging.getLogger(__name__)
@@ -188,11 +189,29 @@ def _claim_sandbox_batch() -> None:
         raise HTTPException(status_code=429, detail="a sandbox batch is already running")
 
 
+async def reserve_usage(request: Request) -> None:
+    store = getattr(_resources(request), "usage", None)
+    if store is None:
+        # Embedders without lifespan remain compatible only when the gate is off.
+        if UsageConfig.from_env().request_limit:
+            raise HTTPException(503, "usage quota unavailable")
+        return
+    try:
+        await store.reserve("ask" if request.url.path.endswith("/ask") else "sandbox")
+    except QuotaExceeded:
+        raise HTTPException(429, "usage request quota exceeded") from None
+    except Exception:
+        log.error("Usage quota unavailable")
+        raise HTTPException(503, "usage quota unavailable") from None
+
+
 GRAPH_DEP = [Depends(require_graph)]
 MUTATING_DEP = [Depends(require_api_key), Depends(require_graph)]
 INGEST_DEP = [Depends(require_api_key), Depends(rate_limit), Depends(require_graph)]
-ASK_DEP = [Depends(require_api_key), Depends(rate_limit), Depends(require_graph)]
-SANDBOX_DEP = [Depends(require_api_key), Depends(sandbox_rate_limit), Depends(require_graph)]
+ASK_DEP = [Depends(require_api_key), Depends(rate_limit), Depends(require_graph),
+           Depends(reserve_usage)]
+SANDBOX_DEP = [Depends(require_api_key), Depends(sandbox_rate_limit), Depends(require_graph),
+               Depends(reserve_usage)]
 
 
 # ------------------------------------------------------------------
@@ -590,8 +609,9 @@ async def ask(req: AskRequest, request: Request):
     agent = _resources(request).agent
     started = time.perf_counter()
     try:
-        result = (await agent.ask(req.question) if req.source_id is None
-                  else await agent.ask(req.question, source_id=req.source_id))
+        with usage_scope(getattr(_resources(request), "usage", None)):
+            result = (await agent.ask(req.question) if req.source_id is None
+                      else await agent.ask(req.question, source_id=req.source_id))
     except Exception:
         log.exception("Failed to answer question")
         raise HTTPException(status_code=500, detail=INTERNAL_ERROR) from None
@@ -613,6 +633,18 @@ async def ask(req: AskRequest, request: Request):
         except Exception as exc:
             log.warning("Recording query history failed: %s", exc)
     return result
+
+
+@router.get("/usage", dependencies=[Depends(require_api_key)])
+async def usage(request: Request):
+    store = getattr(_resources(request), "usage", None)
+    if store is None:
+        raise HTTPException(503, "usage accounting unavailable")
+    try:
+        return await store.snapshot()
+    except Exception:
+        log.error("Usage accounting unavailable")
+        raise HTTPException(503, "usage accounting unavailable") from None
 
 
 @router.get("/graph/stats", dependencies=GRAPH_DEP)
