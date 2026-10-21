@@ -1,4 +1,4 @@
-# M6 slice 1: browser authentication and role controls
+# M6 browser regressions: authentication and research interactions
 
 Baseline: `1c3d68b41f8ec9869fb88384a916f060b35e8311`. The requested
 `docs/NEXT_MILESTONES.md` was absent at this baseline; this slice follows the
@@ -47,3 +47,33 @@ These are frontend behavior regressions against stub contracts. They complement
 static contracts and server authorization tests; they do not establish real
 cookie/CSRF enforcement, backend middleware, CSP, provider correctness, database isolation or complete M6
 coverage. Disposable-Neo4j integration and live-provider checks are separate.
+
+## Slice 2: ingestion, evidence and merge recovery
+
+`tests/browser/test_research_flows.py` adds eight executable cases. URL submission
+locks all ingest buttons until a terminal event; synthetic WebSocket messages
+exercise progress, unrelated-job filtering, cancellation cleanup and late-event
+rejection. Successful ingestion displays partial, truncated and graph-capped
+coverage; a business failure releases the controls. A durable-job fixture survives
+an actual browser page reload without resubmission, then a synthetic polling 404
+releases the UI. This checks browser reattachment and lost-job handling, **not**
+a real backend restart, durable database recovery or cancellation of provider work.
+
+An answered question opens its citation through the real click handler and
+refetches the current excerpt, showing version and offsets. Invented HTML in the
+answer, title and excerpt remains text. A subsequent 404 removes the displayed
+excerpt and requests a rerun. Separate cases check `llm_unavailable`,
+`insufficient_evidence` and HTTP 503 responses, then retry successfully. These
+responses are fixtures; no provider availability, citation entailment or backend
+source-version validation is established.
+
+Merge recovery submits the selected node IDs through the confirmation dialog,
+recovers the control after HTTP failure and retries. On success the UI refetches
+the graph and duplicate groups even without a WebSocket merge notification. The
+fixture changes from two nodes to one; it does not perform or verify a Neo4j merge.
+
+The harness accepts explicit method/path response overrides and records request
+bodies only in memory for assertions. WebSocket messages are injected through
+Playwright's intercepted socket. Unexpected traffic still fails teardown and no
+transport connects to an API, database or external service. Complete M6 acceptance
+still needs a disposable-backend end-to-end run and disposable-Neo4j CI.
