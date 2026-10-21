@@ -4,14 +4,20 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
 
@@ -26,9 +32,12 @@ jobs:
 
   browser:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
       - name: Install browser test dependencies
@@ -37,3 +46,51 @@ jobs:
         run: python -m playwright install --with-deps chromium
       - name: Browser regressions (synthetic transport only)
         run: python -m pytest --browser tests/browser -q
+
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Install pinned security tools
+        run: pip install pip-audit==2.9.0 bandit==1.8.6 detect-secrets==1.5.0
+      - name: Audit resolved runtime dependencies (no vulnerability ignores)
+        run: python -m pip_audit -r requirements.txt
+      - name: Scan tracked files for secrets (no external verification)
+        if: ${{ !cancelled() }}
+        run: python -m scripts.check_ci_secrets
+      - name: Python SAST (block medium and high severity)
+        if: ${{ !cancelled() }}
+        run: python -m bandit -r src scripts -ll
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      neo4j:
+        image: neo4j:5.26-community
+        env:
+          NEO4J_AUTH: neo4j/ci-disposable-only
+        ports:
+          - 127.0.0.1:17687:7687
+        options: >-
+          --health-cmd "cypher-shell -u neo4j -p ci-disposable-only 'RETURN 1'"
+          --health-interval 10s --health-timeout 10s --health-retries 12
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Install integration dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Validate disposable service identity and run destructive integration tests
+        env:
+          CI_NEO4J_SERVICE_ID: ${{ job.services.neo4j.id }}
+        run: python -m scripts.check_ci_integration
