@@ -1,6 +1,6 @@
 {
   "measured_at": "2026-10-21",
-  "tested_commit": "6de936882b46ce247d25340ee20dc70ecedacf1f",
+  "tested_commit": "6de9368",
   "corpus_version": 1,
   "neo4j_server": "5.26.0 Community",
   "neo4j_driver": "6.4.1",
