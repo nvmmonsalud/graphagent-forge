@@ -175,6 +175,9 @@ class WorkspaceRuntime:
                 ws_manager=manager, neo4j_available=available, storage_mode='sqlite',
                 database=database, lock_descriptor=descriptor,
             )
+            from src.agent.usage import UsageConfig, UsageStore
+            resource.usage = UsageStore(database, config=UsageConfig.from_env())
+            await resource.usage.initialize()
             from src.agent.research_services import initialize_research
             await initialize_research(resource, identity=self.identity, workspace_id=workspace_id)
             return resource

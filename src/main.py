@@ -128,6 +128,9 @@ async def lifespan(app: FastAPI):
     Neo4j failures are non-fatal: the app still boots in a degraded mode where
     `/api/health` reports the outage and graph-touching routes answer 503.
     """
+    from src.agent.usage import UsageConfig, UsageStore
+
+    usage_config = UsageConfig.from_env()
     mode = os.getenv("AUTH_MODE", "local")
     if mode not in ("local", "private"):
         raise ValueError("AUTH_MODE must be local or private")
@@ -249,6 +252,8 @@ async def lifespan(app: FastAPI):
             jobs.start()
             app.state.history = QueryHistory()
             app.state.database = None
+        app.state.usage = UsageStore(app.state.database, config=usage_config)
+        await app.state.usage.initialize()
         from src.agent.research_services import initialize_research
         await initialize_research(app.state)
         yield
