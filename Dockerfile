@@ -7,7 +7,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# Refresh inherited packaging tools: the image inventory audit covers these too.
+RUN python -m pip install --no-cache-dir --upgrade pip==26.2.2 setuptools==83.0.0 \
+    && python -m pip install --no-cache-dir -r requirements.txt \
+    && python -m pip check
 
 COPY src/ ./src/
 COPY scripts/ ./scripts/

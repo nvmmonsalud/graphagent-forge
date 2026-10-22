@@ -51,6 +51,11 @@ original UI without the public preview shim. It does **not** start the applicati
 It records the actual installed package names/versions and cleans up its own
 container and image tag, including on failure. Cleanup failure fails the gate.
 
+The first live gate exposed vulnerable packaging tools inherited from the Python
+base image. The Dockerfile now upgrades pip to 26.2.2 and setuptools to 83.0.0
+before installing application dependencies and runs `pip check`. The inventory
+audit continues to cover those tools; no advisory is ignored.
+
 The workflow audits that installed inventory with pinned `pip-audit` and no
 vulnerability ignores, rather than assuming the host Python installation matches
 the image. Only after successful build/policy/audit steps does it upload exactly:
