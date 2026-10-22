@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "origin": "",
+  "workspace_id": "",
+  "usage_request_limit": 0,
+  "usage_window_seconds": 0,
+  "compose_project": "",
+  "images": {
+    "app": "",
+    "neo4j": "",
+    "proxy": ""
+  },
+  "state_dir": "",
+  "neo4j_dir": "",
+  "control_dir": "",
+  "tls_dir": "",
+  "probe_address": "",
+  "bindings": {
+    "host_provider": "",
+    "region": "",
+    "instance_resources": "",
+    "domain_dns_owner": "",
+    "tls_renewal": "",
+    "storage_capacity": "",
+    "monthly_hosting_ceiling": "",
+    "enabled_workspace_count": 0,
+    "deployment_operator": "",
+    "backup_destination": "",
+    "backup_encryption": "",
+    "backup_access": "",
+    "recovery_point_objective": "",
+    "recovery_time_objective": "",
+    "source_commit": ""
+  }
+}

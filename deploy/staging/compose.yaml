@@ -1,0 +1,209 @@
+{
+  "name": "${STAGING_PROJECT:?bind the reviewed compose_project}",
+  "services": {
+    "app": {
+      "image": "${STAGING_APP_IMAGE:?bind reviewed app image digest}",
+      "user": "1000:1000",
+      "command": [
+        "uvicorn",
+        "src.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--workers",
+        "1",
+        "--proxy-headers",
+        "--forwarded-allow-ips",
+        "172.30.63.2",
+        "--no-access-log",
+        "--timeout-graceful-shutdown",
+        "180"
+      ],
+      "env_file": [
+        "${STAGING_APP_NEO4J_ENV_FILE:?bind private app database credential file}"
+      ],
+      "environment": {
+        "AUTH_MODE": "private",
+        "AUTH_COOKIE_SECURE": "1",
+        "AUTH_CONFIG_PATH": "/app/data/auth.json",
+        "STATE_DB_PATH": "/app/data/identity.sqlite3",
+        "ALLOWED_ORIGINS": "https://${STAGING_HOSTNAME:?bind exact hostname}",
+        "ENABLE_API_DOCS": "0",
+        "DEV_RELOAD": "0",
+        "NEO4J_URI": "bolt://172.30.63.4:7687",
+        "NEO4J_USER": "neo4j",
+        "USAGE_REQUEST_LIMIT": "${STAGING_USAGE_REQUEST_LIMIT:?bind positive request quota}",
+        "USAGE_WINDOW_SECONDS": "${STAGING_USAGE_WINDOW_SECONDS:?bind explicit window}",
+        "INGEST_ATTEMPT_BUDGET": "20",
+        "INGEST_JOB_TIMEOUT": "120",
+        "RATE_LIMIT_MAX": "30",
+        "KIMI_API_KEY": "",
+        "DAYTONA_API_KEY": "",
+        "NOSANA_API_KEY": "",
+        "NOSANA_EMBEDDING_URL": "",
+        "LOG_LEVEL": "warning",
+        "PYTHONDONTWRITEBYTECODE": "1"
+      },
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "${STAGING_STATE_DIR:?bind existing private local state}",
+          "target": "/app/data",
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "networks": {
+        "private": {
+          "ipv4_address": "172.30.63.3"
+        }
+      },
+      "read_only": true,
+      "tmpfs": [
+        "/tmp:rw,noexec,nosuid,size=256m,mode=1777"
+      ],
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "init": true,
+      "restart": "no",
+      "stop_grace_period": "210s",
+      "cpus": "2.0",
+      "mem_limit": "2g",
+      "pids_limit": 256,
+      "logging": {
+        "driver": "none"
+      }
+    },
+    "neo4j": {
+      "image": "${STAGING_NEO4J_IMAGE:?bind Neo4j 5.26 image digest}",
+      "user": "7474:7474",
+      "env_file": [
+        "${STAGING_NEO4J_ENV_FILE:?bind private credential file}"
+      ],
+      "environment": {
+        "NEO4J_server_http_enabled": "false",
+        "NEO4J_server_https_enabled": "false",
+        "NEO4J_server_bolt_listen__address": "0.0.0.0:7687",
+        "NEO4J_server_memory_heap_initial__size": "256m",
+        "NEO4J_server_memory_heap_max__size": "768m",
+        "NEO4J_server_memory_pagecache_size": "256m",
+        "NEO4J_dbms_usage__report_enabled": "false"
+      },
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "${STAGING_NEO4J_DIR:?bind existing private local Neo4j data}",
+          "target": "/data",
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "networks": {
+        "private": {
+          "ipv4_address": "172.30.63.4"
+        }
+      },
+      "cap_drop": [
+        "ALL"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "restart": "no",
+      "stop_grace_period": "120s",
+      "cpus": "2.0",
+      "mem_limit": "2g",
+      "pids_limit": 256,
+      "logging": {
+        "driver": "none"
+      }
+    },
+    "proxy": {
+      "image": "${STAGING_PROXY_IMAGE:?bind nginx stable image digest}",
+      "entrypoint": [
+        "/bin/sh",
+        "-ec"
+      ],
+      "command": [
+        "envsubst '$$STAGING_HOSTNAME $$STAGING_OPERATOR_IP' < /etc/nginx/nginx.conf.template > /tmp/nginx.conf; exec nginx -c /tmp/nginx.conf -g 'daemon off;'"
+      ],
+      "environment": {
+        "STAGING_HOSTNAME": "${STAGING_HOSTNAME:?bind exact hostname}",
+        "STAGING_OPERATOR_IP": "${STAGING_OPERATOR_IP:?bind single restricted probe source IP}"
+      },
+      "ports": [
+        "443:443"
+      ],
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "./nginx.conf.template",
+          "target": "/etc/nginx/nginx.conf.template",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${STAGING_TLS_DIR:?bind existing TLS directory}",
+          "target": "/etc/nginx/tls",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        },
+        {
+          "type": "bind",
+          "source": "${STAGING_CONTROL_DIR:?bind existing admission control directory}",
+          "target": "/control",
+          "read_only": true,
+          "bind": {
+            "create_host_path": false
+          }
+        }
+      ],
+      "networks": {
+        "private": {
+          "ipv4_address": "172.30.63.2"
+        },
+        "ingress": {}
+      },
+      "read_only": true,
+      "tmpfs": [
+        "/tmp:rw,noexec,nosuid,size=64m,mode=1777"
+      ],
+      "security_opt": [
+        "no-new-privileges:true"
+      ],
+      "restart": "no",
+      "stop_grace_period": "30s",
+      "cpus": "0.5",
+      "mem_limit": "256m",
+      "pids_limit": 64,
+      "logging": {
+        "driver": "none"
+      }
+    }
+  },
+  "networks": {
+    "private": {
+      "internal": true,
+      "ipam": {
+        "config": [
+          {
+            "subnet": "172.30.63.0/24"
+          }
+        ]
+      }
+    },
+    "ingress": {}
+  }
+}
