@@ -25,6 +25,8 @@ def _isolated_env(monkeypatch):
         "GRAPHAGENT_TOKEN",
         "GRAPHAGENT_WORKSPACE",
         "INGEST_ATTEMPT_BUDGET",
+        "USAGE_REQUEST_LIMIT",
+        "USAGE_WINDOW_SECONDS",
     ):
         monkeypatch.delenv(var, raising=False)
     yield
