@@ -48,6 +48,9 @@ acceptance; its evidence does not close the hosted deployment gates.
 The [slice B operator tools and templates](H1_STAGING_PREFLIGHT.md) now provide
 configuration, local host inspection and authenticated readiness. Host bindings,
 continuous admission control, TLS and coordinated restore evidence remain open.
+The [slice C CI gates](H1_RELEASE_GATES.md) add connected acceptance and exact-commit
+image build/inventory checks. Live CI results, an approved registry digest and
+actual hosted release evidence are still required.
 
 M0 still needs fully reproducible dependency resolution and broader operational
 telemetry. M3 still needs full provider accounting, monetary reservations/spend
