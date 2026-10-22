@@ -45,9 +45,12 @@ separate. Start the local acceptance harness first; bind host/domain/budget/reco
 inputs before remote provisioning. H1 is specified, not deployed or accepted.
 The [slice A harness](H1_LOCAL_ACCEPTANCE.md) provides opt-in local connected
 acceptance; its evidence does not close the hosted deployment gates.
+The [slice B operator tools and templates](H1_STAGING_PREFLIGHT.md) now provide
+configuration, local host inspection and authenticated readiness. Host bindings,
+continuous admission control, TLS and coordinated restore evidence remain open.
 
 M0 still needs fully reproducible dependency resolution and broader operational
 telemetry. M3 still needs full provider accounting, monetary reservations/spend
-ceilings and shared-worker event/rate delivery. M6 still needs browser acceptance
-against the running backend. Human-reviewed real-provider claim support and
+ceilings and shared-worker event/rate delivery. M6 still needs hosted browser acceptance
+against the deployed backend. Human-reviewed real-provider claim support and
 representative user documents remain separate evaluation gates.
