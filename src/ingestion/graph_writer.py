@@ -130,7 +130,8 @@ def prefix_and_validate(
     """
     doc_hash = (
         hashlib.sha256(f"{source_doc}\0{version}".encode()).hexdigest()
-        if version is not None else hashlib.md5(source_doc.encode()).hexdigest()[:8]
+        if version is not None
+        else hashlib.md5(source_doc.encode(), usedforsecurity=False).hexdigest()[:8]
     )
 
     nodes = graph_data.get("nodes", [])
