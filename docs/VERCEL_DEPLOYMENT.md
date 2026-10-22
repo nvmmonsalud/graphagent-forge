@@ -23,6 +23,12 @@ including when the preview script fails to load. Generated files are release
 artifacts, not source files to commit.
 
 The native Git connection targets `nvmmonsalud/graphagent-forge`, branch `main`.
+Automatic production domain assignment is disabled: native Git builds are
+staged, and promotion is a separate post-CI step. This is not fully automatic
+gated promotion. Native GitHub Deployment Checks can replace that manual gate
+when configured in Vercel Settings → Build and Deployment → Deployment Checks;
+require all CI jobs before enabling automatic assignment.
+
 Release only the exact commit whose lint, offline, browser, security and
 disposable-Neo4j CI checks passed. Stage production without assigning domains,
 verify the manifest SHA and the page, script and vendored asset responses, then
