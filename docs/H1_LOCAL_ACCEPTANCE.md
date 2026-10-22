@@ -3,7 +3,7 @@
 This is the local harness from [the H1 contract](HOSTED_BACKEND_CONTRACT.md).
 It runs the original application in a separate private-mode process, with real
 HTTP/WebSockets, actual SQLite state and a newly owned Neo4j 5.26 database.
-Chromium loads the real UI; API and WebSocket responses are not intercepted.
+Chromium loads the real UI; API and WebSocket responses are not stubbed.
 Only the external completion provider is scripted with invented Apricot/Cedar
 data. This is not hosted, TLS, proxy, production or real-provider acceptance.
 
@@ -46,7 +46,10 @@ Parallel pytest/xdist execution is not supported.
   fixed analytics/parser subprocesses are not independently fenced by that hook.
   A dependency's startup IPv6 bind-capability probe is deliberately denied; a
   nonzero denied counter does not mean that external provider access succeeded.
-- Browser tests block decorative font requests. They save no screenshots, traces,
+- Browser contexts block service workers and reject HTTP/WS destinations outside
+  the exact assigned app origin before transmission. App requests continue to the
+  real server; WebSocket messages forward unchanged. Decorative fonts are blocked.
+  A live unassigned loopback listener verifies both guards. Tests save no screenshots, traces,
   video, storage snapshots or authentication artifacts. The normal application
   frontend is used, without the Vercel preview shim.
 - Service logs stay in private temporary files and are not copied into assertion

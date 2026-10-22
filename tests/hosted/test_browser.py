@@ -1,4 +1,6 @@
 """Shipped browser UI against the real private app, without API/WS stubs."""
+import socket
+import time
 from urllib.parse import urlsplit
 
 import pytest
@@ -7,6 +9,34 @@ from playwright.sync_api import expect
 pytestmark = pytest.mark.hosted
 
 DOCUMENT = "Apricot built Cedar in 2042. Private marker: orchid-acceptance-739."
+
+
+def restrict_browser_network(context, origin):
+    """Continue real app traffic; reject other HTTP/WS destinations before sending."""
+    violations = []
+    app = urlsplit(origin)
+
+    def http(route):
+        destination = urlsplit(route.request.url)
+        if destination.scheme == app.scheme and destination.netloc == app.netloc:
+            route.continue_()
+        else:
+            if destination.hostname not in {"fonts.googleapis.com", "fonts.gstatic.com"}:
+                violations.append("http")
+            route.abort()
+
+    def websocket(route):
+        destination = urlsplit(route.url)
+        if destination.scheme == "ws" and destination.netloc == app.netloc:
+            route.connect_to_server()
+        else:
+            violations.append("websocket")
+            # A routed socket never reaches the network unless explicitly connected.
+            # Do not call close() during its handshake (Playwright 1.56 can deadlock).
+
+    context.route("**/*", http)
+    context.route_web_socket("**/*", websocket)
+    return violations
 
 
 def login(page, hosted, principal="alice"):
@@ -31,10 +61,8 @@ def assert_private_storage_empty(page, tokens):
 
 
 def test_browser_ingest_answer_citation_switch_and_logout(hosted, hosted_browser):
-    with hosted_browser.new_context() as context:
-        # Fonts are decorative. The app, APIs, assets and WebSocket use real network.
-        context.route("https://fonts.googleapis.com/**", lambda route: route.abort())
-        context.route("https://fonts.gstatic.com/**", lambda route: route.abort())
+    with hosted_browser.new_context(service_workers="block") as context:
+        violations = restrict_browser_network(context, hosted.origin)
         page = context.new_page()
         errors = []
         requests = []
@@ -94,12 +122,12 @@ def test_browser_ingest_answer_citation_switch_and_logout(hosted, hosted_browser
         assert no_page_errors, "Browser raised an application error"
         assert allowed_destinations, "Browser requested an unexpected destination"
         assert credential_free_urls, "Browser exposed credentials in a URL"
+        assert not violations, "Browser attempted an unexpected network destination"
 
 
 def test_connected_reader_controls_and_server_enforcement(hosted, hosted_browser):
-    with hosted_browser.new_context() as context:
-        context.route("https://fonts.googleapis.com/**", lambda route: route.abort())
-        context.route("https://fonts.gstatic.com/**", lambda route: route.abort())
+    with hosted_browser.new_context(service_workers="block") as context:
+        violations = restrict_browser_network(context, hosted.origin)
         page = context.new_page()
         login(page, hosted, "reader")
         expect(page.locator("#private-role")).to_have_text("reader")
@@ -115,3 +143,29 @@ def test_connected_reader_controls_and_server_enforcement(hosted, hosted_browser
         assert result == 403
         assert hosted.provider.calls == {"extraction": 0, "answer": 0}
         assert_private_storage_empty(page, hosted.tokens)
+        assert not violations, "Browser attempted an unexpected network destination"
+
+
+def test_browser_guard_blocks_http_and_websocket_before_transmission(hosted, hosted_browser):
+    with (socket.socket() as listener,
+          hosted_browser.new_context(service_workers="block", bypass_csp=True) as context):
+        # Exercise the harness guard independently of the app's HTTP CSP.
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listener.settimeout(0.2)
+        violations = restrict_browser_network(context, hosted.origin)
+        page = context.new_page()
+        page.goto(hosted.origin)
+        destination = f"http://127.0.0.1:{listener.getsockname()[1]}"
+        blocked = page.evaluate("""async origin => {
+            const http = await fetch(origin).then(() => false, () => true);
+            window.guardProbe = new WebSocket(origin.replace('http:', 'ws:'));
+            return http;
+        }""", destination)
+        assert blocked, "Browser HTTP guard permitted an unassigned listener"
+        deadline = time.monotonic() + 3
+        while len(violations) < 2 and time.monotonic() < deadline:
+            page.wait_for_timeout(50)
+        assert sorted(violations) == ["http", "websocket"]
+        with pytest.raises(TimeoutError):
+            listener.accept()
