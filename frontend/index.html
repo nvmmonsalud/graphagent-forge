@@ -2735,16 +2735,19 @@ function connectWebSocket() {
   const generation = workspaceGeneration;
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws/graph`);
+  const socket = ws;
 
   ws.onopen = () => {
-    if (generation !== workspaceGeneration) return;
+    if (generation !== workspaceGeneration || ws !== socket || !authReady) return;
     setConnStatus(true);
     // Send periodic pings to keep alive
-    wsPingInterval = setInterval(() => { if (ws.readyState === 1) ws.send('ping'); }, 30000);
+    wsPingInterval = setInterval(() => {
+      if (generation === workspaceGeneration && ws === socket && socket.readyState === 1) socket.send('ping');
+    }, 30000);
   };
 
   ws.onmessage = (event) => {
-    if (generation !== workspaceGeneration || !authReady) return;
+    if (generation !== workspaceGeneration || !authReady || ws !== socket) return;
     try {
       const msg = JSON.parse(event.data);
       if (msg.type === 'graph_update' && msg.nodes && msg.edges) {
@@ -2786,13 +2789,13 @@ function connectWebSocket() {
   };
 
   ws.onclose = () => {
-    if (generation !== workspaceGeneration || !authReady) return;
+    if (generation !== workspaceGeneration || !authReady || ws !== socket) return;
     setConnStatus(false);
     if (wsPingInterval) { clearInterval(wsPingInterval); wsPingInterval = null; }
     setTimeout(() => { if (generation === workspaceGeneration && authReady) connectWebSocket(); }, 3000);
   };
 
-  ws.onerror = () => { ws.close(); };
+  ws.onerror = () => { socket.close(); };
 }
 
 function handleGraphUpdate(newNodes, newEdges) {
