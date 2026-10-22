@@ -23,12 +23,15 @@ def browser():
 
 
 class Frontend:
-    def __init__(self, page, mode='local', hold=None, failure=None):
+    def __init__(self, page, mode='local', hold=None, failure=None, responses=None):
         self.page = page
         self.mode = mode
         self.hold = hold
         self.failure = failure
+        self.responses = responses or {}
         self.pending = {}
+        self.socket_routes = []
+        self.bodies = []
         self.requests = []
         self.unexpected = []
         self.errors = []
@@ -40,6 +43,7 @@ class Frontend:
 
     def socket(self, socket):
         self.sockets.append(socket.url)
+        self.socket_routes.append(socket)
         if socket.url != ORIGIN.replace('http:', 'ws:') + '/ws/graph':
             self.unexpected.append(socket.url)
         # No connect_to_server: no network WebSocket or provider can be reached.
@@ -67,6 +71,12 @@ class Frontend:
                           content_type='text/html' if path == '/' else 'application/javascript')
             return
         self.requests.append((request.method, path, request.headers.get('x-workspace-id')))
+        self.bodies.append((request.method, path, request.post_data))
+        response = self.responses.get((request.method, path))
+        if response is not None:
+            status, payload = response
+            route.fulfill(status=status, json=payload)
+            return
         if path == self.hold:
             self.pending[path] = route
             return
@@ -118,6 +128,11 @@ class Frontend:
         else:
             route.fulfill(json=payloads[path])
 
+    def emit(self, payload):
+        import json
+
+        self.socket_routes[-1].send(json.dumps(payload))
+
     def open(self):
         self.page.goto(ORIGIN, wait_until='domcontentloaded')
 
@@ -126,7 +141,7 @@ class Frontend:
         self.page.locator('#query-history[data-loaded="1"]').wait_for(state='attached')
         self.page.locator('#sources-list[data-loaded="1"]').wait_for(state='attached')
         self.page.locator('#duplicates-list[data-loaded="1"]').wait_for(state='attached')
-        self.page.locator('#force-graph .nodes circle').wait_for(state='attached')
+        self.page.locator('#force-graph .nodes circle').first.wait_for(state='attached')
 
     def release(self, path, payload, status=200):
         self.page.wait_for_function('true')  # pump pending Playwright route callbacks
