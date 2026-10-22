@@ -35,6 +35,10 @@ logs/
 # Streamlit
 .streamlit/secrets.toml
 
+# Generated static Vercel preview and local project linkage
+/public/
+/.vercel/
+
 # Private durable workflow state
 /data/
 *.sqlite3

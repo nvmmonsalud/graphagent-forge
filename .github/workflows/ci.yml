@@ -27,6 +27,11 @@ jobs:
       - name: Lint
         run: ruff check src/ scripts/ tests/
 
+      - name: Build allowlisted static Vercel preview
+        run: python3 scripts/build_vercel_preview.py
+        env:
+          VERCEL_GIT_COMMIT_SHA: ${{ github.sha }}
+
       - name: Test
         run: pytest -q
 
