@@ -38,6 +38,12 @@ main merge and deployment remain separate publication steps.
 
 ## Remaining milestone scope
 
+The next execution contract is [H1 — private hosted staging](HOSTED_BACKEND_CONTRACT.md).
+It freezes one persistent host, a same-origin private UI/API/WebSocket deployment,
+and provider-free connected acceptance. The public Vercel synthetic preview stays
+separate. Start the local acceptance harness first; bind host/domain/budget/recovery
+inputs before remote provisioning. H1 is specified, not deployed or accepted.
+
 M0 still needs fully reproducible dependency resolution and broader operational
 telemetry. M3 still needs full provider accounting, monetary reservations/spend
 ceilings and shared-worker event/rate delivery. M6 still needs browser acceptance
