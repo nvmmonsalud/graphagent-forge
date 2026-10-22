@@ -1,0 +1,25 @@
+{
+  "measured_at": "2026-10-21",
+  "tested_commit": "6de9368",
+  "corpus_version": 1,
+  "neo4j_server": "5.26.0 Community",
+  "neo4j_driver": "6.4.1",
+  "python": "3.11.15",
+  "retrieval": "Actual Neo4j fulltext_rrf; no entities, embeddings or LLM",
+  "k": 3,
+  "rankings": {
+    "equal_titles_planet": ["near_duplicate", "planet", "element"],
+    "equal_titles_element": ["element", "planet", "near_duplicate"],
+    "conflicting_dates": ["conflict_a", "conflict_b"],
+    "unicode": ["unicode"],
+    "late_fact": ["late"],
+    "morphology": ["morphology"],
+    "source_filter": ["planet"],
+    "untrusted_content": ["injection", "planet", "near_duplicate"],
+    "unsupported": []
+  },
+  "macro_source_recall": 1.0,
+  "mean_reciprocal_rank": 0.9375,
+  "unsupported_empty_rate": 1.0,
+  "scope": "Eight positive synthetic questions and one unsupported question. No claim support, precision, semantic retrieval or general answer-quality claim. No post-hoc quality threshold."
+}
