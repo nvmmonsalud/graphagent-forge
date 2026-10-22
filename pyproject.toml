@@ -12,6 +12,7 @@ pythonpath = ["."]
 markers = [
     "integration: requires a live Neo4j",
     "browser: opt-in Chromium frontend regressions (use --browser)",
+    "hosted: opt-in local connected acceptance (use --hosted)",
 ]
 addopts = "-m 'not integration'"
 testpaths = ["tests"]

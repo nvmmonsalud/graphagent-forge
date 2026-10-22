@@ -1,0 +1,4 @@
+# Opt-in local connected acceptance; no remote provider credentials needed.
+-r requirements-dev.txt
+-r requirements-browser.txt
+httpx-ws==0.9.0

@@ -34,7 +34,9 @@ def _isolated_env(monkeypatch):
 
 def pytest_addoption(parser):
     parser.addoption('--browser', action='store_true', help='Run opt-in Chromium regressions')
+    parser.addoption('--hosted', action='store_true', help='Run isolated connected acceptance')
 
 
 def pytest_ignore_collect(collection_path, config):
-    return 'browser' in collection_path.parts and not config.getoption('--browser')
+    return (('browser' in collection_path.parts and not config.getoption('--browser'))
+            or ('hosted' in collection_path.parts and not config.getoption('--hosted')))

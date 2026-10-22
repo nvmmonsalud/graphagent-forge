@@ -43,6 +43,8 @@ It freezes one persistent host, a same-origin private UI/API/WebSocket deploymen
 and provider-free connected acceptance. The public Vercel synthetic preview stays
 separate. Start the local acceptance harness first; bind host/domain/budget/recovery
 inputs before remote provisioning. H1 is specified, not deployed or accepted.
+The [slice A harness](H1_LOCAL_ACCEPTANCE.md) provides opt-in local connected
+acceptance; its evidence does not close the hosted deployment gates.
 
 M0 still needs fully reproducible dependency resolution and broader operational
 telemetry. M3 still needs full provider accounting, monetary reservations/spend
